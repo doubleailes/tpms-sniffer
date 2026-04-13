@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::{make_model_hint, Sighting, TpmsPacket, VehicleTrack};
+use crate::{Sighting, TpmsPacket, VehicleTrack, make_model_hint};
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
 /// For these we cluster packets into time-window bursts and fingerprint by
@@ -272,13 +272,16 @@ fn burst_to_signature(pressures: &[f32]) -> [f32; 4] {
 /// Slots that are zero in either vector are excluded from the average so that
 /// a vehicle seen with fewer than 4 wheels can still match.
 fn l1_per_wheel(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let (sum, count) = a.iter().zip(b.iter()).fold((0.0f32, 0u32), |(s, n), (&x, &y)| {
-        if x == 0.0 || y == 0.0 {
-            (s, n)
-        } else {
-            (s + (x - y).abs(), n + 1)
-        }
-    });
+    let (sum, count) = a
+        .iter()
+        .zip(b.iter())
+        .fold((0.0f32, 0u32), |(s, n), (&x, &y)| {
+            if x == 0.0 || y == 0.0 {
+                (s, n)
+            } else {
+                (s + (x - y).abs(), n + 1)
+            }
+        });
     if count == 0 {
         f32::MAX
     } else {

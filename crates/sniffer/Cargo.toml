@@ -1,0 +1,20 @@
+[package]
+name = "tpms-sniffer"
+version = { workspace = true }
+edition = { workspace = true }
+description = "Passive TPMS sniffer — 25 protocols from rtl_433, powered by rtlsdr-next"
+
+[[bin]]
+name = "tpms-sniffer"
+path = "src/main.rs"
+
+[dependencies]
+rtlsdr-next  = { git = "https://github.com/mattdelashaw/rtlsdr-next" }
+tokio        = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap         = { workspace = true }
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
