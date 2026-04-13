@@ -30,6 +30,7 @@ pub struct Framer {
     sr: u128,
     sr_len: usize,
     frame_buf: Vec<u8>,
+    #[allow(unused)]
     pub frames: Vec<Vec<u8>>,
 }
 

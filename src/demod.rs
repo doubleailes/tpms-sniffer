@@ -16,6 +16,7 @@ const FSK_SYMBOL_US: f32 = 52.0;
 // ─── OOK ────────────────────────────────────────────────────
 
 pub struct OokDemod {
+    #[allow(unused)]
     sample_rate: u32,
     /// samples per TPMS symbol
     sps: f32,
@@ -24,6 +25,7 @@ pub struct OokDemod {
     // clock recovery
     phase_accum: f32,
     last_mag: f32,
+    #[allow(unused)]
     bits: Vec<u8>,
 }
 
@@ -80,7 +82,9 @@ pub struct FskDemod {
     prev_i: f32,
     prev_q: f32,
     /// DC-block IIR state
+    #[allow(unused)]
     dc_i: f32,
+    #[allow(unused)]
     dc_q: f32,
 }
 

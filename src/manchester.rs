@@ -70,6 +70,7 @@ pub fn differential_manchester_decode(bits: &[u8]) -> Vec<u8> {
 
 /// Search for a preamble pattern (as byte slice) within a bit stream
 /// and return the bit offset immediately after it, or None.
+#[allow(unused)]
 pub fn find_preamble(bits: &[u8], preamble: &[u8]) -> Option<usize> {
     if bits.len() < preamble.len() {
         return None;
