@@ -78,8 +78,14 @@ struct BurstAccumulator {
 // ---------------------------------------------------------------------------
 
 pub struct Resolver {
-    /// Stable sensor_id → vehicle_id for fixed-ID protocols.
-    fixed_map: HashMap<u32, Uuid>,
+    /// `(sensor_id, rtl433_id) → vehicle_id` for fixed-ID protocols.
+    ///
+    /// The decoder ID is part of the key so that two sensors from different
+    /// protocols that happen to share a `sensor_id` value cannot be absorbed
+    /// into the same vehicle UUID. See the issue "Fixed-ID lookup does not
+    /// verify protocol, allows near-sentinel cross-protocol absorption" for
+    /// background.
+    fixed_map: HashMap<(u32, u16), Uuid>,
     /// All tracked vehicles keyed by vehicle_id.
     vehicles: HashMap<Uuid, VehicleTrack>,
     /// Accumulator for an in-progress rolling-ID burst.
@@ -103,7 +109,8 @@ impl Resolver {
     fn load_from_db(&mut self) -> Result<()> {
         for vehicle in self.db.all_vehicles()? {
             if let Some(sid) = vehicle.fixed_sensor_id {
-                self.fixed_map.insert(sid, vehicle.vehicle_id);
+                self.fixed_map
+                    .insert((sid, vehicle.rtl433_id), vehicle.vehicle_id);
             }
             self.vehicles.insert(vehicle.vehicle_id, vehicle);
         }
@@ -161,9 +168,13 @@ impl Resolver {
 
     fn process_fixed(&mut self, sighting: Sighting, rtl433_id: u16) -> Result<Option<Uuid>> {
         let sensor_id = sighting.sensor_id;
+        // Key the fixed-ID map on `(sensor_id, rtl433_id)` so that two
+        // sensors from different decoders sharing a `sensor_id` value produce
+        // distinct vehicle UUIDs instead of merging.
+        let key = (sensor_id, rtl433_id);
 
         // Look up or create the vehicle.
-        let vehicle_id = if let Some(&vid) = self.fixed_map.get(&sensor_id) {
+        let vehicle_id = if let Some(&vid) = self.fixed_map.get(&key) {
             vid
         } else {
             let vid = Uuid::new_v4();
@@ -173,11 +184,12 @@ impl Resolver {
                 last_seen: sighting.ts,
                 sighting_count: 0,
                 protocol: sighting.protocol.clone(),
+                rtl433_id,
                 fixed_sensor_id: Some(sensor_id),
                 pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                 make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
             };
-            self.fixed_map.insert(sensor_id, vid);
+            self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
             vid
         };
@@ -232,6 +244,7 @@ impl Resolver {
                 last_seen: now,
                 sighting_count: 0,
                 protocol: protocol.clone(),
+                rtl433_id,
                 fixed_sensor_id: None,
                 pressure_signature: [pressure, 0.0, 0.0, 0.0],
                 make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
@@ -328,6 +341,7 @@ impl Resolver {
                 last_seen: now,
                 sighting_count: 0,
                 protocol: burst.protocol.clone(),
+                rtl433_id: burst.rtl433_id,
                 fixed_sensor_id: None,
                 pressure_signature: sig,
                 make_model_hint: make_model_hint(burst.rtl433_id).map(str::to_owned),
@@ -448,7 +462,10 @@ mod tests {
             );
         }
         assert!(
-            !resolver.fixed_map.contains_key(&0xFFFFFFFF),
+            !resolver
+                .fixed_map
+                .keys()
+                .any(|(sid, _)| *sid == 0xFFFFFFFF),
             "sentinel 0xFFFFFFFF must not appear in fixed_map"
         );
     }
@@ -471,7 +488,10 @@ mod tests {
             );
         }
         assert!(
-            !resolver.fixed_map.contains_key(&0x00000000),
+            !resolver
+                .fixed_map
+                .keys()
+                .any(|(sid, _)| *sid == 0x00000000),
             "sentinel 0x00000000 must not appear in fixed_map"
         );
     }
@@ -528,10 +548,10 @@ mod tests {
 
         // All 5 sightings should map to the same vehicle via the fixed-ID path.
         assert!(
-            resolver.fixed_map.contains_key(&0xFEFFFFFD),
+            resolver.fixed_map.contains_key(&(0xFEFFFFFD, 298)),
             "valid ID 0xFEFFFFFD must be in the fixed_map"
         );
-        let vid = resolver.fixed_map[&0xFEFFFFFD];
+        let vid = resolver.fixed_map[&(0xFEFFFFFD, 298)];
         let vehicle = &resolver.vehicles[&vid];
         assert_eq!(vehicle.sighting_count, 5);
         assert_eq!(vehicle.fixed_sensor_id, Some(0xFEFFFFFD));
@@ -630,6 +650,44 @@ mod tests {
             .filter(|v| v.protocol == "EezTire")
             .count();
         assert_eq!(eez_count, 2);
+    }
+
+    #[test]
+    fn fixed_id_map_keyed_on_protocol_does_not_merge_across_decoders() {
+        // Two sightings with identical sensor_id but different rtl433_id
+        // values must resolve to distinct vehicle UUIDs via the fixed-ID
+        // path. This is the defence-in-depth guard against cross-protocol
+        // absorption — if two decoders happen to emit the same sensor_id,
+        // keying the map on sensor_id alone would merge them. Keying on
+        // (sensor_id, rtl433_id) must keep them separate.
+        let mut resolver = in_memory_resolver();
+
+        // Pick a sensor_id that passes is_valid_sensor_id (plenty of bits
+        // cleared, not near the all-ones sentinel).
+        let shared_id = "0x1A2B3C4D";
+
+        let p_trw = make_packet(shared_id, "TRW-OOK", 298, 63.8);
+        let p_hyu = make_packet(shared_id, "Hyundai-Elantra", 140, 255.0);
+
+        let vid_trw = resolver.process(&p_trw).unwrap().expect("vid");
+        let vid_hyu = resolver.process(&p_hyu).unwrap().expect("vid");
+
+        assert_ne!(
+            vid_trw, vid_hyu,
+            "same sensor_id from two different decoders must produce distinct vehicle UUIDs"
+        );
+
+        // Both entries must be present in the fixed_map under their
+        // (sensor_id, rtl433_id) keys.
+        assert!(resolver.fixed_map.contains_key(&(0x1A2B3C4D, 298)));
+        assert!(resolver.fixed_map.contains_key(&(0x1A2B3C4D, 140)));
+        assert_eq!(resolver.vehicles.len(), 2);
+
+        // A subsequent TRW packet with the shared ID must rejoin the TRW
+        // vehicle, not flip to the Hyundai one.
+        let p_trw2 = make_packet(shared_id, "TRW-OOK", 298, 63.9);
+        let vid_trw2 = resolver.process(&p_trw2).unwrap().expect("vid");
+        assert_eq!(vid_trw, vid_trw2);
     }
 
     #[test]
