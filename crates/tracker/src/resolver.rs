@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -12,6 +12,14 @@ use crate::{Sighting, TpmsPacket, VehicleTrack, make_model_hint};
 /// the resulting pressure tuple.
 const ROLLING_ID_PROTOCOLS: &[u16] = &[
     208, // AVE
+];
+
+/// rtl_433 protocol IDs whose sensor ID field is unreliable because individual
+/// bits flip between transmissions (so every packet looks like a different
+/// sensor).  For these we ignore the sensor ID entirely and correlate each
+/// packet against active vehicles by protocol + pressure fingerprint.
+const BIT_FLIP_ID_PROTOCOLS: &[u16] = &[
+    241, // EezTire
 ];
 
 /// Sensor IDs that are decode artifacts (not real identifiers).
@@ -32,6 +40,13 @@ const BURST_MAX_WHEELS: usize = 4;
 /// L1 distance threshold (kPa, per-wheel average) for matching a new burst
 /// against a known vehicle's pressure signature.
 const PRESSURE_MATCH_TOLERANCE_KPA: f32 = 5.0;
+
+/// How long a vehicle remains eligible for pressure-fingerprint correlation
+/// after its most recent sighting.  After this gap we assume the sensor has
+/// gone out of range and any new match is a different vehicle.
+fn vehicle_expiry() -> Duration {
+    Duration::seconds(300) // 5 minutes
+}
 
 /// EMA weight for updating the pressure signature (higher = faster adaptation).
 const EMA_ALPHA: f32 = 0.2;
@@ -109,7 +124,10 @@ impl Resolver {
             battery_ok: packet.battery_ok.unwrap_or(true),
         };
 
-        if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) || !is_valid_sensor_id(sensor_id) {
+        if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
+            self.process_fingerprint(sighting)
+        } else if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) || !is_valid_sensor_id(sensor_id)
+        {
             self.process_rolling(sighting)
         } else {
             self.process_fixed(sighting, packet.rtl433_id)
@@ -158,6 +176,64 @@ impl Resolver {
         vehicle.last_seen = sighting.ts;
         vehicle.sighting_count += 1;
         ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
+
+        // Persist.
+        self.db.upsert_vehicle(vehicle)?;
+        self.db.insert_sighting(&sighting, vehicle_id)?;
+
+        Ok(Some(vehicle_id))
+    }
+
+    // -----------------------------------------------------------------------
+    // Fingerprint path (single-packet pressure correlation)
+    // -----------------------------------------------------------------------
+
+    /// Correlate a single packet against active vehicles of the same protocol
+    /// using the pressure fingerprint.  Used for protocols whose sensor ID
+    /// field is unreliable because bits flip between transmissions (e.g.
+    /// EezTire), which would otherwise cause every packet to create a new
+    /// vehicle via the fixed-ID path.
+    fn process_fingerprint(&mut self, sighting: Sighting) -> Result<Option<Uuid>> {
+        let now = sighting.ts;
+        let pressure = sighting.pressure_kpa;
+        let protocol = sighting.protocol.clone();
+        let rtl433_id = sighting.rtl433_id;
+        let expiry = vehicle_expiry();
+
+        // Find an active vehicle of the same protocol whose pressure
+        // signature is within tolerance.  Copy the Uuid so we drop the shared
+        // borrow before taking a mutable one below.
+        let matched_vid: Option<Uuid> = self
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == protocol && v.fixed_sensor_id.is_none())
+            .filter(|v| now.signed_duration_since(v.last_seen) < expiry)
+            .find(|v| (v.pressure_signature[0] - pressure).abs() <= PRESSURE_MATCH_TOLERANCE_KPA)
+            .map(|v| v.vehicle_id);
+
+        let vehicle_id = if let Some(vid) = matched_vid {
+            vid
+        } else {
+            let vid = Uuid::new_v4();
+            let vehicle = VehicleTrack {
+                vehicle_id: vid,
+                first_seen: now,
+                last_seen: now,
+                sighting_count: 0,
+                protocol: protocol.clone(),
+                fixed_sensor_id: None,
+                pressure_signature: [pressure, 0.0, 0.0, 0.0],
+                make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+            };
+            self.vehicles.insert(vid, vehicle);
+            vid
+        };
+
+        // Update in-memory state.
+        let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+        vehicle.last_seen = now;
+        vehicle.sighting_count += 1;
+        ema_update(&mut vehicle.pressure_signature[0], pressure);
 
         // Persist.
         self.db.upsert_vehicle(vehicle)?;
@@ -313,8 +389,18 @@ mod tests {
     use crate::db::Database;
 
     fn make_packet(sensor_id: &str, protocol: &str, rtl433_id: u16, pressure_kpa: f32) -> TpmsPacket {
+        make_packet_at("2025-06-01 12:00:00.000", sensor_id, protocol, rtl433_id, pressure_kpa)
+    }
+
+    fn make_packet_at(
+        timestamp: &str,
+        sensor_id: &str,
+        protocol: &str,
+        rtl433_id: u16,
+        pressure_kpa: f32,
+    ) -> TpmsPacket {
         TpmsPacket {
-            timestamp: "2025-06-01 12:00:00.000".to_string(),
+            timestamp: timestamp.to_string(),
             protocol: protocol.to_string(),
             rtl433_id,
             sensor_id: sensor_id.to_string(),
@@ -438,6 +524,101 @@ mod tests {
         let vehicle = &resolver.vehicles[&vid];
         assert_eq!(vehicle.sighting_count, 5);
         assert_eq!(vehicle.fixed_sensor_id, Some(0xFEFFFFFD));
+    }
+
+    #[test]
+    fn eeztire_rolling_id_burst_resolves_to_single_vehicle() {
+        // Regression for the 6-packet burst listed in the tracker issue:
+        // EezTire (protocol 241) stable ~51.1 kPa with every packet reporting
+        // a different bit-flipped sensor ID.  Prior behaviour was to create
+        // one vehicle per packet; all six must now collapse to a single UUID.
+        let mut resolver = in_memory_resolver();
+        let bursts = [
+            ("2025-06-01 12:00:00.000", "0xF7FFFFFF"),
+            ("2025-06-01 12:00:30.000", "0xFFDFFFFF"),
+            ("2025-06-01 12:01:00.000", "0xBFFFFFFF"),
+            ("2025-06-01 12:01:30.000", "0xEFFFF5FF"),
+            ("2025-06-01 12:02:00.000", "0x7FFFFF7F"),
+            ("2025-06-01 12:02:30.000", "0x7FFEFFFE"),
+        ];
+
+        let mut vids = Vec::new();
+        for (ts, sid) in bursts {
+            let p = make_packet_at(ts, sid, "EezTire", 241, 51.1);
+            let vid = resolver.process(&p).unwrap().expect("vid resolved");
+            vids.push(vid);
+        }
+
+        let first = vids[0];
+        for (i, v) in vids.iter().enumerate() {
+            assert_eq!(
+                *v, first,
+                "packet {i} expected to resolve to the same vehicle as the first"
+            );
+        }
+
+        let eez_count = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .count();
+        assert_eq!(
+            eez_count, 1,
+            "all six EezTire packets must collapse into a single vehicle"
+        );
+        let v = resolver.vehicles.values().find(|v| v.protocol == "EezTire").unwrap();
+        assert_eq!(v.sighting_count, 6);
+        assert!(v.fixed_sensor_id.is_none());
+    }
+
+    #[test]
+    fn eeztire_packet_after_expiry_creates_new_vehicle() {
+        // After VEHICLE_EXPIRY (5 minutes) of silence a new EezTire packet at
+        // the same pressure should resolve to a *different* vehicle UUID.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at("2025-06-01 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 51.1);
+        let p2 = make_packet_at("2025-06-01 12:00:10.000", "0xBFFFFFFF", "EezTire", 241, 51.1);
+        let vid1 = resolver.process(&p1).unwrap().unwrap();
+        let vid2 = resolver.process(&p2).unwrap().unwrap();
+        assert_eq!(vid1, vid2, "packets inside the expiry window must merge");
+
+        // > 5 minutes later, a new sighting should not merge with the earlier vehicle.
+        let p3 = make_packet_at("2025-06-01 12:05:11.000", "0x7FFFFF7F", "EezTire", 241, 51.1);
+        let vid3 = resolver.process(&p3).unwrap().unwrap();
+        assert_ne!(
+            vid1, vid3,
+            "a packet arriving after VEHICLE_EXPIRY silence must create a new vehicle"
+        );
+    }
+
+    #[test]
+    fn eeztire_two_sensors_at_different_pressures_do_not_merge() {
+        // Two EezTire sensors with materially different pressures (51 kPa and
+        // 25 kPa, both present in the real capture) must resolve to distinct
+        // vehicles.
+        let mut resolver = in_memory_resolver();
+
+        let hi1 = make_packet_at("2025-06-01 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 51.1);
+        let lo1 = make_packet_at("2025-06-01 12:00:01.000", "0xBFFFFFFF", "EezTire", 241, 25.0);
+        let hi2 = make_packet_at("2025-06-01 12:00:02.000", "0x7FFEFFFE", "EezTire", 241, 51.2);
+        let lo2 = make_packet_at("2025-06-01 12:00:03.000", "0xEFFFF5FF", "EezTire", 241, 24.9);
+
+        let vhi1 = resolver.process(&hi1).unwrap().unwrap();
+        let vlo1 = resolver.process(&lo1).unwrap().unwrap();
+        let vhi2 = resolver.process(&hi2).unwrap().unwrap();
+        let vlo2 = resolver.process(&lo2).unwrap().unwrap();
+
+        assert_ne!(vhi1, vlo1, "51 kPa and 25 kPa sensors must not merge");
+        assert_eq!(vhi1, vhi2, "both 51 kPa packets must resolve to same vehicle");
+        assert_eq!(vlo1, vlo2, "both 25 kPa packets must resolve to same vehicle");
+
+        let eez_count = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .count();
+        assert_eq!(eez_count, 2);
     }
 
     #[test]
