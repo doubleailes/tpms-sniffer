@@ -1,15 +1,15 @@
+mod decoder;
 mod demod;
 mod framer;
 mod manchester;
-mod decoder;
 mod reporter;
 
 use clap::Parser;
 use tracing::info;
 
-use rtlsdr_next::Driver;
 use decoder::TpmsProtocol;
 use reporter::Reporter;
+use rtlsdr_next::Driver;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,42 +60,46 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let protocol = match args.protocol.as_str() {
-        "ford"          => TpmsProtocol::Ford,
-        "citroen"       => TpmsProtocol::Citroen,
-        "toyota"        => TpmsProtocol::Toyota,
-        "toyota107j"    => TpmsProtocol::ToyotaPmv107j,
-        "renault"       => TpmsProtocol::Renault,
-        "schrader"      => TpmsProtocol::Schrader,
+        "ford" => TpmsProtocol::Ford,
+        "citroen" => TpmsProtocol::Citroen,
+        "toyota" => TpmsProtocol::Toyota,
+        "toyota107j" => TpmsProtocol::ToyotaPmv107j,
+        "renault" => TpmsProtocol::Renault,
+        "schrader" => TpmsProtocol::Schrader,
         "schrader_eg53" => TpmsProtocol::SchraderEg53ma4,
-        "schrader_smd"  => TpmsProtocol::SchraderSmd3ma4,
-        "steelmate"     => TpmsProtocol::Steelmate,
-        "jansite"       => TpmsProtocol::Jansite,
+        "schrader_smd" => TpmsProtocol::SchraderSmd3ma4,
+        "steelmate" => TpmsProtocol::Steelmate,
+        "jansite" => TpmsProtocol::Jansite,
         "jansite_solar" => TpmsProtocol::JansiteSolar,
-        "elantra"       => TpmsProtocol::Elantra,
-        "abarth"        => TpmsProtocol::Abarth,
-        "hyundai_vdo"   => TpmsProtocol::HyundaiVdo,
-        "bmw_gen45"     => TpmsProtocol::BmwGen45,
-        "bmw_gen23"     => TpmsProtocol::BmwGen23,
-        "porsche"       => TpmsProtocol::Porsche,
-        "ave"           => TpmsProtocol::Ave,
-        "tyreguard"     => TpmsProtocol::TyreGuard,
-        "eeztire"       => TpmsProtocol::EezTire,
-        "gm"            => TpmsProtocol::GmAftermarket,
-        "trw_ook"       => TpmsProtocol::TrwOok,
-        "trw_fsk"       => TpmsProtocol::TrwFsk,
-        "airpuxem"      => TpmsProtocol::Airpuxem,
-        "truck"         => TpmsProtocol::SolarTruck,
-        _               => TpmsProtocol::All,
+        "elantra" => TpmsProtocol::Elantra,
+        "abarth" => TpmsProtocol::Abarth,
+        "hyundai_vdo" => TpmsProtocol::HyundaiVdo,
+        "bmw_gen45" => TpmsProtocol::BmwGen45,
+        "bmw_gen23" => TpmsProtocol::BmwGen23,
+        "porsche" => TpmsProtocol::Porsche,
+        "ave" => TpmsProtocol::Ave,
+        "tyreguard" => TpmsProtocol::TyreGuard,
+        "eeztire" => TpmsProtocol::EezTire,
+        "gm" => TpmsProtocol::GmAftermarket,
+        "trw_ook" => TpmsProtocol::TrwOok,
+        "trw_fsk" => TpmsProtocol::TrwFsk,
+        "airpuxem" => TpmsProtocol::Airpuxem,
+        "truck" => TpmsProtocol::SolarTruck,
+        _ => TpmsProtocol::All,
     };
 
     info!(
         "Opening RTL-SDR #{} @ {:.3} MHz  SR={} kHz",
-        args.device, args.freq as f64 / 1e6, args.rate / 1000,
+        args.device,
+        args.freq as f64 / 1e6,
+        args.rate / 1000,
     );
 
     // rtlsdr-next selects the device via RTLSDR_DEVICE_INDEX
     // SAFETY: called once before any parallel USB threads are spawned
-    unsafe { std::env::set_var("RTLSDR_DEVICE_INDEX", args.device.to_string()); }
+    unsafe {
+        std::env::set_var("RTLSDR_DEVICE_INDEX", args.device.to_string());
+    }
     let mut driver = Driver::new()?;
     driver.set_frequency(args.freq as u64)?;
     driver.set_sample_rate(args.rate)?;
@@ -106,18 +110,21 @@ async fn main() -> anyhow::Result<()> {
         info!("Gain = {:.1} dB", args.gain as f32 / 10.0);
     }
 
-    let reporter   = Reporter::new(args.json);
+    let reporter = Reporter::new(args.json);
     let mut stream = driver.stream();
 
     eprintln!("═══════════════════════════════════════════════════════");
-    eprintln!(" TPMS Sniffer  │  {:.3} MHz  │  {} kHz sample-rate",
-        args.freq as f64 / 1e6, args.rate / 1000);
+    eprintln!(
+        " TPMS Sniffer  │  {:.3} MHz  │  {} kHz sample-rate",
+        args.freq as f64 / 1e6,
+        args.rate / 1000
+    );
     eprintln!(" 25 protocols  │  rtl_433 reference  │  rtlsdr-next");
     eprintln!("═══════════════════════════════════════════════════════");
 
     let mut ook_demod = demod::OokDemod::new(args.rate);
     let mut fsk_demod = demod::FskDemod::new(args.rate);
-    let mut framer    = framer::Framer::new();
+    let mut framer = framer::Framer::new();
 
     while let Some(Ok(chunk)) = stream.next().await {
         let bits_ook = ook_demod.process(&chunk);

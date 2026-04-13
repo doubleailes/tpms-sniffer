@@ -12,16 +12,16 @@
 //  simultaneously using a single shift-register.
 // ============================================================
 
-const ALT_PREAMBLE_MIN: usize = 16;   // minimum alternating bits
-const HUF_PREAMBLE:     u32   = 0x00FF; // 16 bit
-const MAX_FRAME_BITS:   usize = 128;   // maximum frame to collect
+const ALT_PREAMBLE_MIN: usize = 16; // minimum alternating bits
+const HUF_PREAMBLE: u32 = 0x00FF; // 16 bit
+const MAX_FRAME_BITS: usize = 128; // maximum frame to collect
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Idle,
     AltPreamble { count: usize },
     HufPreamble { reg: u32 },
-    Collecting  { bits: usize, total: usize },
+    Collecting { bits: usize, total: usize },
 }
 
 pub struct Framer {
@@ -65,7 +65,9 @@ impl Framer {
                 // ── Idle: look for alternating pattern ─────
                 State::Idle => {
                     if alt >= ALT_PREAMBLE_MIN {
-                        self.state = State::AltPreamble { count: ALT_PREAMBLE_MIN };
+                        self.state = State::AltPreamble {
+                            count: ALT_PREAMBLE_MIN,
+                        };
                     } else if self.sr_len >= 16 {
                         let reg16 = (self.sr & 0xFFFF) as u32;
                         if reg16 == HUF_PREAMBLE {
@@ -100,7 +102,10 @@ impl Framer {
                 }
 
                 // ── Collecting frame bits ────────────────────
-                State::Collecting { ref mut bits, total } => {
+                State::Collecting {
+                    ref mut bits,
+                    total,
+                } => {
                     self.frame_buf.push(b);
                     *bits += 1;
                     if *bits >= total {

@@ -23,7 +23,7 @@ pub fn manchester_decode(bits: &[u8]) -> Vec<u8> {
         let decoded = match (bits[i] & 1, bits[i + 1] & 1) {
             (1, 0) => Some(1u8),
             (0, 1) => Some(0u8),
-            _      => None,   // Manchester violation
+            _ => None, // Manchester violation
         };
         i += 2;
         if let Some(b) = decoded {
