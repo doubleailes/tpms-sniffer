@@ -22,13 +22,24 @@ const BIT_FLIP_ID_PROTOCOLS: &[u16] = &[
     241, // EezTire
 ];
 
-/// Sensor IDs that are decode artifacts (not real identifiers).
-/// Multiple protocols emit these when the sensor ID field cannot be reliably
-/// extracted.  They must never be used for fixed-ID vehicle matching.
-const SENTINEL_IDS: &[u32] = &[0xFFFFFFFF, 0x00000000];
-
+/// Rejects sensor IDs that are decode artifacts rather than real identifiers.
+///
+/// When a protocol decoder cannot extract all bits of the sensor ID field
+/// reliably, unresolved bits default to `1`, producing values close to
+/// `0xFFFFFFFF` (e.g. `0xFFFFFFFD`, `0xFFFFFFF7`, `0xFFFFFFFB`, `0xFFFFFFBF`).
+/// These near-sentinel IDs appear across multiple protocols and, if treated
+/// as legitimate fixed IDs, cause cross-protocol vehicle merging in the
+/// fixed-ID map.
+///
+/// The check rejects all-zeros and any ID with fewer than 2 bits cleared from
+/// the all-ones state. A `>= 2` threshold (rather than the `>= 3` originally
+/// proposed) preserves the confirmed real TRW sensor `0xFEFFFFFD`, which has
+/// exactly 2 bits cleared. Raising the threshold further would regress that
+/// known-good fixed-ID track.
 fn is_valid_sensor_id(id: u32) -> bool {
-    !SENTINEL_IDS.contains(&id)
+    // Reject 0x00000000 and any ID with ≤ 1 bit cleared from 0xFFFFFFFF.
+    // IDs with 0–1 bits cleared are decode artifacts (unresolved bit fields).
+    id != 0x00000000 && id.count_zeros() >= 2
 }
 
 /// Maximum gap (ms) between consecutive packets belonging to the same burst.
@@ -623,10 +634,48 @@ mod tests {
 
     #[test]
     fn is_valid_sensor_id_unit() {
+        // Exact sentinels.
         assert!(!is_valid_sensor_id(0xFFFFFFFF));
         assert!(!is_valid_sensor_id(0x00000000));
+
+        // Near-sentinels with a single bit cleared (decode artifacts).
+        assert!(!is_valid_sensor_id(0xFFFFFFFD));
+        assert!(!is_valid_sensor_id(0xFFFFFFF7));
+        assert!(!is_valid_sensor_id(0xFFFFFFFB));
+        assert!(!is_valid_sensor_id(0xFFFFFFBF));
+
+        // Confirmed real TRW sensor with exactly 2 bits cleared — must not
+        // regress.
         assert!(is_valid_sensor_id(0xFEFFFFFD));
+
+        // Arbitrary real IDs.
         assert!(is_valid_sensor_id(0x1A2B3C4D));
         assert!(is_valid_sensor_id(1));
+    }
+
+    /// Popcount boundary coverage required by the acceptance criteria:
+    /// IDs with 0, 1, 2, 3, and 4 bits cleared must return the correct
+    /// valid/invalid result. The boundary sits between 1 and 2 bits cleared.
+    #[test]
+    fn is_valid_sensor_id_popcount_boundary() {
+        // 0 bits cleared → invalid.
+        assert_eq!(0xFFFFFFFFu32.count_zeros(), 0);
+        assert!(!is_valid_sensor_id(0xFFFFFFFF));
+
+        // 1 bit cleared → invalid.
+        assert_eq!(0xFFFFFFFEu32.count_zeros(), 1);
+        assert!(!is_valid_sensor_id(0xFFFFFFFE));
+
+        // 2 bits cleared → valid.
+        assert_eq!(0xFFFFFFFCu32.count_zeros(), 2);
+        assert!(is_valid_sensor_id(0xFFFFFFFC));
+
+        // 3 bits cleared → valid.
+        assert_eq!(0xFFFFFFF8u32.count_zeros(), 3);
+        assert!(is_valid_sensor_id(0xFFFFFFF8));
+
+        // 4 bits cleared → valid.
+        assert_eq!(0xFFFFFFF0u32.count_zeros(), 4);
+        assert!(is_valid_sensor_id(0xFFFFFFF0));
     }
 }
