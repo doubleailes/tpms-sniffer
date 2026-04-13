@@ -57,6 +57,11 @@ pub struct VehicleTrack {
     pub last_seen: DateTime<Utc>,
     pub sighting_count: u32,
     pub protocol: String,
+    /// Canonical rtl_433 decoder ID. Paired with `fixed_sensor_id` to form the
+    /// fixed-ID map key so that two sensors from different protocols that
+    /// happen to share a `sensor_id` value cannot be merged into the same
+    /// vehicle UUID.
+    pub rtl433_id: u16,
     /// Stable for pre-2018 fixed-ID sensors; `None` for rolling-ID protocols.
     pub fixed_sensor_id: Option<u32>,
     /// Exponential-moving-average pressure per wheel slot (kPa).

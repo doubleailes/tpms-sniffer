@@ -27,6 +27,7 @@ impl Database {
                 last_seen      TEXT NOT NULL,
                 sighting_count INTEGER NOT NULL DEFAULT 0,
                 protocol       TEXT NOT NULL,
+                rtl433_id      INTEGER NOT NULL DEFAULT 0,
                 sensor_id      INTEGER,        -- NULL for rolling-ID protocols
                 make_model     TEXT,
                 pressure_sig   TEXT NOT NULL DEFAULT '[0,0,0,0]'
@@ -50,6 +51,22 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_sightings_ts      ON sightings(ts);
             "#,
         )?;
+
+        // Migration: add rtl433_id column for databases created before the
+        // cross-protocol-absorption fix. SQLite has no `ADD COLUMN IF NOT
+        // EXISTS`, so check pragma_table_info first.
+        let has_rtl433_id: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='rtl433_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_rtl433_id == 0 {
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN rtl433_id INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -61,8 +78,8 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO vehicles
-                (vehicle_id, first_seen, last_seen, sighting_count, protocol, sensor_id, make_model, pressure_sig)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
@@ -74,6 +91,7 @@ impl Database {
                 v.last_seen.to_rfc3339(),
                 v.sighting_count as i64,
                 v.protocol,
+                v.rtl433_id as i64,
                 v.fixed_sensor_id.map(|id| id as i64),
                 v.make_model_hint.as_deref(),
                 pressure_sig,
@@ -108,7 +126,7 @@ impl Database {
     pub fn find_vehicle_by_sensor_id(&self, sensor_id: u32) -> Result<Option<VehicleTrack>> {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
-                    sensor_id, make_model, pressure_sig
+                    sensor_id, make_model, pressure_sig, rtl433_id
              FROM vehicles WHERE sensor_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![sensor_id as i64])?;
@@ -123,7 +141,7 @@ impl Database {
     pub fn all_vehicles(&self) -> Result<Vec<VehicleTrack>> {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
-                    sensor_id, make_model, pressure_sig
+                    sensor_id, make_model, pressure_sig, rtl433_id
              FROM vehicles ORDER BY last_seen DESC",
         )?;
         let vehicles = stmt
@@ -142,6 +160,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let sensor_id: Option<i64> = row.get(5)?;
     let make_model: Option<String> = row.get(6)?;
     let pressure_sig_s: String = row.get(7)?;
+    let rtl433_id: i64 = row.get(8)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -155,6 +174,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         last_seen: parse_dt(&last_seen_s),
         sighting_count: sighting_count as u32,
         protocol,
+        rtl433_id: rtl433_id as u16,
         fixed_sensor_id: sensor_id.map(|id| id as u32),
         pressure_signature: serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]),
         make_model_hint: make_model,
