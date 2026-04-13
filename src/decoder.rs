@@ -188,6 +188,11 @@ fn raw_bits_to_bytes(bits: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Reject frames where every byte is the same value (noise / no signal).
+fn is_noise(b: &[u8]) -> bool {
+    b.len() >= 2 && b.iter().all(|&x| x == b[0])
+}
+
 fn score(crc_ok: bool, sane: bool, kpa: f32, temp: Option<f32>) -> u8 {
     let mut s = 0u8;
     if crc_ok {
@@ -729,6 +734,9 @@ fn decode_porsche(bits: &[u8]) -> Option<TpmsPacket> {
 fn decode_ave(bits: &[u8]) -> Option<TpmsPacket> {
     let b = raw_bits_to_bytes(bits);
     if b.len() < 6 {
+        return None;
+    }
+    if is_noise(&b[..6]) {
         return None;
     }
     let xor = b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5];
