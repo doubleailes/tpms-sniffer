@@ -68,19 +68,19 @@ pub struct VehicleTrack {
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.
 pub fn make_model_hint(rtl433_id: u16) -> Option<&'static str> {
     match rtl433_id {
-        59  => Some("Schrader EG53MA4"),
-        82  => Some("Citroën / Peugeot / Fiat / Mitsubishi"),
-        88  => Some("Toyota Auris / Corolla / Lexus"),
-        89  => Some("Ford Fiesta / Focus / Kuga / Transit"),
-        90  => Some("Renault / Dacia"),
-        95  => Some("Saab / Opel / Vauxhall / Chevrolet"),
+        59 => Some("Schrader EG53MA4"),
+        82 => Some("Citroën / Peugeot / Fiat / Mitsubishi"),
+        88 => Some("Toyota Auris / Corolla / Lexus"),
+        89 => Some("Ford Fiesta / Focus / Kuga / Transit"),
+        90 => Some("Renault / Dacia"),
+        95 => Some("Saab / Opel / Vauxhall / Chevrolet"),
         140 => Some("Hyundai Elantra 2012"),
         208 => Some("AVE (rolling-ID)"),
         241 => Some("EezTire"),
         252 => Some("BMW / Audi / VW (Gen4/5)"),
         257 => Some("BMW (Gen2/3)"),
         298 => Some("TRW-OOK"),
-        _   => None,
+        _ => None,
     }
 }
 

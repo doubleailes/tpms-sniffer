@@ -2,7 +2,7 @@ use std::io::{self, BufRead};
 
 use anyhow::Result;
 use clap::Parser;
-use tpms_tracker::{db::Database, resolver::Resolver, TpmsPacket};
+use tpms_tracker::{TpmsPacket, db::Database, resolver::Resolver};
 
 #[derive(Parser)]
 #[command(
