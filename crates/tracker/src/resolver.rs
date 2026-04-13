@@ -14,6 +14,15 @@ const ROLLING_ID_PROTOCOLS: &[u16] = &[
     208, // AVE
 ];
 
+/// Sensor IDs that are decode artifacts (not real identifiers).
+/// Multiple protocols emit these when the sensor ID field cannot be reliably
+/// extracted.  They must never be used for fixed-ID vehicle matching.
+const SENTINEL_IDS: &[u32] = &[0xFFFFFFFF, 0x00000000];
+
+fn is_valid_sensor_id(id: u32) -> bool {
+    !SENTINEL_IDS.contains(&id)
+}
+
 /// Maximum gap (ms) between consecutive packets belonging to the same burst.
 const BURST_GAP_MS: i64 = 200;
 
@@ -100,7 +109,7 @@ impl Resolver {
             battery_ok: packet.battery_ok.unwrap_or(true),
         };
 
-        if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) {
+        if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) || !is_valid_sensor_id(sensor_id) {
             self.process_rolling(sighting)
         } else {
             self.process_fixed(sighting, packet.rtl433_id)
@@ -295,5 +304,148 @@ fn ema_update(slot: &mut f32, new_val: f32) {
         *slot = new_val;
     } else {
         *slot = *slot * (1.0 - EMA_ALPHA) + new_val * EMA_ALPHA;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    fn make_packet(sensor_id: &str, protocol: &str, rtl433_id: u16, pressure_kpa: f32) -> TpmsPacket {
+        TpmsPacket {
+            timestamp: "2025-06-01 12:00:00.000".to_string(),
+            protocol: protocol.to_string(),
+            rtl433_id,
+            sensor_id: sensor_id.to_string(),
+            pressure_kpa,
+            temp_c: Some(25.0),
+            battery_ok: Some(true),
+            alarm: Some(false),
+            confidence: 90,
+        }
+    }
+
+    fn in_memory_resolver() -> Resolver {
+        let db = Database::open(":memory:").unwrap();
+        Resolver::new(db).unwrap()
+    }
+
+    #[test]
+    fn sentinel_0xffffffff_not_created_via_fixed_id_path() {
+        let mut resolver = in_memory_resolver();
+
+        // Send two packets with 0xFFFFFFFF from EezTire (fixed-ID protocol 241).
+        let p1 = make_packet("0xFFFFFFFF", "EezTire", 241, 51.1);
+        let p2 = make_packet("0xFFFFFFFF", "EezTire", 241, 51.2);
+        resolver.process(&p1).unwrap();
+        resolver.process(&p2).unwrap();
+        resolver.flush().unwrap();
+
+        // No vehicle should have a fixed_sensor_id of 0xFFFFFFFF.
+        for v in resolver.vehicles.values() {
+            assert_ne!(
+                v.fixed_sensor_id,
+                Some(0xFFFFFFFF),
+                "sentinel 0xFFFFFFFF must not be stored as a fixed sensor ID"
+            );
+        }
+        assert!(
+            !resolver.fixed_map.contains_key(&0xFFFFFFFF),
+            "sentinel 0xFFFFFFFF must not appear in fixed_map"
+        );
+    }
+
+    #[test]
+    fn sentinel_0x00000000_not_created_via_fixed_id_path() {
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet("0x00000000", "TRW-OOK", 298, 63.0);
+        let p2 = make_packet("0x00000000", "TRW-OOK", 298, 63.1);
+        resolver.process(&p1).unwrap();
+        resolver.process(&p2).unwrap();
+        resolver.flush().unwrap();
+
+        for v in resolver.vehicles.values() {
+            assert_ne!(
+                v.fixed_sensor_id,
+                Some(0x00000000),
+                "sentinel 0x00000000 must not be stored as a fixed sensor ID"
+            );
+        }
+        assert!(
+            !resolver.fixed_map.contains_key(&0x00000000),
+            "sentinel 0x00000000 must not appear in fixed_map"
+        );
+    }
+
+    #[test]
+    fn sentinel_different_protocols_do_not_merge() {
+        let mut resolver = in_memory_resolver();
+
+        // Two bursts with 0xFFFFFFFF from different protocols, with very
+        // different pressures so the fingerprint correlator cannot merge them.
+        let p1a = make_packet("0xFFFFFFFF", "EezTire", 241, 51.0);
+        let p1b = make_packet("0xFFFFFFFF", "EezTire", 241, 52.0);
+        resolver.process(&p1a).unwrap();
+        resolver.process(&p1b).unwrap();
+        resolver.flush().unwrap();
+
+        let p2a = make_packet("0xFFFFFFFF", "Hyundai-Elantra", 140, 255.0);
+        let p2b = make_packet("0xFFFFFFFF", "Hyundai-Elantra", 140, 254.0);
+        resolver.process(&p2a).unwrap();
+        resolver.process(&p2b).unwrap();
+        resolver.flush().unwrap();
+
+        // Collect all vehicle IDs — different protocols must not share a UUID.
+        let eez_vids: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .map(|v| v.vehicle_id)
+            .collect();
+        let hyu_vids: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "Hyundai-Elantra")
+            .map(|v| v.vehicle_id)
+            .collect();
+
+        for eid in &eez_vids {
+            assert!(
+                !hyu_vids.contains(eid),
+                "EezTire and Hyundai-Elantra with sentinel ID must not share vehicle UUID"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_fixed_id_still_works() {
+        let mut resolver = in_memory_resolver();
+
+        // TRW sensor 0xFEFFFFFD — a valid fixed ID.
+        for _ in 0..5 {
+            let p = make_packet("0xFEFFFFFD", "TRW-OOK", 298, 63.8);
+            resolver.process(&p).unwrap();
+        }
+
+        // All 5 sightings should map to the same vehicle via the fixed-ID path.
+        assert!(
+            resolver.fixed_map.contains_key(&0xFEFFFFFD),
+            "valid ID 0xFEFFFFFD must be in the fixed_map"
+        );
+        let vid = resolver.fixed_map[&0xFEFFFFFD];
+        let vehicle = &resolver.vehicles[&vid];
+        assert_eq!(vehicle.sighting_count, 5);
+        assert_eq!(vehicle.fixed_sensor_id, Some(0xFEFFFFFD));
+    }
+
+    #[test]
+    fn is_valid_sensor_id_unit() {
+        assert!(!is_valid_sensor_id(0xFFFFFFFF));
+        assert!(!is_valid_sensor_id(0x00000000));
+        assert!(is_valid_sensor_id(0xFEFFFFFD));
+        assert!(is_valid_sensor_id(0x1A2B3C4D));
+        assert!(is_valid_sensor_id(1));
     }
 }
