@@ -45,7 +45,7 @@ Modulation codes: **OOK** = On-Off Keying, **FSK-Manch** = FSK + Manchester,
 
 ## Architecture
 
-```
+```text
 rtlsdr-next (async IQ stream)
        │
        ├─ OokDemod ──┐
@@ -92,7 +92,7 @@ cargo build --release
 
 ## Sample output
 
-```
+```text
 [2026-04-10 14:32:01.123] [ 89] Ford-VDO                    0x1A2B3C4D   231.2 kPa ( 33.5 psi)    21.0 °C  conf= 95% [moving]  raw=[1A 2B 3C 4D 8C D6 44 7E]
 [2026-04-10 14:32:01.445] [ 82] Citroen/Peugeot/Fiat        0xABCD1234   218.4 kPa ( 31.7 psi)    20.0 °C  conf= 90%           raw=[00 AB CD 12 34 0C 9E 46 00 XX]
 [2026-04-10 14:32:02.001] [ 88] Toyota-PMV-C210             0x0D5AEE30   234.4 kPa ( 34.0 psi)    25.0 °C  conf= 95%           raw=[0D 5A EE 30 80 8C 41 00 7B 0C]
@@ -144,4 +144,4 @@ regarding reception of automotive RF signals before use.
 
 ## License
 
-Apache-2.0 (matching rtlsdr-next upstream).
+MIT.
