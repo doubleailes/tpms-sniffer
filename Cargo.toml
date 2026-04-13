@@ -1,3 +1,6 @@
+[workspace]
+members = ["tracker"]
+
 [package]
 name = "tpms-sniffer"
 version = "0.2.0"
