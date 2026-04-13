@@ -1,0 +1,21 @@
+[package]
+name = "tpms-sniffer"
+version = "0.2.0"
+edition = "2021"
+description = "Passive TPMS sniffer — 25 protocols from rtl_433, powered by rtlsdr-next"
+
+[[bin]]
+name = "tpms-sniffer"
+path = "src/main.rs"
+
+[dependencies]
+rtlsdr-next  = { git = "https://github.com/mattdelashaw/rtlsdr-next" }
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+clap         = { version = "4", features = ["derive"] }
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono       = { version = "0.4", features = ["serde"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+anyhow       = "1"
