@@ -81,7 +81,30 @@ pub struct TpmsPacket {
     pub alarm: Option<bool>,
     pub raw_hex: String,
     pub confidence: u8,
+    /// `false` when the decoded pressure value is known to be a protocol-level
+    /// artifact rather than a real reading (e.g. AVE-TPMS dual-range encoding,
+    /// see `AVE_MIN_VALID_KPA`). Downstream consumers (the tracker) should not
+    /// update pressure fingerprints from packets with this flag unset.
+    pub pressure_kpa_reliable: bool,
 }
+
+/// Minimum valid AVE-TPMS pressure in kPa.
+///
+/// The AVE aftermarket clip-on TPMS (rtl_433 protocol 208) encodes its
+/// pressure field as `byte * 1.5 kPa`. In addition to the normal operating
+/// range, the same field is reused for a low-pressure detection encoding that
+/// produces values at roughly half the real pressure (e.g. a sensor sitting
+/// at ~382 kPa occasionally transmits a frame decoding to ~190 kPa).  Those
+/// half-range frames are a protocol-level artifact, not a genuine pressure
+/// reading, and if fed into the tracker's pressure fingerprint they cause
+/// the vehicle track to drift or split.
+///
+/// We treat any AVE reading below this threshold as unreliable and clear the
+/// `pressure_kpa_reliable` flag so the tracker can skip fingerprint updates
+/// for it while still counting it as a sighting. 200 kPa sits safely above
+/// the half-range values observed in the field (~190 kPa) and below any
+/// plausible real operating pressure for an aftermarket AVE sensor.
+pub const AVE_MIN_VALID_KPA: f32 = 200.0;
 
 // ─── Entry point ─────────────────────────────────────────────
 
@@ -239,6 +262,7 @@ fn pkt(
         alarm,
         raw_hex: hex_bytes(raw),
         confidence: conf,
+        pressure_kpa_reliable: true,
     }
 }
 
@@ -744,7 +768,7 @@ fn decode_ave(bits: &[u8]) -> Option<TpmsPacket> {
     let kpa = b[4] as f32 * 1.5;
     let temp = b[5] as f32 - 40.0;
     let sane = (0.0..=400.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
-    Some(pkt(
+    let mut p = pkt(
         "AVE-TPMS",
         208,
         id,
@@ -756,7 +780,14 @@ fn decode_ave(bits: &[u8]) -> Option<TpmsPacket> {
         None,
         &b[..6],
         score(xor == 0, sane, kpa, Some(temp)),
-    ))
+    );
+    // AVE encodes a half-range low-pressure frame for the same physical
+    // sensor; flag those as unreliable so the tracker skips fingerprint
+    // updates from them. See `AVE_MIN_VALID_KPA` for the protocol reference.
+    if kpa < AVE_MIN_VALID_KPA {
+        p.pressure_kpa_reliable = false;
+    }
+    Some(p)
 }
 
 // ═══════════════════════════════════════════════════════════
