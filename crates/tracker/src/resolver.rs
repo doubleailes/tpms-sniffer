@@ -176,6 +176,63 @@ impl Resolver {
         // Look up or create the vehicle.
         let vehicle_id = if let Some(&vid) = self.fixed_map.get(&key) {
             vid
+        } else if rtl433_id != 0 {
+            // Legacy backward-compat bridge: a migrated row may have
+            // `rtl433_id=0` because the column did not exist at insert time.
+            // Check whether `(sensor_id, 0)` already maps to a vehicle whose
+            // protocol matches, and if so adopt it rather than creating a
+            // duplicate.
+            let legacy_key = (sensor_id, 0u16);
+            if let Some(&legacy_vid) = self.fixed_map.get(&legacy_key) {
+                let protocol_matches = self
+                    .vehicles
+                    .get(&legacy_vid)
+                    .map_or(false, |v| v.protocol == sighting.protocol);
+                if protocol_matches {
+                    // Migrate the in-memory key from (sensor_id, 0) to the
+                    // real (sensor_id, rtl433_id) and correct the stored value.
+                    self.fixed_map.remove(&legacy_key);
+                    self.fixed_map.insert(key, legacy_vid);
+                    if let Some(v) = self.vehicles.get_mut(&legacy_vid) {
+                        v.rtl433_id = rtl433_id;
+                    }
+                    self.db.update_rtl433_id(legacy_vid, rtl433_id)?;
+                    legacy_vid
+                } else {
+                    // Different protocol — create a new vehicle as normal.
+                    let vid = Uuid::new_v4();
+                    let vehicle = VehicleTrack {
+                        vehicle_id: vid,
+                        first_seen: sighting.ts,
+                        last_seen: sighting.ts,
+                        sighting_count: 0,
+                        protocol: sighting.protocol.clone(),
+                        rtl433_id,
+                        fixed_sensor_id: Some(sensor_id),
+                        pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
+                        make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+                    };
+                    self.fixed_map.insert(key, vid);
+                    self.vehicles.insert(vid, vehicle);
+                    vid
+                }
+            } else {
+                let vid = Uuid::new_v4();
+                let vehicle = VehicleTrack {
+                    vehicle_id: vid,
+                    first_seen: sighting.ts,
+                    last_seen: sighting.ts,
+                    sighting_count: 0,
+                    protocol: sighting.protocol.clone(),
+                    rtl433_id,
+                    fixed_sensor_id: Some(sensor_id),
+                    pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
+                    make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+                };
+                self.fixed_map.insert(key, vid);
+                self.vehicles.insert(vid, vehicle);
+                vid
+            }
         } else {
             let vid = Uuid::new_v4();
             let vehicle = VehicleTrack {

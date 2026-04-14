@@ -122,6 +122,18 @@ impl Database {
         Ok(())
     }
 
+    /// Update the `rtl433_id` column for an existing vehicle row.
+    /// Used when a legacy row (migrated with `rtl433_id=0`) is adopted by a
+    /// packet carrying the real decoder ID, so the stored key is corrected
+    /// in place rather than creating a duplicate vehicle.
+    pub fn update_rtl433_id(&self, vehicle_id: Uuid, rtl433_id: u16) -> Result<()> {
+        self.conn.execute(
+            "UPDATE vehicles SET rtl433_id = ?1 WHERE vehicle_id = ?2",
+            params![rtl433_id as i64, vehicle_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Look up a vehicle by its fixed sensor_id.
     pub fn find_vehicle_by_sensor_id(&self, sensor_id: u32) -> Result<Option<VehicleTrack>> {
         let mut stmt = self.conn.prepare(
