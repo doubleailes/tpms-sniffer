@@ -203,19 +203,13 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let pressure_sig_s: String = row.get(7)?;
     let rtl433_id: i64 = row.get(8)?;
     let tx_interval_median: Option<i64> = row.get(9)?;
-    let tx_interval_samples: i64 = row.get(10)?;
+    let _tx_interval_samples: i64 = row.get(10)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now())
     };
-
-    // Reconstruct the in-memory tx_intervals_ms ring buffer: we don't persist
-    // individual intervals, so after a DB reload the buffer is empty and the
-    // median will be recalculated from live traffic.  We do carry over the
-    // sample count / median so the DB row reflects the last-known state.
-    let _ = tx_interval_samples; // acknowledged but not used for ring buffer
 
     Ok(VehicleTrack {
         vehicle_id: Uuid::parse_str(&vid).unwrap_or_else(|_| Uuid::nil()),
