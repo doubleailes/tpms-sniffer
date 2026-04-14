@@ -442,46 +442,56 @@ impl Database {
         from: Option<&str>,
         to: Option<&str>,
     ) -> Result<Vec<PresenceSlot>> {
-        let query = match (from, to) {
-            (Some(f), Some(t)) => format!(
-                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
-                 FROM presence_slots WHERE car_id = ?1 AND slot_start >= '{}' AND slot_start <= '{}' \
-                 ORDER BY slot_start",
-                f, t
-            ),
-            (Some(f), None) => format!(
-                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
-                 FROM presence_slots WHERE car_id = ?1 AND slot_start >= '{}' \
-                 ORDER BY slot_start",
-                f
-            ),
-            (None, Some(t)) => format!(
-                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
-                 FROM presence_slots WHERE car_id = ?1 AND slot_start <= '{}' \
-                 ORDER BY slot_start",
-                t
-            ),
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let receiver_ids_s: String = row.get(4)?;
+            let receiver_ids: Vec<String> =
+                serde_json::from_str(&receiver_ids_s).unwrap_or_default();
+            Ok(PresenceSlot {
+                car_id: row.get(0)?,
+                slot_start: row.get(1)?,
+                slot_end: row.get(2)?,
+                sighting_count: row.get(3)?,
+                receiver_ids,
+            })
+        };
+
+        let slots = match (from, to) {
+            (Some(f), Some(t)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                     FROM presence_slots WHERE car_id = ?1 AND slot_start >= ?2 AND slot_start <= ?3 \
+                     ORDER BY slot_start",
+                )?;
+                stmt.query_map(params![car_id, f, t], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(f), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                     FROM presence_slots WHERE car_id = ?1 AND slot_start >= ?2 \
+                     ORDER BY slot_start",
+                )?;
+                stmt.query_map(params![car_id, f], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(t)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                     FROM presence_slots WHERE car_id = ?1 AND slot_start <= ?2 \
+                     ORDER BY slot_start",
+                )?;
+                stmt.query_map(params![car_id, t], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
             (None, None) => {
-                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
-                 FROM presence_slots WHERE car_id = ?1 ORDER BY slot_start"
-                    .to_string()
+                let mut stmt = self.conn.prepare(
+                    "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                     FROM presence_slots WHERE car_id = ?1 ORDER BY slot_start",
+                )?;
+                stmt.query_map(params![car_id], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
-        let mut stmt = self.conn.prepare(&query)?;
-        let slots = stmt
-            .query_map(params![car_id], |row| {
-                let receiver_ids_s: String = row.get(4)?;
-                let receiver_ids: Vec<String> =
-                    serde_json::from_str(&receiver_ids_s).unwrap_or_default();
-                Ok(PresenceSlot {
-                    car_id: row.get(0)?,
-                    slot_start: row.get(1)?,
-                    slot_end: row.get(2)?,
-                    sighting_count: row.get(3)?,
-                    receiver_ids,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(slots)
     }
 
@@ -496,44 +506,54 @@ impl Database {
         from: Option<&str>,
         to: Option<&str>,
     ) -> Result<Vec<PressureReading>> {
-        let query = match (from, to) {
-            (Some(f), Some(t)) => format!(
-                "SELECT ts, pressure_kpa, alarm FROM sightings \
-                 WHERE vehicle_id = ?1 AND ts >= '{}' AND ts <= '{}' ORDER BY ts",
-                f, t
-            ),
-            (Some(f), None) => format!(
-                "SELECT ts, pressure_kpa, alarm FROM sightings \
-                 WHERE vehicle_id = ?1 AND ts >= '{}' ORDER BY ts",
-                f
-            ),
-            (None, Some(t)) => format!(
-                "SELECT ts, pressure_kpa, alarm FROM sightings \
-                 WHERE vehicle_id = ?1 AND ts <= '{}' ORDER BY ts",
-                t
-            ),
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let ts_s: String = row.get(0)?;
+            let pressure_kpa: f64 = row.get(1)?;
+            let alarm: i64 = row.get(2)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(PressureReading {
+                ts,
+                pressure_kpa: pressure_kpa as f32,
+                alarm: alarm != 0,
+            })
+        };
+
+        let readings = match (from, to) {
+            (Some(f), Some(t)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT ts, pressure_kpa, alarm FROM sightings \
+                     WHERE vehicle_id = ?1 AND ts >= ?2 AND ts <= ?3 ORDER BY ts",
+                )?;
+                stmt.query_map(params![vehicle_id, f, t], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (Some(f), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT ts, pressure_kpa, alarm FROM sightings \
+                     WHERE vehicle_id = ?1 AND ts >= ?2 ORDER BY ts",
+                )?;
+                stmt.query_map(params![vehicle_id, f], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            (None, Some(t)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT ts, pressure_kpa, alarm FROM sightings \
+                     WHERE vehicle_id = ?1 AND ts <= ?2 ORDER BY ts",
+                )?;
+                stmt.query_map(params![vehicle_id, t], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
             (None, None) => {
-                "SELECT ts, pressure_kpa, alarm FROM sightings \
-                 WHERE vehicle_id = ?1 ORDER BY ts"
-                    .to_string()
+                let mut stmt = self.conn.prepare(
+                    "SELECT ts, pressure_kpa, alarm FROM sightings \
+                     WHERE vehicle_id = ?1 ORDER BY ts",
+                )?;
+                stmt.query_map(params![vehicle_id], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
-        let mut stmt = self.conn.prepare(&query)?;
-        let readings = stmt
-            .query_map(params![vehicle_id], |row| {
-                let ts_s: String = row.get(0)?;
-                let pressure_kpa: f64 = row.get(1)?;
-                let alarm: i64 = row.get(2)?;
-                let ts = DateTime::parse_from_rfc3339(&ts_s)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                Ok(PressureReading {
-                    ts,
-                    pressure_kpa: pressure_kpa as f32,
-                    alarm: alarm != 0,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(readings)
     }
 
@@ -699,24 +719,13 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // Total sighting count.
-        let vehicle_ids: Vec<String> = vehicles.iter().map(|v| v.vehicle_id.clone()).collect();
-        let total_sessions: i64 = if vehicle_ids.is_empty() {
-            0
-        } else {
-            let placeholders: Vec<String> = vehicle_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
-            let query = format!(
-                "SELECT COUNT(*) FROM sightings WHERE vehicle_id IN ({})",
-                placeholders.join(", ")
-            );
-            let mut stmt = self.conn.prepare(&query)?;
-            let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vehicle_ids
-                .iter()
-                .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
-                .collect();
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-            stmt.query_row(params_ref.as_slice(), |row| row.get(0))?
-        };
+        // Total sighting count via subquery on car_id.
+        let total_sessions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sightings WHERE vehicle_id IN \
+             (SELECT vehicle_id FROM vehicles WHERE car_id = ?1)",
+            params![car_id],
+            |row| row.get(0),
+        )?;
 
         // Presence slots for routine.
         let slots = self.get_presence_slots(car_id, from, to)?;
