@@ -135,10 +135,7 @@ pub struct VehicleMeta {
 /// Return candidate wheel-mate vehicle IDs for `target` by filtering on
 /// shared sensor-ID byte prefix.  Only applies to fixed-ID protocols; vehicles
 /// without a `fixed_sensor_id` are excluded.
-pub fn candidate_wheel_mates(
-    target: &VehicleMeta,
-    all_vehicles: &[VehicleMeta],
-) -> Vec<Uuid> {
+pub fn candidate_wheel_mates(target: &VehicleMeta, all_vehicles: &[VehicleMeta]) -> Vec<Uuid> {
     let Some(target_sid) = target.fixed_sensor_id else {
         return vec![];
     };
@@ -477,10 +474,7 @@ impl CoOccurrenceMatrix {
             }
         }
         // Sort for deterministic output.
-        pairs.sort_by(|x, y| {
-            x.a.cmp(&y.a)
-                .then(x.b.cmp(&y.b))
-        });
+        pairs.sort_by(|x, y| x.a.cmp(&y.a).then(x.b.cmp(&y.b)));
         JaccardExport {
             window_size_s: WINDOW_SIZE_S,
             windows_accumulated: self.windows_accumulated,
@@ -773,9 +767,21 @@ mod tests {
             fixed_sensor_id: Some(0xFF00_0000),
         };
         let all = vec![
-            VehicleMeta { vehicle_id: target.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
-            VehicleMeta { vehicle_id: mate.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C201) },
-            VehicleMeta { vehicle_id: stranger.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xFF00_0000) },
+            VehicleMeta {
+                vehicle_id: target.vehicle_id,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C100),
+            },
+            VehicleMeta {
+                vehicle_id: mate.vehicle_id,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C201),
+            },
+            VehicleMeta {
+                vehicle_id: stranger.vehicle_id,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xFF00_0000),
+            },
         ];
         let result = candidate_wheel_mates(&target, &all);
         assert!(result.contains(&mate.vehicle_id));
@@ -790,9 +796,11 @@ mod tests {
             rtl433_id: 208,
             fixed_sensor_id: None,
         };
-        let all = vec![
-            VehicleMeta { vehicle_id: Uuid::new_v4(), rtl433_id: 208, fixed_sensor_id: None },
-        ];
+        let all = vec![VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 208,
+            fixed_sensor_id: None,
+        }];
         let result = candidate_wheel_mates(&target, &all);
         assert!(result.is_empty());
     }
@@ -810,8 +818,16 @@ mod tests {
             fixed_sensor_id: Some(0xA3B2C200),
         };
         let all = vec![
-            VehicleMeta { vehicle_id: target.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
-            VehicleMeta { vehicle_id: other.vehicle_id, rtl433_id: 140, fixed_sensor_id: Some(0xA3B2C200) },
+            VehicleMeta {
+                vehicle_id: target.vehicle_id,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C100),
+            },
+            VehicleMeta {
+                vehicle_id: other.vehicle_id,
+                rtl433_id: 140,
+                fixed_sensor_id: Some(0xA3B2C200),
+            },
         ];
         let result = candidate_wheel_mates(&target, &all);
         assert!(result.is_empty());
@@ -834,11 +850,31 @@ mod tests {
 
         let ids = vec![v1, v2, v3, v4, outsider];
         let meta = vec![
-            VehicleMeta { vehicle_id: v1, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
-            VehicleMeta { vehicle_id: v2, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C101) },
-            VehicleMeta { vehicle_id: v3, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C102) },
-            VehicleMeta { vehicle_id: v4, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C103) },
-            VehicleMeta { vehicle_id: outsider, rtl433_id: 298, fixed_sensor_id: Some(0xFF000001) },
+            VehicleMeta {
+                vehicle_id: v1,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C100),
+            },
+            VehicleMeta {
+                vehicle_id: v2,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C101),
+            },
+            VehicleMeta {
+                vehicle_id: v3,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C102),
+            },
+            VehicleMeta {
+                vehicle_id: v4,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C103),
+            },
+            VehicleMeta {
+                vehicle_id: outsider,
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xFF000001),
+            },
         ];
         let groups = group_vehicles_into_cars_with_meta(&m, &ids, &meta);
 
@@ -855,9 +891,11 @@ mod tests {
         // Fixture: 25 fixed-ID sensors of the same protocol.
         // 4 share a prefix → candidates for one target should be ≤ 3 (not 24).
         let target_id = Uuid::new_v4();
-        let mut meta: Vec<VehicleMeta> = vec![
-            VehicleMeta { vehicle_id: target_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
-        ];
+        let mut meta: Vec<VehicleMeta> = vec![VehicleMeta {
+            vehicle_id: target_id,
+            rtl433_id: 298,
+            fixed_sensor_id: Some(0xA3B2C100),
+        }];
         // 3 peers with the same prefix.
         for i in 1..=3u32 {
             meta.push(VehicleMeta {
@@ -884,7 +922,12 @@ mod tests {
 
     #[test]
     fn wheel_position_round_trip() {
-        for pos in &[WheelPosition::FL, WheelPosition::FR, WheelPosition::RL, WheelPosition::RR] {
+        for pos in &[
+            WheelPosition::FL,
+            WheelPosition::FR,
+            WheelPosition::RL,
+            WheelPosition::RR,
+        ] {
             let s = pos.as_str();
             let parsed = WheelPosition::from_str(s).unwrap();
             assert_eq!(*pos, parsed);

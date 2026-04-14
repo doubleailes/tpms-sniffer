@@ -7,12 +7,12 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::jaccard::{
-    self, CoOccurrenceMatrix, VehicleMeta, group_vehicles_into_cars_with_meta,
-    infer_wheel_positions, WINDOW_SIZE_S,
+    self, CoOccurrenceMatrix, VehicleMeta, WINDOW_SIZE_S, group_vehicles_into_cars_with_meta,
+    infer_wheel_positions,
 };
 use crate::{
-    CROSS_RECEIVER_WINDOW_MS, Sighting, TpmsPacket, VehicleTrack, compute_median,
-    make_model_hint, TX_INTERVAL_MAX_MS, TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW,
+    CROSS_RECEIVER_WINDOW_MS, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_TOLERANCE_MS,
+    TX_INTERVAL_WINDOW, TpmsPacket, VehicleTrack, compute_median, make_model_hint,
 };
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
@@ -263,11 +263,7 @@ impl Resolver {
     // Fixed-ID path
     // -----------------------------------------------------------------------
 
-    fn process_fixed(
-        &mut self,
-        sighting: Sighting,
-        rtl433_id: u16,
-    ) -> Result<Option<Uuid>> {
+    fn process_fixed(&mut self, sighting: Sighting, rtl433_id: u16) -> Result<Option<Uuid>> {
         let sensor_id = sighting.sensor_id;
         // Key the fixed-ID map on `(sensor_id, rtl433_id)` so that two
         // sensors from different decoders sharing a `sensor_id` value produce
@@ -433,10 +429,7 @@ impl Resolver {
     /// field is unreliable because bits flip between transmissions (e.g.
     /// EezTire), which would otherwise cause every packet to create a new
     /// vehicle via the fixed-ID path.
-    fn process_fingerprint(
-        &mut self,
-        sighting: Sighting,
-    ) -> Result<Option<Uuid>> {
+    fn process_fingerprint(&mut self, sighting: Sighting) -> Result<Option<Uuid>> {
         let now = sighting.ts;
         let pressure = sighting.pressure_kpa;
         let protocol = sighting.protocol.clone();
@@ -465,9 +458,7 @@ impl Resolver {
                     return false;
                 }
                 // Interval guard: reject if both sides have data and intervals differ.
-                if let (Some(v_interval), Some(s_interval)) =
-                    (v.tx_interval_median_ms, hint)
-                {
+                if let (Some(v_interval), Some(s_interval)) = (v.tx_interval_median_ms, hint) {
                     let delta = (v_interval as i64 - s_interval as i64).unsigned_abs() as u32;
                     if delta > TX_INTERVAL_TOLERANCE_MS {
                         return false;
@@ -560,10 +551,7 @@ impl Resolver {
     // Rolling-ID path (burst accumulator)
     // -----------------------------------------------------------------------
 
-    fn process_rolling(
-        &mut self,
-        sighting: Sighting,
-    ) -> Result<Option<Uuid>> {
+    fn process_rolling(&mut self, sighting: Sighting) -> Result<Option<Uuid>> {
         // Unreliable readings (e.g. AVE half-range low-pressure frames) would
         // poison the pressure fingerprint if fed through the burst accumulator.
         // Drop them entirely: do not extend the pending burst, do not close it,
@@ -650,8 +638,7 @@ impl Resolver {
                 if let Some(v_median) = v.tx_interval_median_ms {
                     let gap_ms = now.signed_duration_since(v.last_seen).num_milliseconds();
                     if gap_ms > 0 && (gap_ms as u32) < TX_INTERVAL_MAX_MS {
-                        let delta =
-                            (v_median as i64 - gap_ms).unsigned_abs() as u32;
+                        let delta = (v_median as i64 - gap_ms).unsigned_abs() as u32;
                         if delta > TX_INTERVAL_TOLERANCE_MS {
                             return false;
                         }
@@ -723,11 +710,10 @@ impl Resolver {
 
         // Incrementally update presence slot if car_id is assigned.
         if let Some(car_id) = vehicle.car_id {
-            if let Err(e) = self.db.upsert_presence_slot(
-                &car_id.to_string(),
-                &now,
-                &self.receiver_id,
-            ) {
+            if let Err(e) =
+                self.db
+                    .upsert_presence_slot(&car_id.to_string(), &now, &self.receiver_id)
+            {
                 eprintln!("warn: presence slot upsert failed: {e}");
             }
         }
@@ -744,9 +730,7 @@ impl Resolver {
     /// algorithm and persists car assignments.
     fn maybe_advance_window(&mut self, now: DateTime<Utc>) {
         let should_advance = match self.last_window_advance {
-            Some(prev) => {
-                (now - prev).num_seconds() >= WINDOW_SIZE_S as i64
-            }
+            Some(prev) => (now - prev).num_seconds() >= WINDOW_SIZE_S as i64,
             None => {
                 // First packet ever — initialize the timer but don't advance.
                 self.last_window_advance = Some(now);
@@ -787,7 +771,8 @@ impl Resolver {
             let mut make_model: Option<String> = None;
             for &vid in &group.members {
                 if let Some(v) = self.vehicles.get(&vid) {
-                    first = Some(first.map_or(v.first_seen, |f: DateTime<Utc>| f.min(v.first_seen)));
+                    first =
+                        Some(first.map_or(v.first_seen, |f: DateTime<Utc>| f.min(v.first_seen)));
                     last = Some(last.map_or(v.last_seen, |l: DateTime<Utc>| l.max(v.last_seen)));
                     if make_model.is_none() {
                         make_model = v.make_model_hint.clone();
@@ -810,9 +795,7 @@ impl Resolver {
             let group_sensor_ids: Vec<u32> = group
                 .members
                 .iter()
-                .filter_map(|vid| {
-                    self.vehicles.get(vid).and_then(|v| v.fixed_sensor_id)
-                })
+                .filter_map(|vid| self.vehicles.get(vid).and_then(|v| v.fixed_sensor_id))
                 .collect();
             let wheel_map = infer_wheel_positions(&group_sensor_ids);
 
@@ -918,7 +901,14 @@ mod tests {
         rtl433_id: u16,
         pressure_kpa: f32,
     ) -> TpmsPacket {
-        make_packet_at_reliable(timestamp, sensor_id, protocol, rtl433_id, pressure_kpa, true)
+        make_packet_at_reliable(
+            timestamp,
+            sensor_id,
+            protocol,
+            rtl433_id,
+            pressure_kpa,
+            true,
+        )
     }
 
     fn make_packet_at_reliable(
@@ -1413,7 +1403,7 @@ mod tests {
         assert_eq!(vehicle_expiry_for(208), Duration::seconds(600)); // AVE-TPMS
         assert_eq!(vehicle_expiry_for(241), Duration::seconds(480)); // EezTire
         assert_eq!(vehicle_expiry_for(298), Duration::seconds(480)); // TRW-OOK
-        assert_eq!(vehicle_expiry_for(0), Duration::seconds(300));   // default
+        assert_eq!(vehicle_expiry_for(0), Duration::seconds(300)); // default
     }
 
     #[test]
@@ -1703,7 +1693,10 @@ mod tests {
             298,
             63.8,
         );
-        let vid1 = resolver.process(&p1).unwrap().expect("packet 1 must resolve");
+        let vid1 = resolver
+            .process(&p1)
+            .unwrap()
+            .expect("packet 1 must resolve");
         assert_ne!(vid1, ave_vid, "packet 1 must not resolve to AVE vehicle");
 
         // Packet 2: TRW-OOK, sentinel 0xFFFFFFFF.
@@ -1730,7 +1723,10 @@ mod tests {
             298,
             63.8,
         );
-        let vid3 = resolver.process(&p3).unwrap().expect("packet 3 must resolve");
+        let vid3 = resolver
+            .process(&p3)
+            .unwrap()
+            .expect("packet 3 must resolve");
         assert_ne!(vid3, ave_vid, "packet 3 must not resolve to AVE vehicle");
 
         // Packets 1 and 3 share the same valid fixed ID — they must resolve
@@ -2109,7 +2105,10 @@ mod tests {
             "node-02",
         );
         let vid2 = resolver.process(&p2).unwrap().unwrap();
-        assert_eq!(vid1, vid2, "same vehicle from different receiver within window");
+        assert_eq!(
+            vid1, vid2,
+            "same vehicle from different receiver within window"
+        );
 
         let v = &resolver.vehicles[&vid2];
         assert_eq!(
@@ -2145,8 +2144,7 @@ mod tests {
         );
         resolver.process(&p2).unwrap();
         assert_eq!(
-            resolver.vehicles[&vid].sighting_count,
-            count_after_first,
+            resolver.vehicles[&vid].sighting_count, count_after_first,
             "cross-receiver duplicate must not increment sighting_count"
         );
     }
@@ -2181,11 +2179,7 @@ mod tests {
             vid1, vid2,
             "same vehicle from two receivers within 2 s must produce one UUID"
         );
-        assert_eq!(
-            resolver.vehicles.len(),
-            1,
-            "only one vehicle should exist"
-        );
+        assert_eq!(resolver.vehicles.len(), 1, "only one vehicle should exist");
     }
 
     #[test]
