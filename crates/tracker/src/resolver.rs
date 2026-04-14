@@ -55,8 +55,18 @@ const PRESSURE_MATCH_TOLERANCE_KPA: f32 = 5.0;
 /// How long a vehicle remains eligible for pressure-fingerprint correlation
 /// after its most recent sighting.  After this gap we assume the sensor has
 /// gone out of range and any new match is a different vehicle.
-fn vehicle_expiry() -> Duration {
-    Duration::seconds(300) // 5 minutes
+///
+/// Some protocols transmit infrequently when the vehicle is stationary and
+/// need a longer expiry than the default.  AVE-TPMS (rtl_433 id 208) is a
+/// known low-transmission-rate protocol — aftermarket AVE sensors idle at
+/// 2–8 minute intervals when parked, so a 5-minute expiry leaks the track
+/// and spawns a fresh vehicle UUID for every other sighting. See
+/// `crates/tracker/README.md` for the documented per-protocol values.
+fn vehicle_expiry_for(rtl433_id: u16) -> Duration {
+    match rtl433_id {
+        208 => Duration::seconds(600), // AVE-TPMS: low TX rate when parked
+        _ => Duration::seconds(300),   // default: 5 minutes
+    }
 }
 
 /// EMA weight for updating the pressure signature (higher = faster adaptation).
@@ -142,13 +152,15 @@ impl Resolver {
             battery_ok: packet.battery_ok.unwrap_or(true),
         };
 
+        let pressure_reliable = packet.pressure_kpa_reliable;
+
         if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
-            self.process_fingerprint(sighting)
+            self.process_fingerprint(sighting, pressure_reliable)
         } else if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) || !is_valid_sensor_id(sensor_id)
         {
-            self.process_rolling(sighting)
+            self.process_rolling(sighting, pressure_reliable)
         } else {
-            self.process_fixed(sighting, packet.rtl433_id)
+            self.process_fixed(sighting, packet.rtl433_id, pressure_reliable)
         }
     }
 
@@ -166,7 +178,12 @@ impl Resolver {
     // Fixed-ID path
     // -----------------------------------------------------------------------
 
-    fn process_fixed(&mut self, sighting: Sighting, rtl433_id: u16) -> Result<Option<Uuid>> {
+    fn process_fixed(
+        &mut self,
+        sighting: Sighting,
+        rtl433_id: u16,
+        pressure_reliable: bool,
+    ) -> Result<Option<Uuid>> {
         let sensor_id = sighting.sensor_id;
         // Key the fixed-ID map on `(sensor_id, rtl433_id)` so that two
         // sensors from different decoders sharing a `sensor_id` value produce
@@ -255,7 +272,9 @@ impl Resolver {
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
         vehicle.last_seen = sighting.ts;
         vehicle.sighting_count += 1;
-        ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
+        if pressure_reliable {
+            ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
+        }
 
         // Persist.
         self.db.upsert_vehicle(vehicle)?;
@@ -273,12 +292,16 @@ impl Resolver {
     /// field is unreliable because bits flip between transmissions (e.g.
     /// EezTire), which would otherwise cause every packet to create a new
     /// vehicle via the fixed-ID path.
-    fn process_fingerprint(&mut self, sighting: Sighting) -> Result<Option<Uuid>> {
+    fn process_fingerprint(
+        &mut self,
+        sighting: Sighting,
+        pressure_reliable: bool,
+    ) -> Result<Option<Uuid>> {
         let now = sighting.ts;
         let pressure = sighting.pressure_kpa;
         let protocol = sighting.protocol.clone();
         let rtl433_id = sighting.rtl433_id;
-        let expiry = vehicle_expiry();
+        let expiry = vehicle_expiry_for(rtl433_id);
 
         // Find an active vehicle of the same protocol whose pressure
         // signature is within tolerance.  Copy the Uuid so we drop the shared
@@ -314,7 +337,9 @@ impl Resolver {
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
         vehicle.last_seen = now;
         vehicle.sighting_count += 1;
-        ema_update(&mut vehicle.pressure_signature[0], pressure);
+        if pressure_reliable {
+            ema_update(&mut vehicle.pressure_signature[0], pressure);
+        }
 
         // Persist.
         self.db.upsert_vehicle(vehicle)?;
@@ -327,7 +352,22 @@ impl Resolver {
     // Rolling-ID path (burst accumulator)
     // -----------------------------------------------------------------------
 
-    fn process_rolling(&mut self, sighting: Sighting) -> Result<Option<Uuid>> {
+    fn process_rolling(
+        &mut self,
+        sighting: Sighting,
+        pressure_reliable: bool,
+    ) -> Result<Option<Uuid>> {
+        // Unreliable readings (e.g. AVE half-range low-pressure frames) would
+        // poison the pressure fingerprint if fed through the burst
+        // accumulator.  Drop them entirely: do not extend the pending burst,
+        // do not close it, do not start a new one.  The sighting is lost
+        // because it doesn't carry a trustworthy pressure, but the track for
+        // the underlying vehicle keeps its last known good signature and is
+        // still matched when the next normal packet arrives.
+        if !pressure_reliable {
+            return Ok(None);
+        }
+
         let ts = sighting.ts;
         let protocol = sighting.protocol.clone();
 
@@ -492,6 +532,17 @@ mod tests {
         rtl433_id: u16,
         pressure_kpa: f32,
     ) -> TpmsPacket {
+        make_packet_at_reliable(timestamp, sensor_id, protocol, rtl433_id, pressure_kpa, true)
+    }
+
+    fn make_packet_at_reliable(
+        timestamp: &str,
+        sensor_id: &str,
+        protocol: &str,
+        rtl433_id: u16,
+        pressure_kpa: f32,
+        pressure_kpa_reliable: bool,
+    ) -> TpmsPacket {
         TpmsPacket {
             timestamp: timestamp.to_string(),
             protocol: protocol.to_string(),
@@ -502,6 +553,7 @@ mod tests {
             battery_ok: Some(true),
             alarm: Some(false),
             confidence: 90,
+            pressure_kpa_reliable,
         }
     }
 
@@ -802,6 +854,74 @@ mod tests {
         let p_trw2 = make_packet(shared_id, "TRW-OOK", 298, 63.9);
         let vid_trw2 = resolver.process(&p_trw2).unwrap().expect("vid");
         assert_eq!(vid_trw, vid_trw2);
+    }
+
+    #[test]
+    fn ave_half_range_frame_does_not_split_vehicle() {
+        // Regression for the AVE-TPMS dual-range encoding issue: a single
+        // physical sensor occasionally emits a frame whose pressure field
+        // decodes to roughly half the real pressure (~190 kPa vs ~382 kPa).
+        // The sniffer decoder flags these as `pressure_kpa_reliable = false`;
+        // the tracker must drop them so they do not create a distinct vehicle
+        // or drift the pressure signature of the real vehicle.
+        let mut resolver = in_memory_resolver();
+
+        // Three AVE packets with rolling sensor IDs, tight timestamps so they
+        // all fall inside one burst window (BURST_GAP_MS = 200ms).
+        let p1 = make_packet_at(
+            "2025-06-01 19:17:57.000",
+            "0x12345678",
+            "AVE-TPMS",
+            208,
+            382.5,
+        );
+        let p2 = make_packet_at_reliable(
+            "2025-06-01 19:17:57.050",
+            "0x87654321",
+            "AVE-TPMS",
+            208,
+            190.5,
+            false, // half-range artifact, flagged by the decoder
+        );
+        let p3 = make_packet_at(
+            "2025-06-01 19:17:57.100",
+            "0xDEADBEEF",
+            "AVE-TPMS",
+            208,
+            382.5,
+        );
+
+        resolver.process(&p1).unwrap();
+        resolver.process(&p2).unwrap();
+        resolver.process(&p3).unwrap();
+        resolver.flush().unwrap();
+
+        // Exactly one AVE vehicle, whose signature has not been contaminated
+        // by the 190.5 kPa half-range reading.
+        let ave: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "AVE-TPMS")
+            .collect();
+        assert_eq!(
+            ave.len(),
+            1,
+            "the half-range 190.5 kPa frame must not spawn a second vehicle"
+        );
+        let sig0 = ave[0].pressure_signature[0];
+        assert!(
+            (sig0 - 382.5).abs() < 1.0,
+            "pressure signature drifted from 382.5 kPa to {sig0}"
+        );
+    }
+
+    #[test]
+    fn ave_has_longer_vehicle_expiry_than_default() {
+        // Documented per-protocol expiry: AVE-TPMS (208) uses 10 minutes,
+        // everything else (e.g. EezTire 241) keeps the 5-minute default.
+        assert_eq!(vehicle_expiry_for(208), Duration::seconds(600));
+        assert_eq!(vehicle_expiry_for(241), Duration::seconds(300));
+        assert_eq!(vehicle_expiry_for(0), Duration::seconds(300));
     }
 
     #[test]

@@ -18,6 +18,15 @@ pub struct TpmsPacket {
     pub battery_ok: Option<bool>,
     pub alarm: Option<bool>,
     pub confidence: u8,
+    /// `false` when the decoder tagged the pressure reading as a protocol
+    /// artifact (e.g. AVE-TPMS half-range low-pressure frame). Missing in
+    /// older JSON captures — defaults to `true`.
+    #[serde(default = "default_pressure_reliable")]
+    pub pressure_kpa_reliable: bool,
+}
+
+fn default_pressure_reliable() -> bool {
+    true
 }
 
 impl TpmsPacket {
