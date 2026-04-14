@@ -358,12 +358,13 @@ impl Resolver {
         pressure_reliable: bool,
     ) -> Result<Option<Uuid>> {
         // Unreliable readings (e.g. AVE half-range low-pressure frames) would
-        // poison the pressure fingerprint if fed through the burst
-        // accumulator.  Drop them entirely: do not extend the pending burst,
-        // do not close it, do not start a new one.  The sighting is lost
-        // because it doesn't carry a trustworthy pressure, but the track for
-        // the underlying vehicle keeps its last known good signature and is
-        // still matched when the next normal packet arrives.
+        // poison the pressure fingerprint if fed through the burst accumulator.
+        // Drop them entirely: do not extend the pending burst, do not close it,
+        // do not start a new one.  A sighting cannot be persisted here because
+        // no vehicle UUID is known until a complete burst resolves — recording a
+        // sighting requires a vehicle to attach it to.  The track for the
+        // underlying vehicle keeps its last known good signature and is still
+        // matched when the next normal packet arrives.
         if !pressure_reliable {
             return Ok(None);
         }

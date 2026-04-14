@@ -100,10 +100,13 @@ pub struct TpmsPacket {
 /// the vehicle track to drift or split.
 ///
 /// We treat any AVE reading below this threshold as unreliable and clear the
-/// `pressure_kpa_reliable` flag so the tracker can skip fingerprint updates
-/// for it while still counting it as a sighting. 200 kPa sits safely above
-/// the half-range values observed in the field (~190 kPa) and below any
-/// plausible real operating pressure for an aftermarket AVE sensor.
+/// `pressure_kpa_reliable` flag.  Consumers that correlate by pressure
+/// fingerprint (e.g. the rolling-ID burst path in the tracker) drop these
+/// packets entirely to avoid poisoning the pressure signature; consumers that
+/// already know the vehicle identity may choose to record them as low-quality
+/// sightings.  200 kPa sits safely above the half-range values observed in
+/// the field (~190 kPa) and below any plausible real operating pressure for
+/// an aftermarket AVE sensor.
 pub const AVE_MIN_VALID_KPA: f32 = 200.0;
 
 // ─── Entry point ─────────────────────────────────────────────
