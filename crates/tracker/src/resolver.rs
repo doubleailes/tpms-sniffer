@@ -150,17 +150,16 @@ impl Resolver {
             temp_c,
             alarm: packet.alarm.unwrap_or(false),
             battery_ok: packet.battery_ok.unwrap_or(true),
+            pressure_reliable: packet.pressure_kpa_reliable,
         };
 
-        let pressure_reliable = packet.pressure_kpa_reliable;
-
         if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
-            self.process_fingerprint(sighting, pressure_reliable)
+            self.process_fingerprint(sighting)
         } else if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) || !is_valid_sensor_id(sensor_id)
         {
-            self.process_rolling(sighting, pressure_reliable)
+            self.process_rolling(sighting)
         } else {
-            self.process_fixed(sighting, packet.rtl433_id, pressure_reliable)
+            self.process_fixed(sighting, packet.rtl433_id)
         }
     }
 
@@ -182,7 +181,6 @@ impl Resolver {
         &mut self,
         sighting: Sighting,
         rtl433_id: u16,
-        pressure_reliable: bool,
     ) -> Result<Option<Uuid>> {
         let sensor_id = sighting.sensor_id;
         // Key the fixed-ID map on `(sensor_id, rtl433_id)` so that two
@@ -272,7 +270,7 @@ impl Resolver {
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
         vehicle.last_seen = sighting.ts;
         vehicle.sighting_count += 1;
-        if pressure_reliable {
+        if sighting.pressure_reliable {
             ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
         }
 
@@ -295,7 +293,6 @@ impl Resolver {
     fn process_fingerprint(
         &mut self,
         sighting: Sighting,
-        pressure_reliable: bool,
     ) -> Result<Option<Uuid>> {
         let now = sighting.ts;
         let pressure = sighting.pressure_kpa;
@@ -340,7 +337,7 @@ impl Resolver {
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
         vehicle.last_seen = now;
         vehicle.sighting_count += 1;
-        if pressure_reliable {
+        if sighting.pressure_reliable {
             ema_update(&mut vehicle.pressure_signature[0], pressure);
         }
 
@@ -358,7 +355,6 @@ impl Resolver {
     fn process_rolling(
         &mut self,
         sighting: Sighting,
-        pressure_reliable: bool,
     ) -> Result<Option<Uuid>> {
         // Unreliable readings (e.g. AVE half-range low-pressure frames) would
         // poison the pressure fingerprint if fed through the burst accumulator.
@@ -368,7 +364,7 @@ impl Resolver {
         // sighting requires a vehicle to attach it to.  The track for the
         // underlying vehicle keeps its last known good signature and is still
         // matched when the next normal packet arrives.
-        if !pressure_reliable {
+        if !sighting.pressure_reliable {
             return Ok(None);
         }
 
@@ -919,6 +915,86 @@ mod tests {
         assert!(
             (sig0 - 382.5).abs() < 1.0,
             "pressure signature drifted from 382.5 kPa to {sig0}"
+        );
+    }
+
+    #[test]
+    fn ave_sequence_382_190_produces_one_vehicle_and_stable_average() {
+        // Acceptance-criteria test: the sequence [382.5, 190.5, 382.5, 190.5, 382.5]
+        // must produce exactly one vehicle UUID and the final stored pressure
+        // average must be within 5.0 kPa of 382.5.  The 190.5 kPa packets are
+        // AVE half-range artifacts (pressure_kpa_reliable = false) and must not
+        // corrupt the running average.
+        let mut resolver = in_memory_resolver();
+
+        let pressures: &[(f32, bool)] = &[
+            (382.5, true),
+            (190.5, false),
+            (382.5, true),
+            (190.5, false),
+            (382.5, true),
+        ];
+
+        // Use timestamps spaced > BURST_GAP_MS apart so each reliable packet
+        // forms its own burst and resolves immediately.  Unreliable packets are
+        // dropped before entering the burst accumulator.
+        let base_ts = "2025-06-01 21:00:0";
+
+        for (i, &(kpa, reliable)) in pressures.iter().enumerate() {
+            // Construct two packets per reliable reading so each burst has the
+            // minimum 2 slots required by resolve_burst.
+            if reliable {
+                let ts1 = format!("{}{}.000", base_ts, i);
+                let ts2 = format!("{}{}.100", base_ts, i);
+                let p1 = make_packet_at_reliable(
+                    &ts1,
+                    &format!("0x{:08X}", 0xAA000000 + i as u32 * 2),
+                    "AVE-TPMS",
+                    208,
+                    kpa,
+                    reliable,
+                );
+                let p2 = make_packet_at_reliable(
+                    &ts2,
+                    &format!("0x{:08X}", 0xAA000001 + i as u32 * 2),
+                    "AVE-TPMS",
+                    208,
+                    kpa,
+                    reliable,
+                );
+                resolver.process(&p1).unwrap();
+                resolver.process(&p2).unwrap();
+                resolver.flush().unwrap();
+            } else {
+                let ts = format!("{}{}.000", base_ts, i);
+                let p = make_packet_at_reliable(
+                    &ts,
+                    &format!("0x{:08X}", 0xBB000000 + i as u32),
+                    "AVE-TPMS",
+                    208,
+                    kpa,
+                    reliable,
+                );
+                resolver.process(&p).unwrap();
+            }
+        }
+
+        // Collect all AVE vehicles.
+        let ave: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "AVE-TPMS")
+            .collect();
+        assert_eq!(
+            ave.len(),
+            1,
+            "AVE sequence [382.5, 190.5, 382.5, 190.5, 382.5] must produce exactly one vehicle"
+        );
+
+        let sig0 = ave[0].pressure_signature[0];
+        assert!(
+            (sig0 - 382.5).abs() < 5.0,
+            "final stored pressure average ({sig0}) must be within 5.0 kPa of 382.5"
         );
     }
 

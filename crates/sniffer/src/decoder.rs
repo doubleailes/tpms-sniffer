@@ -83,12 +83,12 @@ pub struct TpmsPacket {
     pub confidence: u8,
     /// `false` when the decoded pressure value is known to be a protocol-level
     /// artifact rather than a real reading (e.g. AVE-TPMS dual-range encoding,
-    /// see `AVE_MIN_VALID_KPA`). Downstream consumers (the tracker) should not
+    /// see `AVE_MIN_RELIABLE_KPA`). Downstream consumers (the tracker) should not
     /// update pressure fingerprints from packets with this flag unset.
     pub pressure_kpa_reliable: bool,
 }
 
-/// Minimum valid AVE-TPMS pressure in kPa.
+/// Minimum reliable AVE-TPMS pressure in kPa.
 ///
 /// The AVE aftermarket clip-on TPMS (rtl_433 protocol 208) encodes its
 /// pressure field as `byte * 1.5 kPa`. In addition to the normal operating
@@ -107,7 +107,7 @@ pub struct TpmsPacket {
 /// sightings.  200 kPa sits safely above the half-range values observed in
 /// the field (~190 kPa) and below any plausible real operating pressure for
 /// an aftermarket AVE sensor.
-pub const AVE_MIN_VALID_KPA: f32 = 200.0;
+pub const AVE_MIN_RELIABLE_KPA: f32 = 200.0;
 
 // ─── Entry point ─────────────────────────────────────────────
 
@@ -786,8 +786,8 @@ fn decode_ave(bits: &[u8]) -> Option<TpmsPacket> {
     );
     // AVE encodes a half-range low-pressure frame for the same physical
     // sensor; flag those as unreliable so the tracker skips fingerprint
-    // updates from them. See `AVE_MIN_VALID_KPA` for the protocol reference.
-    if kpa < AVE_MIN_VALID_KPA {
+    // updates from them. See `AVE_MIN_RELIABLE_KPA` for the protocol reference.
+    if kpa < AVE_MIN_RELIABLE_KPA {
         p.pressure_kpa_reliable = false;
     }
     Some(p)
