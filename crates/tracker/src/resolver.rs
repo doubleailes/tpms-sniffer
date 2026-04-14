@@ -406,11 +406,13 @@ impl Resolver {
 
         // Incrementally update presence slot if car_id is assigned.
         if let Some(car_id) = vehicle.car_id {
-            let _ = self.db.upsert_presence_slot(
+            if let Err(e) = self.db.upsert_presence_slot(
                 &car_id.to_string(),
                 &sighting.ts,
                 &sighting.receiver_id,
-            );
+            ) {
+                eprintln!("warn: presence slot upsert failed: {e}");
+            }
         }
 
         Ok(Some(vehicle_id))
@@ -535,11 +537,13 @@ impl Resolver {
 
         // Incrementally update presence slot if car_id is assigned.
         if let Some(car_id) = vehicle.car_id {
-            let _ = self.db.upsert_presence_slot(
+            if let Err(e) = self.db.upsert_presence_slot(
                 &car_id.to_string(),
                 &sighting.ts,
                 &sighting.receiver_id,
-            );
+            ) {
+                eprintln!("warn: presence slot upsert failed: {e}");
+            }
         }
 
         Ok(Some(vehicle_id))
@@ -711,11 +715,13 @@ impl Resolver {
 
         // Incrementally update presence slot if car_id is assigned.
         if let Some(car_id) = vehicle.car_id {
-            let _ = self.db.upsert_presence_slot(
+            if let Err(e) = self.db.upsert_presence_slot(
                 &car_id.to_string(),
                 &now,
                 &self.receiver_id,
-            );
+            ) {
+                eprintln!("warn: presence slot upsert failed: {e}");
+            }
         }
 
         Ok(Some(vehicle_id))

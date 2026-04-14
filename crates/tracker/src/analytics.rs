@@ -172,6 +172,8 @@ pub fn compute_routine(car_id: &str, slots: &[PresenceSlot]) -> Option<CarRoutin
                 continue;
             }
             let h = dt.hour() as u8;
+            // ±1 hour tolerance around the typical window accounts for
+            // natural schedule variation (early arrivals, late departures).
             if h < arr.saturating_sub(1) || h > dep + 1 {
                 anomalous_presences.push(dt.to_rfc3339());
             }
@@ -300,7 +302,10 @@ pub fn detect_pressure_events(
         let denom = n * sum_x2 - sum_x * sum_x;
         if denom.abs() > f64::EPSILON {
             let slope = (n * sum_xy - sum_x * sum_y) / denom;
-            // Only report if slope is negative (declining).
+            // Report when the regression slope exceeds −0.05 kPa/day.
+            // Typical slow-leak rates range from −0.1 to −0.5 kPa/day;
+            // the threshold is set low enough to catch early leaks while
+            // filtering out normal pressure fluctuations from temperature.
             if slope < -0.05 {
                 let last = readings.last().unwrap();
                 events.push(PressureEvent::SlowDecline {
