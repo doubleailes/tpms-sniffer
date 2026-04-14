@@ -195,7 +195,11 @@ impl Resolver {
             battery_ok: packet.battery_ok.unwrap_or(true),
             pressure_reliable: packet.pressure_kpa_reliable,
             tx_interval_hint_ms: hint,
-            receiver_id: packet.receiver_id.clone(),
+            receiver_id: if packet.receiver_id == "default" {
+                self.receiver_id.clone()
+            } else {
+                packet.receiver_id.clone()
+            },
         };
 
         if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
@@ -1981,6 +1985,301 @@ mod tests {
             "ring buffer must not exceed TX_INTERVAL_WINDOW ({}), got {}",
             crate::TX_INTERVAL_WINDOW,
             v.tx_intervals_ms.len()
+        );
+    }
+
+    /// Helper: create a packet with a specific receiver_id.
+    fn make_packet_at_receiver(
+        timestamp: &str,
+        sensor_id: &str,
+        protocol: &str,
+        rtl433_id: u16,
+        pressure_kpa: f32,
+        receiver_id: &str,
+    ) -> TpmsPacket {
+        let mut p = make_packet_at(timestamp, sensor_id, protocol, rtl433_id, pressure_kpa);
+        p.receiver_id = receiver_id.to_string();
+        p
+    }
+
+    #[test]
+    fn cross_receiver_duplicate_does_not_increment_tx_interval() {
+        // AC: duplicate sighting from second receiver within window does not
+        // increment tx_intervals_ms ring buffer.
+        let mut resolver = in_memory_resolver();
+
+        // First sighting from node-01.
+        let p1 = make_packet_at_receiver(
+            "2025-06-01 12:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        let vid1 = resolver.process(&p1).unwrap().unwrap();
+
+        let v = &resolver.vehicles[&vid1];
+        let intervals_before = v.tx_intervals_ms.len();
+
+        // Duplicate sighting from node-02 within the 5-second window (2 s later).
+        let p2 = make_packet_at_receiver(
+            "2025-06-01 12:00:02.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-02",
+        );
+        let vid2 = resolver.process(&p2).unwrap().unwrap();
+        assert_eq!(vid1, vid2, "same vehicle from different receiver within window");
+
+        let v = &resolver.vehicles[&vid2];
+        assert_eq!(
+            v.tx_intervals_ms.len(),
+            intervals_before,
+            "cross-receiver duplicate must not add to tx_intervals_ms"
+        );
+    }
+
+    #[test]
+    fn cross_receiver_duplicate_does_not_increment_sighting_count() {
+        // Cross-receiver duplicate should not increment sighting_count.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_receiver(
+            "2025-06-01 12:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        let vid = resolver.process(&p1).unwrap().unwrap();
+        let count_after_first = resolver.vehicles[&vid].sighting_count;
+
+        let p2 = make_packet_at_receiver(
+            "2025-06-01 12:00:02.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-02",
+        );
+        resolver.process(&p2).unwrap();
+        assert_eq!(
+            resolver.vehicles[&vid].sighting_count,
+            count_after_first,
+            "cross-receiver duplicate must not increment sighting_count"
+        );
+    }
+
+    #[test]
+    fn two_receiver_fixture_produces_one_vehicle() {
+        // AC: replay of a two-receiver fixture (same vehicle appearing on
+        // both nodes within 2 seconds) produces one vehicle UUID, not two.
+        let mut resolver = in_memory_resolver();
+
+        let p_node1 = make_packet_at_receiver(
+            "2025-06-01 14:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        let p_node2 = make_packet_at_receiver(
+            "2025-06-01 14:00:02.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-02",
+        );
+
+        let vid1 = resolver.process(&p_node1).unwrap().unwrap();
+        let vid2 = resolver.process(&p_node2).unwrap().unwrap();
+
+        assert_eq!(
+            vid1, vid2,
+            "same vehicle from two receivers within 2 s must produce one UUID"
+        );
+        assert_eq!(
+            resolver.vehicles.len(),
+            1,
+            "only one vehicle should exist"
+        );
+    }
+
+    #[test]
+    fn receiver_sightings_tracks_both_receivers() {
+        // AC: receiver_sightings correctly records which receivers saw the
+        // vehicle and when.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_receiver(
+            "2025-06-01 14:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        let p2 = make_packet_at_receiver(
+            "2025-06-01 14:00:02.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-02",
+        );
+
+        let vid = resolver.process(&p1).unwrap().unwrap();
+        resolver.process(&p2).unwrap();
+
+        let v = &resolver.vehicles[&vid];
+        assert!(
+            v.receiver_sightings.contains_key("node-01"),
+            "receiver_sightings must contain node-01"
+        );
+        assert!(
+            v.receiver_sightings.contains_key("node-02"),
+            "receiver_sightings must contain node-02"
+        );
+        assert_eq!(v.receiver_sightings["node-01"].len(), 1);
+        assert_eq!(v.receiver_sightings["node-02"].len(), 1);
+    }
+
+    #[test]
+    fn same_receiver_outside_window_still_counts() {
+        // When a second sighting arrives from the SAME receiver, it should
+        // not be treated as a cross-receiver duplicate, even if within the
+        // 5 s window.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_receiver(
+            "2025-06-01 12:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        let vid = resolver.process(&p1).unwrap().unwrap();
+        let count1 = resolver.vehicles[&vid].sighting_count;
+
+        // Same receiver, 2 s later — should NOT be a cross-receiver duplicate.
+        let p2 = make_packet_at_receiver(
+            "2025-06-01 12:00:02.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        resolver.process(&p2).unwrap();
+        assert!(
+            resolver.vehicles[&vid].sighting_count > count1,
+            "sighting from the same receiver must still increment sighting_count"
+        );
+    }
+
+    #[test]
+    fn cross_receiver_outside_window_counts_normally() {
+        // A sighting from a different receiver that arrives OUTSIDE the 5 s
+        // window should be treated as a normal sighting (not a duplicate).
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_receiver(
+            "2025-06-01 12:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-01",
+        );
+        let vid = resolver.process(&p1).unwrap().unwrap();
+        let count1 = resolver.vehicles[&vid].sighting_count;
+
+        // Different receiver, 10 s later — outside the 5 s window.
+        let p2 = make_packet_at_receiver(
+            "2025-06-01 12:00:10.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+            "node-02",
+        );
+        resolver.process(&p2).unwrap();
+        assert!(
+            resolver.vehicles[&vid].sighting_count > count1,
+            "cross-receiver sighting outside window must increment sighting_count"
+        );
+    }
+
+    #[test]
+    fn fingerprint_path_cross_receiver_dedup() {
+        // Cross-receiver deduplication also works on the fingerprint path
+        // (e.g. EezTire).
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_receiver(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+            "node-01",
+        );
+        let vid = resolver.process(&p1).unwrap().unwrap();
+        let count1 = resolver.vehicles[&vid].sighting_count;
+        let intervals1 = resolver.vehicles[&vid].tx_intervals_ms.len();
+
+        // Same vehicle from a different receiver within the window.
+        let p2 = make_packet_at_receiver(
+            "2025-06-01 12:00:03.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+            "node-02",
+        );
+        let vid2 = resolver.process(&p2).unwrap().unwrap();
+        assert_eq!(vid, vid2, "same EezTire vehicle from different receiver");
+
+        let v = &resolver.vehicles[&vid2];
+        assert_eq!(
+            v.sighting_count, count1,
+            "cross-receiver EezTire duplicate must not increment sighting_count"
+        );
+        assert_eq!(
+            v.tx_intervals_ms.len(),
+            intervals1,
+            "cross-receiver EezTire duplicate must not add to tx_intervals_ms"
+        );
+    }
+
+    #[test]
+    fn receiver_id_populates_from_packet() {
+        // The receiver_id from the TpmsPacket should flow through to the
+        // Sighting and into the vehicle's receiver_sightings.
+        let db = Database::open(":memory:").unwrap();
+        let mut resolver = Resolver::with_receiver_id(db, "central".to_string()).unwrap();
+
+        let mut p = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0x1A2B3C4D",
+            "TRW-OOK",
+            298,
+            63.8,
+        );
+        p.receiver_id = "node-42".to_string();
+
+        let vid = resolver.process(&p).unwrap().unwrap();
+        let v = &resolver.vehicles[&vid];
+        assert!(
+            v.receiver_sightings.contains_key("node-42"),
+            "receiver_sightings must reflect the packet's receiver_id"
         );
     }
 }

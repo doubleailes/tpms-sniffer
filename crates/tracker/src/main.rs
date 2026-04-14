@@ -28,13 +28,18 @@ struct Args {
     /// after processing all input.
     #[arg(long)]
     export_jaccard: Option<String>,
+
+    /// Identifier for this receiver node (e.g. "node-01").
+    /// Used for cross-receiver deduplication in multi-node deployments.
+    #[arg(long, default_value = "default")]
+    receiver_id: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let db = Database::open(&args.db)?;
-    let mut resolver = Resolver::new(db)?;
+    let mut resolver = Resolver::with_receiver_id(db, args.receiver_id.clone())?;
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -65,8 +70,9 @@ fn main() -> Result<()> {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "none".to_string());
                 println!(
-                    "{} | vehicle={vid} | car={car_id} | sensor={} | {:.1} kPa | {}",
+                    "{} | vehicle={vid} | car={car_id} | sensor={} | {:.1} kPa | {} | receiver={}",
                     packet.timestamp, packet.sensor_id, packet.pressure_kpa, packet.protocol,
+                    packet.receiver_id,
                 );
             }
             Ok(_) => {}

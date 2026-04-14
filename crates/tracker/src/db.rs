@@ -116,6 +116,37 @@ impl Database {
             )?;
         }
 
+        // Migration: add receiver_id column to sightings table and create the
+        // receivers table for multi-node deployments.
+        let has_receiver_id: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sightings') WHERE name='receiver_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_receiver_id == 0 {
+            self.conn.execute(
+                "ALTER TABLE sightings ADD COLUMN receiver_id TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )?;
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sightings_receiver ON sightings(receiver_id, ts)",
+                [],
+            )?;
+        }
+
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS receivers (
+                receiver_id   TEXT PRIMARY KEY,
+                first_seen    TEXT,
+                last_seen     TEXT,
+                lat           REAL,
+                lon           REAL,
+                notes         TEXT
+            );
+            "#,
+        )?;
+
         Ok(())
     }
 
@@ -163,8 +194,8 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO sightings
-                (vehicle_id, ts, protocol, sensor_id, pressure_kpa, temp_c, alarm, battery_ok)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (vehicle_id, ts, protocol, sensor_id, pressure_kpa, temp_c, alarm, battery_ok, receiver_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 vehicle_id.to_string(),
@@ -175,6 +206,7 @@ impl Database {
                 s.temp_c,
                 s.alarm as i64,
                 s.battery_ok as i64,
+                s.receiver_id,
             ],
         )?;
         Ok(())
