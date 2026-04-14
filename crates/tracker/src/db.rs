@@ -193,5 +193,6 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         fixed_sensor_id: sensor_id.map(|id| id as u32),
         pressure_signature: serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]),
         make_model_hint: make_model,
+        battery_ok: true,
     })
 }

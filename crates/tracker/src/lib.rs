@@ -83,6 +83,10 @@ pub struct VehicleTrack {
     /// For fixed-ID sensors only slot 0 is used.
     pub pressure_signature: [f32; 4],
     pub make_model_hint: Option<String>,
+    /// Most recent battery status reported by the sensor.  `true` means the
+    /// battery is OK; `false` means the sensor has flagged low battery.
+    /// Defaults to `true` when no battery field is present in the packet.
+    pub battery_ok: bool,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.
