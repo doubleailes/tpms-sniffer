@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use uuid::Uuid;
 
@@ -297,5 +298,6 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         tx_intervals_ms: VecDeque::new(),
         tx_interval_median_ms: tx_interval_median.map(|ms| ms as u32),
         car_id: car_id_uuid,
+        receiver_sightings: HashMap::new(),
     })
 }

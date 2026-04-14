@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::jaccard::{self, CoOccurrenceMatrix, group_vehicles_into_cars, WINDOW_SIZE_S};
 use crate::{
-    Sighting, TpmsPacket, VehicleTrack, compute_median, make_model_hint, TX_INTERVAL_MAX_MS,
-    TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW,
+    CROSS_RECEIVER_WINDOW_MS, Sighting, TpmsPacket, VehicleTrack, compute_median,
+    make_model_hint, TX_INTERVAL_MAX_MS, TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW,
 };
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
@@ -125,11 +125,18 @@ pub struct Resolver {
     cooccurrence: CoOccurrenceMatrix,
     /// Timestamp of the last window advance.
     last_window_advance: Option<DateTime<Utc>>,
+    /// Receiver ID assigned to all locally-created sightings.
+    receiver_id: String,
 }
 
 impl Resolver {
     /// Open (or create) the database and restore in-memory state from it.
     pub fn new(db: Database) -> Result<Self> {
+        Self::with_receiver_id(db, "default".to_string())
+    }
+
+    /// Open (or create) the database with a specific receiver ID.
+    pub fn with_receiver_id(db: Database, receiver_id: String) -> Result<Self> {
         let mut r = Self {
             fixed_map: HashMap::new(),
             vehicles: HashMap::new(),
@@ -138,6 +145,7 @@ impl Resolver {
             db,
             cooccurrence: CoOccurrenceMatrix::new(),
             last_window_advance: None,
+            receiver_id,
         };
         r.load_from_db()?;
         Ok(r)
@@ -187,6 +195,7 @@ impl Resolver {
             battery_ok: packet.battery_ok.unwrap_or(true),
             pressure_reliable: packet.pressure_kpa_reliable,
             tx_interval_hint_ms: hint,
+            receiver_id: packet.receiver_id.clone(),
         };
 
         if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
@@ -207,6 +216,40 @@ impl Resolver {
             }
         }
         Ok(())
+    }
+
+    /// Check whether a sighting from a different receiver within the
+    /// cross-receiver deduplication window should be treated as a duplicate
+    /// (same physical event).
+    fn is_cross_receiver_duplicate(vehicle: &VehicleTrack, sighting: &Sighting) -> bool {
+        if vehicle.receiver_sightings.is_empty() {
+            return false;
+        }
+        let last_receiver = vehicle
+            .receiver_sightings
+            .iter()
+            .filter_map(|(rid, times)| times.last().map(|t| (rid, t)))
+            .max_by_key(|&(_, t)| *t);
+        if let Some((last_rid, last_ts)) = last_receiver {
+            if *last_rid != sighting.receiver_id {
+                let delta_ms = sighting
+                    .ts
+                    .signed_duration_since(*last_ts)
+                    .num_milliseconds()
+                    .unsigned_abs();
+                return delta_ms < CROSS_RECEIVER_WINDOW_MS;
+            }
+        }
+        false
+    }
+
+    /// Record a receiver sighting timestamp on the vehicle track.
+    fn record_receiver_sighting(vehicle: &mut VehicleTrack, receiver_id: &str, ts: DateTime<Utc>) {
+        vehicle
+            .receiver_sightings
+            .entry(receiver_id.to_string())
+            .or_default()
+            .push(ts);
     }
 
     // -----------------------------------------------------------------------
@@ -266,6 +309,7 @@ impl Resolver {
                         tx_intervals_ms: VecDeque::new(),
                         tx_interval_median_ms: None,
                         car_id: None,
+                        receiver_sightings: HashMap::new(),
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -287,6 +331,7 @@ impl Resolver {
                     tx_intervals_ms: VecDeque::new(),
                     tx_interval_median_ms: None,
                     car_id: None,
+                    receiver_sightings: HashMap::new(),
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -308,34 +353,44 @@ impl Resolver {
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
                 car_id: None,
+                receiver_sightings: HashMap::new(),
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
             vid
         };
 
-        // Update in-memory state.
+        // Cross-receiver dedup check + update in-memory state.
+        let is_dup = {
+            let vehicle = self.vehicles.get(&vehicle_id).unwrap();
+            Self::is_cross_receiver_duplicate(vehicle, &sighting)
+        };
         {
             let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
-            // Accumulate inter-packet interval before updating last_seen.
-            let interval_ms = (sighting.ts - vehicle.last_seen).num_milliseconds() as u32;
-            if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
-                vehicle.tx_intervals_ms.push_back(interval_ms);
-                if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
-                    vehicle.tx_intervals_ms.pop_front();
+            Self::record_receiver_sighting(vehicle, &sighting.receiver_id, sighting.ts);
+            if !is_dup {
+                // Accumulate inter-packet interval before updating last_seen.
+                let interval_ms = (sighting.ts - vehicle.last_seen).num_milliseconds() as u32;
+                if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+                    vehicle.tx_intervals_ms.push_back(interval_ms);
+                    if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                        vehicle.tx_intervals_ms.pop_front();
+                    }
+                    vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
                 }
-                vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
+                vehicle.sighting_count += 1;
             }
             vehicle.last_seen = sighting.ts;
-            vehicle.sighting_count += 1;
             vehicle.battery_ok = sighting.battery_ok;
             if sighting.pressure_reliable {
                 ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
             }
         }
 
-        // Record co-occurrence.
-        self.cooccurrence.record(vehicle_id);
+        // Record co-occurrence (only for non-duplicate sightings).
+        if !is_dup {
+            self.cooccurrence.record(vehicle_id);
+        }
 
         // Advance window if enough time has elapsed.
         self.maybe_advance_window(sighting.ts);
@@ -419,33 +474,43 @@ impl Resolver {
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
                 car_id: None,
+                receiver_sightings: HashMap::new(),
             };
             self.vehicles.insert(vid, vehicle);
             vid
         };
 
-        // Update in-memory state.
+        // Cross-receiver dedup check + update in-memory state.
+        let is_dup = {
+            let vehicle = self.vehicles.get(&vehicle_id).unwrap();
+            Self::is_cross_receiver_duplicate(vehicle, &sighting)
+        };
         {
             let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
-            // Accumulate inter-packet interval before updating last_seen.
-            let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
-            if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
-                vehicle.tx_intervals_ms.push_back(interval_ms);
-                if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
-                    vehicle.tx_intervals_ms.pop_front();
+            Self::record_receiver_sighting(vehicle, &sighting.receiver_id, now);
+            if !is_dup {
+                // Accumulate inter-packet interval before updating last_seen.
+                let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
+                if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+                    vehicle.tx_intervals_ms.push_back(interval_ms);
+                    if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                        vehicle.tx_intervals_ms.pop_front();
+                    }
+                    vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
                 }
-                vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
+                vehicle.sighting_count += 1;
             }
             vehicle.last_seen = now;
-            vehicle.sighting_count += 1;
             vehicle.battery_ok = sighting.battery_ok;
             if sighting.pressure_reliable {
                 ema_update(&mut vehicle.pressure_signature[0], pressure);
             }
         }
 
-        // Record co-occurrence.
-        self.cooccurrence.record(vehicle_id);
+        // Record co-occurrence (only for non-duplicate sightings).
+        if !is_dup {
+            self.cooccurrence.record(vehicle_id);
+        }
 
         // Advance window if enough time has elapsed.
         self.maybe_advance_window(now);
@@ -582,14 +647,20 @@ impl Resolver {
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
                 car_id: None,
+                receiver_sightings: HashMap::new(),
             };
             self.vehicles.insert(vid, vehicle);
             vid
         };
 
         // Update in-memory state.
+        // Note: rolling-ID bursts do not carry per-sighting receiver_id
+        // metadata (the burst accumulator merges multiple packets), so
+        // cross-receiver dedup is not applied here.  The burst uses the
+        // resolver's own receiver_id.
         {
             let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+            Self::record_receiver_sighting(vehicle, &self.receiver_id, now);
             // Accumulate inter-burst interval before updating last_seen.
             let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
             if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
@@ -789,6 +860,7 @@ mod tests {
             alarm: Some(false),
             confidence: 90,
             pressure_kpa_reliable,
+            receiver_id: "test".to_string(),
         }
     }
 
@@ -811,6 +883,7 @@ mod tests {
             alarm: Some(false),
             confidence: 90,
             pressure_kpa_reliable: true,
+            receiver_id: "test".to_string(),
         }
     }
 
@@ -1677,6 +1750,7 @@ mod tests {
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
                 car_id: None,
+                receiver_sightings: HashMap::new(),
             }
         };
 
