@@ -304,12 +304,15 @@ impl Resolver {
         let expiry = vehicle_expiry_for(rtl433_id);
 
         // Find an active vehicle of the same protocol whose pressure
-        // signature is within tolerance.  Copy the Uuid so we drop the shared
-        // borrow before taking a mutable one below.
+        // signature is within tolerance.  Use `rtl433_id` (not the display
+        // name string) so the filter applies unconditionally to all callers,
+        // including sentinel-rejected fixed-ID packets that fall through to
+        // this path.  Copy the Uuid so we drop the shared borrow before
+        // taking a mutable one below.
         let matched_vid: Option<Uuid> = self
             .vehicles
             .values()
-            .filter(|v| v.protocol == protocol && v.fixed_sensor_id.is_none())
+            .filter(|v| v.rtl433_id == rtl433_id && v.fixed_sensor_id.is_none())
             .filter(|v| now.signed_duration_since(v.last_seen) < expiry)
             .find(|v| (v.pressure_signature[0] - pressure).abs() <= PRESSURE_MATCH_TOLERANCE_KPA)
             .map(|v| v.vehicle_id);
@@ -426,7 +429,7 @@ impl Resolver {
         let matched_vid: Option<Uuid> = self
             .vehicles
             .values()
-            .filter(|v| v.fixed_sensor_id.is_none() && v.protocol == burst.protocol)
+            .filter(|v| v.fixed_sensor_id.is_none() && v.rtl433_id == burst.rtl433_id)
             .filter(|v| now.signed_duration_since(v.last_seen) < expiry)
             .find(|v| l1_per_wheel(&v.pressure_signature, &sig) < PRESSURE_MATCH_TOLERANCE_KPA)
             .map(|v| v.vehicle_id);
@@ -1103,5 +1106,158 @@ mod tests {
         // 4 bits cleared → valid.
         assert_eq!(0xFFFFFFF0u32.count_zeros(), 4);
         assert!(is_valid_sensor_id(0xFFFFFFF0));
+    }
+
+    #[test]
+    fn sentinel_trw_ook_never_resolves_to_ave_vehicle() {
+        // A sentinel-rejected TRW-OOK packet (sensor_id = 0xFFFFFFFF) must
+        // never be absorbed into an AVE-TPMS vehicle, regardless of pressure.
+        // This is the unit test for AC #3: sentinel-rejected packet from
+        // protocol A cannot match an active vehicle from protocol B.
+        let mut resolver = in_memory_resolver();
+
+        // Establish an AVE-TPMS vehicle via a rolling-ID burst at 63.8 kPa.
+        let ave1 = make_packet_at(
+            "2025-06-01 21:58:00.000",
+            "0xA1A1A1A1",
+            "AVE-TPMS",
+            208,
+            63.8,
+        );
+        let ave2 = make_packet_at(
+            "2025-06-01 21:58:00.100",
+            "0xB2B2B2B2",
+            "AVE-TPMS",
+            208,
+            63.8,
+        );
+        resolver.process(&ave1).unwrap();
+        resolver.process(&ave2).unwrap();
+        resolver.flush().unwrap();
+
+        let ave_vid = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "AVE-TPMS")
+            .map(|v| v.vehicle_id)
+            .expect("AVE vehicle must exist");
+
+        // Send sentinel TRW-OOK packets at exactly the same pressure.
+        // Because the sensor ID is invalid, these fall through to the
+        // rolling-ID path.  With the rtl433_id filter in place, they must
+        // never match the AVE vehicle.
+        let trw_sentinel = make_packet_at(
+            "2025-06-01 21:58:43.000",
+            "0xFFFFFFFF",
+            "TRW-OOK",
+            298,
+            63.8,
+        );
+        let result = resolver.process(&trw_sentinel).unwrap();
+
+        // If it resolved to something, it must not be the AVE vehicle.
+        if let Some(vid) = result {
+            assert_ne!(
+                vid, ave_vid,
+                "sentinel TRW-OOK packet must not be absorbed into AVE-TPMS vehicle"
+            );
+        }
+
+        // Also verify no AVE vehicle has been touched by the TRW packet.
+        let ave_vehicle = &resolver.vehicles[&ave_vid];
+        assert_eq!(
+            ave_vehicle.protocol, "AVE-TPMS",
+            "AVE vehicle protocol must remain AVE-TPMS"
+        );
+        assert_eq!(
+            ave_vehicle.rtl433_id, 208,
+            "AVE vehicle rtl433_id must remain 208"
+        );
+    }
+
+    #[test]
+    fn three_packet_trw_burst_regression() {
+        // Regression test for the three-packet 21:58:42–21:58:45 burst from
+        // the issue: all three TRW-OOK packets must resolve to the same
+        // TRW-OOK vehicle, even when an AVE-TPMS vehicle exists at the same
+        // pressure.  The sentinel packet (0xFFFFFFFF) must never resolve to
+        // the AVE vehicle UUID.
+        let mut resolver = in_memory_resolver();
+
+        // Pre-seed an AVE-TPMS vehicle at 63.8 kPa.
+        let ave1 = make_packet_at(
+            "2025-06-01 21:57:50.000",
+            "0xA1A1A1A1",
+            "AVE-TPMS",
+            208,
+            63.8,
+        );
+        let ave2 = make_packet_at(
+            "2025-06-01 21:57:50.100",
+            "0xB2B2B2B2",
+            "AVE-TPMS",
+            208,
+            63.8,
+        );
+        resolver.process(&ave1).unwrap();
+        resolver.process(&ave2).unwrap();
+        resolver.flush().unwrap();
+
+        let ave_vid = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "AVE-TPMS")
+            .map(|v| v.vehicle_id)
+            .expect("AVE vehicle must exist");
+
+        // Packet 1: TRW-OOK, valid fixed ID 0xFEFFFFFD.
+        let p1 = make_packet_at(
+            "2025-06-01 21:58:42.000",
+            "0xFEFFFFFD",
+            "TRW-OOK",
+            298,
+            63.8,
+        );
+        let vid1 = resolver.process(&p1).unwrap().expect("packet 1 must resolve");
+        assert_ne!(vid1, ave_vid, "packet 1 must not resolve to AVE vehicle");
+
+        // Packet 2: TRW-OOK, sentinel 0xFFFFFFFF.
+        let p2 = make_packet_at(
+            "2025-06-01 21:58:43.000",
+            "0xFFFFFFFF",
+            "TRW-OOK",
+            298,
+            63.8,
+        );
+        let result2 = resolver.process(&p2).unwrap();
+        if let Some(vid2) = result2 {
+            assert_ne!(
+                vid2, ave_vid,
+                "sentinel packet must not resolve to AVE vehicle"
+            );
+        }
+
+        // Packet 3: TRW-OOK, valid fixed ID 0xFEFFFFFD (same as packet 1).
+        let p3 = make_packet_at(
+            "2025-06-01 21:58:45.000",
+            "0xFEFFFFFD",
+            "TRW-OOK",
+            298,
+            63.8,
+        );
+        let vid3 = resolver.process(&p3).unwrap().expect("packet 3 must resolve");
+        assert_ne!(vid3, ave_vid, "packet 3 must not resolve to AVE vehicle");
+
+        // Packets 1 and 3 share the same valid fixed ID — they must resolve
+        // to the same TRW-OOK vehicle UUID.
+        assert_eq!(
+            vid1, vid3,
+            "packets 1 and 3 (same fixed sensor ID) must share a vehicle UUID"
+        );
+
+        // Verify the TRW vehicle is actually a TRW-OOK vehicle.
+        let trw_vehicle = &resolver.vehicles[&vid1];
+        assert_eq!(trw_vehicle.protocol, "TRW-OOK");
+        assert_eq!(trw_vehicle.rtl433_id, 298);
     }
 }
