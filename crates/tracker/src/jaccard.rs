@@ -118,7 +118,7 @@ pub fn infer_wheel_positions(group: &[u32]) -> Option<HashMap<u32, WheelPosition
                 let id = *group
                     .iter()
                     .find(|&&id| (id & 0xFF) as u8 == byte)
-                    .unwrap();
+                    .expect("trailing byte must exist in group (internal invariant)");
                 (id, pos)
             })
             .collect(),
@@ -363,18 +363,19 @@ pub fn group_vehicles_into_cars_with_meta(
                 continue;
             };
 
-            // Find prefix-matching peers among ungrouped vehicles.
-            let mates: Vec<Uuid> = candidate_wheel_mates(
-                meta_a,
-                &ungrouped
-                    .iter()
-                    .filter_map(|&id| meta_map.get(&id).map(|m| VehicleMeta {
-                        vehicle_id: m.vehicle_id,
-                        rtl433_id: m.rtl433_id,
-                        fixed_sensor_id: m.fixed_sensor_id,
-                    }))
-                    .collect::<Vec<_>>(),
-            );
+            // Find prefix-matching peers among ungrouped vehicles (inline
+            // filtering avoids cloning VehicleMeta for each candidate).
+            let mates: Vec<Uuid> = ungrouped
+                .iter()
+                .filter(|&&id| id != a)
+                .filter_map(|&id| meta_map.get(&id))
+                .filter(|m| m.rtl433_id == meta_a.rtl433_id)
+                .filter(|m| {
+                    m.fixed_sensor_id
+                        .is_some_and(|b| common_prefix_bytes(sid_a, b) >= MIN_PREFIX_BYTES)
+                })
+                .map(|m| m.vehicle_id)
+                .collect();
 
             if mates.is_empty() {
                 continue;
@@ -392,15 +393,8 @@ pub fn group_vehicles_into_cars_with_meta(
 
             for mate_id in mates {
                 if ungrouped.contains(&mate_id) {
-                    // Only add if sensor IDs also share a prefix with `a`.
-                    if let Some(meta_b) = meta_map.get(&mate_id) {
-                        if let Some(sid_b) = meta_b.fixed_sensor_id {
-                            if common_prefix_bytes(sid_a, sid_b) >= MIN_PREFIX_BYTES {
-                                group.add(mate_id);
-                                ungrouped.remove(&mate_id);
-                            }
-                        }
-                    }
+                    group.add(mate_id);
+                    ungrouped.remove(&mate_id);
                 }
             }
         }
