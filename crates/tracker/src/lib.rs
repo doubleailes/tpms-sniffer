@@ -56,6 +56,12 @@ pub struct Sighting {
     pub temp_c: Option<f32>,
     pub alarm: bool,
     pub battery_ok: bool,
+    /// `false` when the decoded pressure value is a protocol-level artifact
+    /// rather than a genuine reading (e.g. AVE-TPMS dual-range half-pressure
+    /// frames, see `AVE_MIN_RELIABLE_KPA` in the sniffer decoder).  The
+    /// tracker skips pressure-fingerprint updates for unreliable readings so
+    /// they do not drift the vehicle's stored average.
+    pub pressure_reliable: bool,
 }
 
 /// Long-lived record for a vehicle inferred from repeated sightings.

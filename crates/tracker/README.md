@@ -30,8 +30,10 @@ The AVE decoder (protocol 208) occasionally emits a frame whose pressure field
 decodes to roughly half the real operating pressure — a ~382 kPa sensor will
 occasionally transmit a ~190 kPa frame. This is a protocol-level dual-range
 encoding quirk used for low-pressure detection, not a genuine pressure reading.
+See the [rtl_433 AVE decoder source](https://github.com/merbanan/rtl_433/blob/master/src/devices/tpms_ave.c)
+for the field definition (`pressure = byte * 1.5 kPa`).
 
 The sniffer side sets `pressure_kpa_reliable = false` on those frames (see
-`AVE_MIN_VALID_KPA` in `crates/sniffer/src/decoder.rs`). The tracker then
+`AVE_MIN_RELIABLE_KPA` in `crates/sniffer/src/decoder.rs`). The tracker then
 skips pressure-fingerprint updates for them so the half-range value does not
 drift the vehicle's signature and does not spawn a duplicate UUID.
