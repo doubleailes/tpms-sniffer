@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use uuid::Uuid;
 
+use crate::analytics::{self, CarReport, GeoSighting, PressureEvent, PressureReading, PresenceSlot, VehicleSummary};
 use crate::{Sighting, VehicleTrack};
 
 pub struct Database {
@@ -144,6 +145,40 @@ impl Database {
                 lon           REAL,
                 notes         TEXT
             );
+            "#,
+        )?;
+
+        // Migration: add presence_slots table for hourly behavioural analytics.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS presence_slots (
+                car_id         TEXT REFERENCES cars(car_id),
+                slot_start     TEXT,
+                slot_end       TEXT,
+                sighting_count INTEGER,
+                receiver_ids   TEXT,
+                PRIMARY KEY (car_id, slot_start)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_presence_slots_car_ts
+                ON presence_slots(car_id, slot_start);
+            "#,
+        )?;
+
+        // Migration: add pressure_events table for trend analysis.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pressure_events (
+                id          INTEGER PRIMARY KEY,
+                car_id      TEXT REFERENCES cars(car_id),
+                vehicle_id  TEXT REFERENCES vehicles(vehicle_id),
+                event_type  TEXT,
+                value_kpa   REAL,
+                ts          TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pressure_events_car_ts
+                ON pressure_events(car_id, ts);
             "#,
         )?;
 
@@ -291,6 +326,429 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Presence-slot analytics
+    // -----------------------------------------------------------------------
+
+    /// Upsert an hourly presence slot for a car.  Called after each sighting
+    /// when the car_id is known.
+    pub fn upsert_presence_slot(
+        &self,
+        car_id: &str,
+        ts: &DateTime<Utc>,
+        receiver_id: &str,
+    ) -> Result<()> {
+        let slot_start = ts
+            .format("%Y-%m-%dT%H:00:00+00:00")
+            .to_string();
+        let slot_end = (*ts + chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:00:00+00:00")
+            .to_string();
+
+        // Check if slot already exists to merge receiver_ids.
+        let existing: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT sighting_count, receiver_ids FROM presence_slots WHERE car_id = ?1 AND slot_start = ?2",
+                params![car_id, slot_start],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if let Some((count, existing_receivers)) = existing {
+            let mut receivers: Vec<String> =
+                serde_json::from_str(&existing_receivers).unwrap_or_default();
+            if !receivers.contains(&receiver_id.to_string()) {
+                receivers.push(receiver_id.to_string());
+            }
+            let receivers_json = serde_json::to_string(&receivers)?;
+            self.conn.execute(
+                r#"
+                UPDATE presence_slots
+                SET sighting_count = ?1, receiver_ids = ?2
+                WHERE car_id = ?3 AND slot_start = ?4
+                "#,
+                params![count + 1, receivers_json, car_id, slot_start],
+            )?;
+        } else {
+            let receivers_json = serde_json::to_string(&[receiver_id])?;
+            self.conn.execute(
+                r#"
+                INSERT INTO presence_slots (car_id, slot_start, slot_end, sighting_count, receiver_ids)
+                VALUES (?1, ?2, ?3, 1, ?4)
+                "#,
+                params![car_id, slot_start, slot_end, receivers_json],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Backfill `presence_slots` from existing sighting data.
+    /// This processes all sightings that have an associated car_id (via the
+    /// vehicles table) and inserts hourly slots.
+    pub fn backfill_presence_slots(&self) -> Result<u64> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT v.car_id, s.ts, s.receiver_id
+            FROM sightings s
+            JOIN vehicles v ON s.vehicle_id = v.vehicle_id
+            WHERE v.car_id IS NOT NULL
+            ORDER BY s.ts
+            "#,
+        )?;
+        let mut count = 0u64;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let car_id: String = row.get(0)?;
+            let ts_s: String = row.get(1)?;
+            let receiver_id: String = row.get(2)?;
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&ts_s) {
+                let utc = dt.with_timezone(&Utc);
+                // Drop the borrow on `rows` by using direct SQL here to avoid
+                // borrow issues with self.
+                let slot_start = utc
+                    .format("%Y-%m-%dT%H:00:00+00:00")
+                    .to_string();
+                let slot_end = (utc + chrono::Duration::hours(1))
+                    .format("%Y-%m-%dT%H:00:00+00:00")
+                    .to_string();
+
+                let receivers_json = serde_json::to_string(&[&receiver_id])?;
+                self.conn.execute(
+                    r#"
+                    INSERT INTO presence_slots (car_id, slot_start, slot_end, sighting_count, receiver_ids)
+                    VALUES (?1, ?2, ?3, 1, ?4)
+                    ON CONFLICT(car_id, slot_start) DO UPDATE SET
+                        sighting_count = presence_slots.sighting_count + 1,
+                        receiver_ids   = CASE
+                            WHEN INSTR(presence_slots.receiver_ids, ?5) > 0
+                            THEN presence_slots.receiver_ids
+                            ELSE JSON_INSERT(presence_slots.receiver_ids, '$[#]', ?5)
+                        END
+                    "#,
+                    params![car_id, slot_start, slot_end, receivers_json, receiver_id],
+                )?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Get all presence slots for a car, optionally filtered by date range.
+    pub fn get_presence_slots(
+        &self,
+        car_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<PresenceSlot>> {
+        let query = match (from, to) {
+            (Some(f), Some(t)) => format!(
+                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                 FROM presence_slots WHERE car_id = ?1 AND slot_start >= '{}' AND slot_start <= '{}' \
+                 ORDER BY slot_start",
+                f, t
+            ),
+            (Some(f), None) => format!(
+                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                 FROM presence_slots WHERE car_id = ?1 AND slot_start >= '{}' \
+                 ORDER BY slot_start",
+                f
+            ),
+            (None, Some(t)) => format!(
+                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                 FROM presence_slots WHERE car_id = ?1 AND slot_start <= '{}' \
+                 ORDER BY slot_start",
+                t
+            ),
+            (None, None) => {
+                "SELECT car_id, slot_start, slot_end, sighting_count, receiver_ids \
+                 FROM presence_slots WHERE car_id = ?1 ORDER BY slot_start"
+                    .to_string()
+            }
+        };
+        let mut stmt = self.conn.prepare(&query)?;
+        let slots = stmt
+            .query_map(params![car_id], |row| {
+                let receiver_ids_s: String = row.get(4)?;
+                let receiver_ids: Vec<String> =
+                    serde_json::from_str(&receiver_ids_s).unwrap_or_default();
+                Ok(PresenceSlot {
+                    car_id: row.get(0)?,
+                    slot_start: row.get(1)?,
+                    slot_end: row.get(2)?,
+                    sighting_count: row.get(3)?,
+                    receiver_ids,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(slots)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pressure event analytics
+    // -----------------------------------------------------------------------
+
+    /// Get pressure readings for a specific vehicle, ordered by timestamp.
+    pub fn get_pressure_readings(
+        &self,
+        vehicle_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<PressureReading>> {
+        let query = match (from, to) {
+            (Some(f), Some(t)) => format!(
+                "SELECT ts, pressure_kpa, alarm FROM sightings \
+                 WHERE vehicle_id = ?1 AND ts >= '{}' AND ts <= '{}' ORDER BY ts",
+                f, t
+            ),
+            (Some(f), None) => format!(
+                "SELECT ts, pressure_kpa, alarm FROM sightings \
+                 WHERE vehicle_id = ?1 AND ts >= '{}' ORDER BY ts",
+                f
+            ),
+            (None, Some(t)) => format!(
+                "SELECT ts, pressure_kpa, alarm FROM sightings \
+                 WHERE vehicle_id = ?1 AND ts <= '{}' ORDER BY ts",
+                t
+            ),
+            (None, None) => {
+                "SELECT ts, pressure_kpa, alarm FROM sightings \
+                 WHERE vehicle_id = ?1 ORDER BY ts"
+                    .to_string()
+            }
+        };
+        let mut stmt = self.conn.prepare(&query)?;
+        let readings = stmt
+            .query_map(params![vehicle_id], |row| {
+                let ts_s: String = row.get(0)?;
+                let pressure_kpa: f64 = row.get(1)?;
+                let alarm: i64 = row.get(2)?;
+                let ts = DateTime::parse_from_rfc3339(&ts_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok(PressureReading {
+                    ts,
+                    pressure_kpa: pressure_kpa as f32,
+                    alarm: alarm != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(readings)
+    }
+
+    /// Insert a pressure event record.
+    pub fn insert_pressure_event(&self, event: &PressureEvent) -> Result<()> {
+        let (car_id, vehicle_id, event_type, value_kpa, ts) = match event {
+            PressureEvent::SlowDecline {
+                car_id,
+                vehicle_id,
+                rate_kpa_per_day,
+                ts,
+            } => (car_id, vehicle_id, "slow_decline", *rate_kpa_per_day, ts),
+            PressureEvent::SuddenIncrease {
+                car_id,
+                vehicle_id,
+                delta_kpa,
+                ts,
+            } => (car_id, vehicle_id, "sudden_increase", *delta_kpa, ts),
+            PressureEvent::AlarmThreshold {
+                car_id,
+                vehicle_id,
+                pressure_kpa,
+                ts,
+            } => (car_id, vehicle_id, "alarm", *pressure_kpa, ts),
+        };
+        self.conn.execute(
+            r#"
+            INSERT INTO pressure_events (car_id, vehicle_id, event_type, value_kpa, ts)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![car_id, vehicle_id, event_type, value_kpa as f64, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Get all pressure events for a car.
+    pub fn get_pressure_events(&self, car_id: &str) -> Result<Vec<PressureEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT car_id, vehicle_id, event_type, value_kpa, ts \
+             FROM pressure_events WHERE car_id = ?1 ORDER BY ts",
+        )?;
+        let events = stmt
+            .query_map(params![car_id], |row| {
+                let car_id: String = row.get(0)?;
+                let vehicle_id: String = row.get(1)?;
+                let event_type: String = row.get(2)?;
+                let value_kpa: f64 = row.get(3)?;
+                let ts: String = row.get(4)?;
+                Ok(match event_type.as_str() {
+                    "slow_decline" => PressureEvent::SlowDecline {
+                        car_id,
+                        vehicle_id,
+                        rate_kpa_per_day: value_kpa as f32,
+                        ts,
+                    },
+                    "sudden_increase" => PressureEvent::SuddenIncrease {
+                        car_id,
+                        vehicle_id,
+                        delta_kpa: value_kpa as f32,
+                        ts,
+                    },
+                    _ => PressureEvent::AlarmThreshold {
+                        car_id,
+                        vehicle_id,
+                        pressure_kpa: value_kpa as f32,
+                        ts,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(events)
+    }
+
+    // -----------------------------------------------------------------------
+    // GeoJSON export
+    // -----------------------------------------------------------------------
+
+    /// Get all sightings with GPS coordinates for GeoJSON export.
+    pub fn get_geo_sightings(
+        &self,
+        car_id: Option<&str>,
+    ) -> Result<Vec<GeoSighting>> {
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let car_id: String = row.get(0)?;
+            let ts_s: String = row.get(1)?;
+            let lat: f64 = row.get(2)?;
+            let lon: f64 = row.get(3)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(GeoSighting {
+                car_id,
+                ts,
+                lat,
+                lon,
+            })
+        };
+
+        let sightings = if let Some(cid) = car_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT v.car_id, s.ts, s.lat, s.lon \
+                 FROM sightings s JOIN vehicles v ON s.vehicle_id = v.vehicle_id \
+                 WHERE v.car_id = ?1 AND s.lat IS NOT NULL AND s.lon IS NOT NULL \
+                 ORDER BY s.ts",
+            )?;
+            stmt.query_map(params![cid], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT v.car_id, s.ts, s.lat, s.lon \
+                 FROM sightings s JOIN vehicles v ON s.vehicle_id = v.vehicle_id \
+                 WHERE v.car_id IS NOT NULL AND s.lat IS NOT NULL AND s.lon IS NOT NULL \
+                 ORDER BY s.ts",
+            )?;
+            stmt.query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(sightings)
+    }
+
+    // -----------------------------------------------------------------------
+    // Report generation
+    // -----------------------------------------------------------------------
+
+    /// Generate a full report for a car.
+    pub fn generate_car_report(
+        &self,
+        car_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<CarReport> {
+        // Get car metadata.
+        let car_meta: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT first_seen, last_seen FROM cars WHERE car_id = ?1",
+                params![car_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        // Get vehicles belonging to this car.
+        let mut stmt = self.conn.prepare(
+            "SELECT vehicle_id, protocol, make_model, pressure_sig \
+             FROM vehicles WHERE car_id = ?1",
+        )?;
+        let vehicles: Vec<VehicleSummary> = stmt
+            .query_map(params![car_id], |row| {
+                let vehicle_id: String = row.get(0)?;
+                let protocol: String = row.get(1)?;
+                let make_model: Option<String> = row.get(2)?;
+                let pressure_sig_s: String = row.get(3)?;
+                let sig: [f32; 4] =
+                    serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
+                let avg = sig.iter().filter(|&&p| p > 0.0).sum::<f32>()
+                    / sig.iter().filter(|&&p| p > 0.0).count().max(1) as f32;
+                Ok(VehicleSummary {
+                    vehicle_id,
+                    protocol,
+                    make_model,
+                    avg_pressure_kpa: avg,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Total sighting count.
+        let vehicle_ids: Vec<String> = vehicles.iter().map(|v| v.vehicle_id.clone()).collect();
+        let total_sessions: i64 = if vehicle_ids.is_empty() {
+            0
+        } else {
+            let placeholders: Vec<String> = vehicle_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let query = format!(
+                "SELECT COUNT(*) FROM sightings WHERE vehicle_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vehicle_ids
+                .iter()
+                .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            stmt.query_row(params_ref.as_slice(), |row| row.get(0))?
+        };
+
+        // Presence slots for routine.
+        let slots = self.get_presence_slots(car_id, from, to)?;
+        let routine = analytics::compute_routine(car_id, &slots);
+
+        // Pressure events.
+        let mut pressure_events: Vec<PressureEvent> = Vec::new();
+        for v in &vehicles {
+            let readings = self.get_pressure_readings(&v.vehicle_id, from, to)?;
+            let events = analytics::detect_pressure_events(car_id, &v.vehicle_id, &readings);
+            pressure_events.extend(events);
+        }
+
+        Ok(CarReport {
+            car_id: car_id.to_string(),
+            first_seen: car_meta.as_ref().map(|(f, _)| f.clone()),
+            last_seen: car_meta.as_ref().map(|(_, l)| l.clone()),
+            total_sessions,
+            routine,
+            pressure_events,
+            vehicles,
+        })
+    }
+
+    /// List all car IDs in the database.
+    pub fn all_car_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT car_id FROM cars ORDER BY last_seen DESC")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
 }
 
 fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
@@ -332,4 +790,164 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         car_id: car_id_uuid,
         receiver_sightings: HashMap::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use crate::Sighting;
+
+    fn test_db() -> Database {
+        Database::open(":memory:").expect("in-memory DB should open")
+    }
+
+    #[test]
+    fn presence_slot_upsert_and_query() {
+        let db = test_db();
+        let car_id = Uuid::new_v4();
+        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 4, None)
+            .unwrap();
+
+        let ts1 = Utc.with_ymd_and_hms(2026, 4, 13, 8, 15, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 4, 13, 8, 45, 0).unwrap();
+        let car_id_s = car_id.to_string();
+
+        db.upsert_presence_slot(&car_id_s, &ts1, "node-01").unwrap();
+        db.upsert_presence_slot(&car_id_s, &ts2, "node-02").unwrap();
+
+        let slots = db.get_presence_slots(&car_id_s, None, None).unwrap();
+        assert_eq!(slots.len(), 1, "same hour should merge into one slot");
+        assert_eq!(slots[0].sighting_count, 2);
+        assert_eq!(slots[0].receiver_ids.len(), 2);
+    }
+
+    #[test]
+    fn backfill_presence_slots_populates_from_sightings() {
+        let db = test_db();
+        let vid = Uuid::new_v4();
+        let car_id = Uuid::new_v4();
+
+        // Create car first (FK constraint).
+        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 1, None)
+            .unwrap();
+
+        // Create vehicle and car.
+        let vehicle = VehicleTrack {
+            vehicle_id: vid,
+            first_seen: Utc.with_ymd_and_hms(2026, 4, 13, 8, 0, 0).unwrap(),
+            last_seen: Utc.with_ymd_and_hms(2026, 4, 13, 10, 0, 0).unwrap(),
+            sighting_count: 2,
+            protocol: "test".to_string(),
+            rtl433_id: 59,
+            fixed_sensor_id: Some(12345),
+            pressure_signature: [230.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_id),
+            receiver_sightings: HashMap::new(),
+        };
+        db.upsert_vehicle(&vehicle).unwrap();
+
+        // Insert sightings.
+        let sighting1 = Sighting {
+            ts: Utc.with_ymd_and_hms(2026, 4, 13, 8, 0, 0).unwrap(),
+            protocol: "test".to_string(),
+            rtl433_id: 59,
+            sensor_id: 12345,
+            pressure_kpa: 230.0,
+            temp_c: Some(25.0),
+            alarm: false,
+            battery_ok: true,
+            pressure_reliable: true,
+            tx_interval_hint_ms: None,
+            receiver_id: "default".to_string(),
+        };
+        let sighting2 = Sighting {
+            ts: Utc.with_ymd_and_hms(2026, 4, 13, 10, 0, 0).unwrap(),
+            ..sighting1.clone()
+        };
+        db.insert_sighting(&sighting1, vid).unwrap();
+        db.insert_sighting(&sighting2, vid).unwrap();
+
+        let count = db.backfill_presence_slots().unwrap();
+        assert_eq!(count, 2);
+
+        let slots = db.get_presence_slots(&car_id.to_string(), None, None).unwrap();
+        assert_eq!(slots.len(), 2, "two distinct hours should produce two slots");
+    }
+
+    #[test]
+    fn pressure_event_insert_and_query() {
+        let db = test_db();
+        let car_id = Uuid::new_v4();
+        let vid = Uuid::new_v4();
+        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 1, None)
+            .unwrap();
+        // Create a vehicle so the FK to vehicles(vehicle_id) is satisfied.
+        let vehicle = VehicleTrack {
+            vehicle_id: vid,
+            first_seen: Utc.with_ymd_and_hms(2026, 4, 13, 8, 0, 0).unwrap(),
+            last_seen: Utc.with_ymd_and_hms(2026, 4, 13, 10, 0, 0).unwrap(),
+            sighting_count: 1,
+            protocol: "test".to_string(),
+            rtl433_id: 59,
+            fixed_sensor_id: Some(12345),
+            pressure_signature: [230.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_id),
+            receiver_sightings: HashMap::new(),
+        };
+        db.upsert_vehicle(&vehicle).unwrap();
+
+        let event = PressureEvent::SuddenIncrease {
+            car_id: car_id.to_string(),
+            vehicle_id: vid.to_string(),
+            delta_kpa: 15.0,
+            ts: "2026-04-13T09:00:00+00:00".to_string(),
+        };
+        db.insert_pressure_event(&event).unwrap();
+
+        let events = db.get_pressure_events(&car_id.to_string()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], PressureEvent::SuddenIncrease { delta_kpa, .. } if (*delta_kpa - 15.0).abs() < 0.1));
+    }
+
+    #[test]
+    fn generate_car_report_with_no_data() {
+        let db = test_db();
+        let car_id = Uuid::new_v4();
+        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 1, None)
+            .unwrap();
+
+        let report = db.generate_car_report(&car_id.to_string(), None, None).unwrap();
+        assert_eq!(report.car_id, car_id.to_string());
+        assert_eq!(report.total_sessions, 0);
+        assert!(report.routine.is_none());
+    }
+
+    #[test]
+    fn schema_has_correct_indexes() {
+        let db = test_db();
+        // Verify presence_slots index exists.
+        let count: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_presence_slots_car_ts'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "idx_presence_slots_car_ts index should exist");
+
+        // Verify pressure_events index exists.
+        let count: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_pressure_events_car_ts'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "idx_pressure_events_car_ts index should exist");
+    }
 }

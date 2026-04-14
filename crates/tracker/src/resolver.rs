@@ -404,6 +404,15 @@ impl Resolver {
         self.db.upsert_vehicle(vehicle)?;
         self.db.insert_sighting(&sighting, vehicle_id)?;
 
+        // Incrementally update presence slot if car_id is assigned.
+        if let Some(car_id) = vehicle.car_id {
+            let _ = self.db.upsert_presence_slot(
+                &car_id.to_string(),
+                &sighting.ts,
+                &sighting.receiver_id,
+            );
+        }
+
         Ok(Some(vehicle_id))
     }
 
@@ -523,6 +532,15 @@ impl Resolver {
         let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
         self.db.insert_sighting(&sighting, vehicle_id)?;
+
+        // Incrementally update presence slot if car_id is assigned.
+        if let Some(car_id) = vehicle.car_id {
+            let _ = self.db.upsert_presence_slot(
+                &car_id.to_string(),
+                &sighting.ts,
+                &sighting.receiver_id,
+            );
+        }
 
         Ok(Some(vehicle_id))
     }
@@ -690,6 +708,15 @@ impl Resolver {
         // Persist.
         let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
+
+        // Incrementally update presence slot if car_id is assigned.
+        if let Some(car_id) = vehicle.car_id {
+            let _ = self.db.upsert_presence_slot(
+                &car_id.to_string(),
+                &now,
+                &self.receiver_id,
+            );
+        }
 
         Ok(Some(vehicle_id))
     }
