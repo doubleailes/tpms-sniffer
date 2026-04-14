@@ -83,7 +83,9 @@ impl Database {
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
-                pressure_sig   = excluded.pressure_sig
+                pressure_sig   = excluded.pressure_sig,
+                rtl433_id      = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.rtl433_id ELSE vehicles.rtl433_id END,
+                protocol       = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.protocol   ELSE vehicles.protocol   END
             "#,
             params![
                 v.vehicle_id.to_string(),
