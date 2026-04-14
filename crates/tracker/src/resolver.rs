@@ -470,8 +470,19 @@ mod tests {
     use super::*;
     use crate::db::Database;
 
-    fn make_packet(sensor_id: &str, protocol: &str, rtl433_id: u16, pressure_kpa: f32) -> TpmsPacket {
-        make_packet_at("2025-06-01 12:00:00.000", sensor_id, protocol, rtl433_id, pressure_kpa)
+    fn make_packet(
+        sensor_id: &str,
+        protocol: &str,
+        rtl433_id: u16,
+        pressure_kpa: f32,
+    ) -> TpmsPacket {
+        make_packet_at(
+            "2025-06-01 12:00:00.000",
+            sensor_id,
+            protocol,
+            rtl433_id,
+            pressure_kpa,
+        )
     }
 
     fn make_packet_at(
@@ -519,10 +530,7 @@ mod tests {
             );
         }
         assert!(
-            !resolver
-                .fixed_map
-                .keys()
-                .any(|(sid, _)| *sid == 0xFFFFFFFF),
+            !resolver.fixed_map.keys().any(|(sid, _)| *sid == 0xFFFFFFFF),
             "sentinel 0xFFFFFFFF must not appear in fixed_map"
         );
     }
@@ -545,10 +553,7 @@ mod tests {
             );
         }
         assert!(
-            !resolver
-                .fixed_map
-                .keys()
-                .any(|(sid, _)| *sid == 0x00000000),
+            !resolver.fixed_map.keys().any(|(sid, _)| *sid == 0x00000000),
             "sentinel 0x00000000 must not appear in fixed_map"
         );
     }
@@ -654,7 +659,11 @@ mod tests {
             eez_count, 1,
             "all six EezTire packets must collapse into a single vehicle"
         );
-        let v = resolver.vehicles.values().find(|v| v.protocol == "EezTire").unwrap();
+        let v = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .unwrap();
         assert_eq!(v.sighting_count, 6);
         assert!(v.fixed_sensor_id.is_none());
     }
@@ -665,14 +674,32 @@ mod tests {
         // the same pressure should resolve to a *different* vehicle UUID.
         let mut resolver = in_memory_resolver();
 
-        let p1 = make_packet_at("2025-06-01 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 51.1);
-        let p2 = make_packet_at("2025-06-01 12:00:10.000", "0xBFFFFFFF", "EezTire", 241, 51.1);
+        let p1 = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let p2 = make_packet_at(
+            "2025-06-01 12:00:10.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
         let vid1 = resolver.process(&p1).unwrap().unwrap();
         let vid2 = resolver.process(&p2).unwrap().unwrap();
         assert_eq!(vid1, vid2, "packets inside the expiry window must merge");
 
         // > 5 minutes later, a new sighting should not merge with the earlier vehicle.
-        let p3 = make_packet_at("2025-06-01 12:05:11.000", "0x7FFFFF7F", "EezTire", 241, 51.1);
+        let p3 = make_packet_at(
+            "2025-06-01 12:05:11.000",
+            "0x7FFFFF7F",
+            "EezTire",
+            241,
+            51.1,
+        );
         let vid3 = resolver.process(&p3).unwrap().unwrap();
         assert_ne!(
             vid1, vid3,
@@ -687,10 +714,34 @@ mod tests {
         // vehicles.
         let mut resolver = in_memory_resolver();
 
-        let hi1 = make_packet_at("2025-06-01 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 51.1);
-        let lo1 = make_packet_at("2025-06-01 12:00:01.000", "0xBFFFFFFF", "EezTire", 241, 25.0);
-        let hi2 = make_packet_at("2025-06-01 12:00:02.000", "0x7FFEFFFE", "EezTire", 241, 51.2);
-        let lo2 = make_packet_at("2025-06-01 12:00:03.000", "0xEFFFF5FF", "EezTire", 241, 24.9);
+        let hi1 = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let lo1 = make_packet_at(
+            "2025-06-01 12:00:01.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            25.0,
+        );
+        let hi2 = make_packet_at(
+            "2025-06-01 12:00:02.000",
+            "0x7FFEFFFE",
+            "EezTire",
+            241,
+            51.2,
+        );
+        let lo2 = make_packet_at(
+            "2025-06-01 12:00:03.000",
+            "0xEFFFF5FF",
+            "EezTire",
+            241,
+            24.9,
+        );
 
         let vhi1 = resolver.process(&hi1).unwrap().unwrap();
         let vlo1 = resolver.process(&lo1).unwrap().unwrap();
@@ -698,8 +749,14 @@ mod tests {
         let vlo2 = resolver.process(&lo2).unwrap().unwrap();
 
         assert_ne!(vhi1, vlo1, "51 kPa and 25 kPa sensors must not merge");
-        assert_eq!(vhi1, vhi2, "both 51 kPa packets must resolve to same vehicle");
-        assert_eq!(vlo1, vlo2, "both 25 kPa packets must resolve to same vehicle");
+        assert_eq!(
+            vhi1, vhi2,
+            "both 51 kPa packets must resolve to same vehicle"
+        );
+        assert_eq!(
+            vlo1, vlo2,
+            "both 25 kPa packets must resolve to same vehicle"
+        );
 
         let eez_count = resolver
             .vehicles
