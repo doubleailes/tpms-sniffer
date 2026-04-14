@@ -1,26 +1,43 @@
-# tpms-sniffer v0.2
+# tpms-sniffer
 
-Passive TPMS sniffer in Rust, built on
-[`rtlsdr-next`](https://github.com/mattdelashaw/rtlsdr-next).
-Protocol details ported directly from
-[`rtl_433`](https://github.com/merbanan/rtl_433) — the reference
-implementation.
+A passive TPMS (Tire Pressure Monitoring System) sniffer and vehicle tracker written in Rust. Decodes over-the-air transmissions from 25 sensor protocols at 315/433 MHz using a low-cost RTL-SDR dongle, and correlates packets into stable vehicle tracks using pressure fingerprinting and transmission-interval analysis.
+
+> **Legal notice:** Passive reception only. No transmission. Verify local regulations regarding the reception of automotive RF signals before use.
 
 ---
 
-## Supported protocols (25 total)
+## Overview
 
-| `--protocol` flag | Protocol / Sensor | rtl_433 # | Vehicles | Freq | Mod |
+Every car with direct TPMS (dTPMS) broadcasts tire pressure and temperature in cleartext over 315 or 433 MHz ISM radio. These transmissions are receivable up to 40–50 m away with a $30 RTL-SDR dongle. `tpms-sniffer` decodes them in real time and feeds a tracker that builds persistent vehicle identities from the data stream — even for modern sensors that rotate their identifiers to defeat tracking.
+
+The tracker pipeline is:
+
+```text
+RTL-SDR (IQ stream)
+  └─ Demodulator (OOK / FSK)
+       └─ Framer (preamble detection)
+            └─ Protocol decoders (25 protocols)
+                 └─ Tracker (fingerprint correlator → vehicle UUIDs)
+                      └─ SQLite store + JSON-L output
+```
+
+---
+
+## Supported protocols
+
+25 protocols ported from the [rtl_433](https://github.com/merbanan/rtl_433) reference implementation.
+
+| Flag | Protocol | rtl_433 # | Vehicles | Freq | Modulation |
 |---|---|---|---|---|---|
 | `steelmate` | Steelmate TPMS | 59 | Generic | 315/433 | OOK-PWM |
 | `schrader` | Schrader generic | 60 | Various | 315/433 | FSK-Manch |
-| `citroen` | Citroen / Peugeot / Fiat VDO | 82 | Citroen, Peugeot, Fiat, Mitsubishi | 433 | FSK-Manch |
-| `toyota` | Toyota PMV-C210 (Pacific Ind.) | 88 | Toyota Auris/Corolla/Lexus | 433 | FSK-DMC |
-| `ford` | Ford / Continental VDO | 89 | Ford Fiesta/Focus/Kuga/Transit | 315/433 | FSK-Manch |
-| `renault` | Renault / Dacia | 90 | Renault Clio/Captur/Zoe, Dacia | 433 | FSK-Manch |
+| `citroen` | Citroën / Peugeot / Fiat VDO | 82 | Citroën, Peugeot, Fiat, Mitsubishi | 433 | FSK-Manch |
+| `toyota` | Toyota PMV-C210 | 88 | Toyota Auris / Corolla / Lexus | 433 | FSK-DMC |
+| `ford` | Ford / Continental VDO | 89 | Ford Fiesta / Focus / Kuga / Transit | 315/433 | FSK-Manch |
+| `renault` | Renault / Dacia | 90 | Renault Clio / Captur / Zoe, Dacia | 433 | FSK-Manch |
 | `schrader_eg53` | Schrader EG53MA4 | 95 | Saab, Opel, Vauxhall, Chevrolet | 315/433 | FSK-Manch |
 | `toyota107j` | Toyota PMV-107J | 110 | Toyota (US market) | 315 | FSK-DMC |
-| `jansite` | Jansite TY02S | 123 | Aftermarket / homebrew | 433 | OOK |
+| `jansite` | Jansite TY02S | 123 | Aftermarket | 433 | OOK |
 | `elantra` | Hyundai Elantra 2012 | 140 | Hyundai Elantra | 433 | OOK |
 | `abarth` | Abarth 124 Spider | 156 | Abarth 124 | 433 | FSK-Manch |
 | `schrader_smd` | Schrader SMD3MA4 / 3039 | 168 | Subaru, Infiniti, Nissan, Renault | 433 | FSK-Manch |
@@ -38,110 +55,214 @@ implementation.
 | `trw_ook` | TRW OOK OEM + clones | 298 | VW, Audi, Renault (OEM) | 433 | OOK |
 | `trw_fsk` | TRW FSK OEM + clones | 299 | VW, Audi, Renault (OEM) | 433 | FSK-Manch |
 
-Modulation codes: **OOK** = On-Off Keying, **FSK-Manch** = FSK + Manchester,
-**FSK-DMC** = FSK + Differential Manchester.
+Modulation codes: **OOK** = On-Off Keying, **FSK-Manch** = FSK + Manchester encoding, **FSK-DMC** = FSK + Differential Manchester encoding.
+
+---
+
+## Hardware requirements
+
+- Any RTL-SDR compatible dongle (RTL2832U chipset, ~$25–35)
+- Antenna tuned for 315 or 433 MHz ISM band
+- Linux or macOS host
+
+Reception range is typically 20–50 m in open-air conditions. NLOS (through walls) reception is possible at reduced range. A vehicle passing at 50 km/h within 20 m of the receiver will typically yield 3–5 packets per pass.
+
+---
+
+## Build
+
+```bash
+# Linux
+sudo apt install libusb-1.0-0-dev
+
+# macOS
+brew install libusb
+
+cargo build --release
+```
+
+---
+
+## Usage
+
+```bash
+# EU band (433.92 MHz, default)
+./target/release/tpms-sniffer
+
+# US band (315 MHz)
+./target/release/tpms-sniffer --freq 315000000
+
+# Decode only Ford sensors
+./target/release/tpms-sniffer --protocol ford
+
+# JSON output — pipe to jq, InfluxDB, the tracker, etc.
+./target/release/tpms-sniffer --json | jq .
+
+# High gain, lower confidence threshold
+./target/release/tpms-sniffer --gain 400 --confidence 50
+```
+
+---
+
+## Output format
+
+### Human-readable (default)
+
+```
+[2026-04-13 15:00:26] [241] EezTire/Carchet/TST-507  0xFFFFFFFF   51.1 kPa (  7.4 psi)  205.0 °C  conf=65% ⚠ALARM 🔋LOW  raw=[FF FF FF FF FB FF FF EF FF]
+[2026-04-13 15:00:26] [208] AVE-TPMS                 0xFFFFBFFF  382.5 kPa ( 55.5 psi)  151.0 °C  conf=65%               raw=[FF FF BF FF FF BF]
+[2026-04-13 15:02:22] [140] Hyundai-Elantra-2012      0xFFFFFFFF  253.0 kPa ( 36.7 psi)  215.0 °C  conf=75%               raw=[FF FF FF FF FD FF FF F7]
+```
+
+Each line contains: timestamp, protocol ID, protocol name, sensor ID, pressure (kPa and psi), temperature (°C), confidence score, alarm/battery flags, and raw bytes.
+
+### JSON (`--json`)
+
+```json
+{
+  "timestamp":    "2026-04-13 15:00:26.692",
+  "protocol":     "EezTire/Carchet/TST-507",
+  "rtl433_id":    241,
+  "sensor_id":    "0xFFFFFFFF",
+  "pressure_kpa": 51.1,
+  "pressure_psi": 7.4,
+  "temp_c":       null,
+  "battery_ok":   false,
+  "alarm":        true,
+  "raw_hex":      "FF FF FF FF FB FF FF EF FF",
+  "confidence":   65
+}
+```
+
+Temperature is emitted as `null` when the sensor reports a sentinel value (≥ 200 °C) indicating the field is unavailable.
+
+---
+
+## Confidence scoring
+
+Packets are scored before output. The default threshold is **65%** — adjust with `--confidence`.
+
+| Condition | Points |
+|---|---|
+| CRC / checksum passes | +60 |
+| Pressure in sane range | +20 |
+| Pressure in typical tyre range (150–350 kPa) | +10 |
+| Temperature in typical range (−20–80 °C) | +5 |
+| Base bonus | +5 |
+
+---
+
+## Tracker
+
+The tracker layer consumes JSON-L output from the sniffer and builds stable vehicle identities. Run it as a pipeline:
+
+```bash
+./target/release/tpms-sniffer --json | ./target/release/tpms-tracker
+```
+
+### How vehicle tracking works
+
+Modern TPMS sensors (post-2018, EU mandate) rotate their sensor ID per packet to defeat passive tracking. The tracker handles both fixed-ID and rolling-ID sensors:
+
+**Fixed-ID sensors** (Hyundai, TRW-OOK, EezTire, most OEM protocols): the sensor ID is stable over the lifetime of the sensor. The tracker maintains a `(sensor_id, protocol)` → `vehicle_uuid` map. IDs with fewer than 3 bits cleared from `0xFFFFFFFF` are treated as decode artifacts and routed to the fingerprint correlator instead.
+
+**Rolling-ID sensors** (AVE-TPMS, post-2018 aftermarket): the sensor ID changes every packet. The tracker correlates these by **pressure fingerprint** — the median pressure reading for each active vehicle — and **transmission interval** — the median time between consecutive packets. Two sensors at 382.5 kPa are ambiguous; two sensors at 382.5 kPa with transmission intervals of 45 s and 71 s are distinct.
+
+### Tracker output
+
+```text
+2026-04-13 17:05:34 | vehicle=7178d3ed-f88f-4f00-8ad0-6ca8dace30e5 | sensor=0xFEFFFFFD | 63.8 kPa | TRW-OOK
+2026-04-13 17:06:47 | vehicle=7178d3ed-f88f-4f00-8ad0-6ca8dace30e5 | sensor=0xFEFFFFFD | 63.8 kPa | TRW-OOK
+2026-04-13 17:11:16 | vehicle=9d4c2a96-6392-4087-ba33-30d7ebae8f90 | sensor=0xFFFF7FFF | 334.5 kPa | AVE-TPMS
+```
+
+Each sighting line carries a stable `vehicle` UUID that persists across ID rotations for the lifetime of the session.
+
+### Tuning parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `PRESSURE_TOLERANCE_KPA` | 5.0 | Maximum pressure delta for fingerprint match |
+| `VEHICLE_EXPIRY` | 300 s (EezTire/TRW: 480 s, AVE: 600 s) | Silence window before a track expires |
+| `TX_INTERVAL_TOLERANCE_MS` | 8 000 | Transmission interval match tolerance |
+| `TX_INTERVAL_MIN_SAMPLES` | 3 | Minimum intervals before TX matching is used |
 
 ---
 
 ## Architecture
 
 ```text
-rtlsdr-next (async IQ stream)
-       │
-       ├─ OokDemod ──┐
-       │              ├─▶ Framer ─▶ decode() ─▶ Reporter
-       └─ FskDemod ──┘
-```
+src/
+├── demod.rs       OOK envelope + FSK FM-discriminator, clock recovery
+├── framer.rs      Alternating (0xAA…) and Huf (0x00FF) preamble detection
+├── manchester.rs  Manchester and Differential Manchester decoders
+├── decoder.rs     25 protocol decoders ported from rtl_433
+└── reporter.rs    Pretty-print and JSON-L output
 
-| File | Responsibility |
-|---|---|
-| `src/demod.rs` | OOK envelope + FSK FM-discriminator, clock recovery |
-| `src/framer.rs` | Alternating (0xAA…) and Huf (0x00FF) preamble detect |
-| `src/manchester.rs` | Manchester and Differential Manchester decoders |
-| `src/decoder.rs` | 25 protocol decoders ported from rtl_433 |
-| `src/reporter.rs` | Pretty-print and JSON-line output |
-
----
-
-## Build & run
-
-```bash
-# system deps
-sudo apt install libusb-1.0-0-dev    # Linux
-brew install libusb                  # macOS
-
-cargo build --release
-
-# EU (default)
-./target/release/tpms-sniffer
-
-# US
-./target/release/tpms-sniffer --freq 315000000
-
-# decode only Ford sensors
-./target/release/tpms-sniffer --protocol ford
-
-# JSON output (pipe to jq, InfluxDB, etc.)
-./target/release/tpms-sniffer --json | jq .
-
-# high gain, low confidence threshold
-./target/release/tpms-sniffer --gain 400 --confidence 50
+tracker/
+├── lib.rs         Vehicle resolver (fixed-ID map + fingerprint correlator)
+├── store.rs       SQLite persistence layer
+└── main.rs        JSON-L ingestion loop
 ```
 
 ---
 
-## Sample output
+## Database schema
 
-```text
-[2026-04-10 14:32:01.123] [ 89] Ford-VDO                    0x1A2B3C4D   231.2 kPa ( 33.5 psi)    21.0 °C  conf= 95% [moving]  raw=[1A 2B 3C 4D 8C D6 44 7E]
-[2026-04-10 14:32:01.445] [ 82] Citroen/Peugeot/Fiat        0xABCD1234   218.4 kPa ( 31.7 psi)    20.0 °C  conf= 90%           raw=[00 AB CD 12 34 0C 9E 46 00 XX]
-[2026-04-10 14:32:02.001] [ 88] Toyota-PMV-C210             0x0D5AEE30   234.4 kPa ( 34.0 psi)    25.0 °C  conf= 95%           raw=[0D 5A EE 30 80 8C 41 00 7B 0C]
-[2026-04-10 14:32:03.200] [252] BMW-Gen4/5+Audi             0xDEADBEEF   230.0 kPa ( 33.4 psi)    22.0 °C  conf= 90%  ⚠ALARM   raw=[DE AD BE EF 01 94 48 02 FF A3]
+The tracker persists sightings to a local SQLite database (`tpms.db` by default).
+
+```sql
+CREATE TABLE vehicles (
+    vehicle_id            TEXT PRIMARY KEY,
+    first_seen            TEXT,
+    protocol              TEXT,
+    rtl433_id             INTEGER,
+    sensor_id             TEXT,
+    make_model            TEXT,
+    pressure_kpa          REAL,
+    tx_interval_median_ms INTEGER
+);
+
+CREATE TABLE sightings (
+    id           INTEGER PRIMARY KEY,
+    vehicle_id   TEXT REFERENCES vehicles(vehicle_id),
+    ts           TEXT,
+    pressure_kpa REAL,
+    temp_c       REAL,
+    alarm        INTEGER,
+    battery_ok   INTEGER,
+    confidence   INTEGER,
+    receiver_id  TEXT NOT NULL DEFAULT 'default',
+    lat          REAL,
+    lon          REAL
+);
 ```
 
 ---
 
-## JSON schema
+## Research context
 
-```json
-{
-  "timestamp":    "2026-04-10 14:32:01.123",
-  "protocol":     "Ford-VDO",
-  "rtl433_id":    89,
-  "sensor_id":    "0x1A2B3C4D",
-  "pressure_kpa": 231.2,
-  "pressure_psi": 33.5,
-  "temp_c":       21.0,
-  "battery_ok":   true,
-  "flags":        68,
-  "moving":       true,
-  "alarm":        false,
-  "raw_hex":      "1A 2B 3C 4D 8C D6 44 7E",
-  "confidence":   95
-}
-```
+This tool implements findings from:
+
+> Lizarribar et al., **"Can't Hide Your Stride: Inferring Car Movement Patterns from Passive TPMS Measurements"** (2024). Five low-cost RTL-SDR receivers deployed over 10 weeks, 6 million packets, 20 000+ vehicles observed. Key result: a network of $100 receivers can reliably reconstruct work schedules, commute patterns, and behavioural routines from passive TPMS capture alone.
+
+The tracker's Jaccard co-occurrence grouping (coming in a future release) is based directly on Section VI of that paper, which demonstrates 12/12 correct car identification using 1-minute co-occurrence windows.
+
+Prior work: Rouf et al., **"Security and Privacy Vulnerabilities of In-Car Wireless Networks: A TPMS Case Study"**, USENIX Security 2010 — the original demonstration that TPMS enables passive vehicle tracking.
 
 ---
 
-## Confidence scoring
+## Contributing
 
-| Condition | Points |
-|---|---|
-| CRC / checksum passes | +60 |
-| Pressure + temp in sane range | +20 |
-| Pressure in typical tyre range 150–350 kPa | +10 |
-| Temperature in typical tyre range −20–80 °C | +5 |
-| Base bonus | +5 |
+Issues and pull requests welcome. The backlog is tracked as GitHub issues — see the open issues for the current roadmap, which includes:
 
-Default threshold: **65%** (use `--confidence` to adjust).
+- Jaccard-index 4-tire vehicle grouping (#13)
+- Multi-receiver deduplication and MQTT ingestion (#14)
+- Long-term behavioural pattern analysis and GeoJSON export (#15)
+- Common-byte prefix seeding for wheel-position inference (#16)
 
 ---
-
-## Legal notice
-
-Passive reception only. No transmission. Verify local regulations
-regarding reception of automotive RF signals before use.
 
 ## License
 
-MIT.
+MIT
