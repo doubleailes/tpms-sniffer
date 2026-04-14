@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 use crate::{Sighting, VehicleTrack};
@@ -67,6 +68,25 @@ impl Database {
             )?;
         }
 
+        // Migration: add tx_interval columns for the tx-interval fingerprint
+        // feature.  `tx_interval_median_ms` is nullable (NULL until enough
+        // samples); `tx_interval_samples` defaults to 0.
+        let has_tx_interval: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='tx_interval_median_ms'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_tx_interval == 0 {
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN tx_interval_median_ms INTEGER",
+                [],
+            )?;
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN tx_interval_samples INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -78,14 +98,17 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO vehicles
-                (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig,
+                 tx_interval_median_ms, tx_interval_samples)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
                 pressure_sig   = excluded.pressure_sig,
                 rtl433_id      = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.rtl433_id ELSE vehicles.rtl433_id END,
-                protocol       = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.protocol   ELSE vehicles.protocol   END
+                protocol       = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.protocol   ELSE vehicles.protocol   END,
+                tx_interval_median_ms = excluded.tx_interval_median_ms,
+                tx_interval_samples   = excluded.tx_interval_samples
             "#,
             params![
                 v.vehicle_id.to_string(),
@@ -97,6 +120,8 @@ impl Database {
                 v.fixed_sensor_id.map(|id| id as i64),
                 v.make_model_hint.as_deref(),
                 pressure_sig,
+                v.tx_interval_median_ms.map(|ms| ms as i64),
+                v.tx_intervals_ms.len() as i64,
             ],
         )?;
         Ok(())
@@ -140,7 +165,8 @@ impl Database {
     pub fn find_vehicle_by_sensor_id(&self, sensor_id: u32) -> Result<Option<VehicleTrack>> {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
-                    sensor_id, make_model, pressure_sig, rtl433_id
+                    sensor_id, make_model, pressure_sig, rtl433_id,
+                    tx_interval_median_ms, tx_interval_samples
              FROM vehicles WHERE sensor_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![sensor_id as i64])?;
@@ -155,7 +181,8 @@ impl Database {
     pub fn all_vehicles(&self) -> Result<Vec<VehicleTrack>> {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
-                    sensor_id, make_model, pressure_sig, rtl433_id
+                    sensor_id, make_model, pressure_sig, rtl433_id,
+                    tx_interval_median_ms, tx_interval_samples
              FROM vehicles ORDER BY last_seen DESC",
         )?;
         let vehicles = stmt
@@ -175,12 +202,20 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let make_model: Option<String> = row.get(6)?;
     let pressure_sig_s: String = row.get(7)?;
     let rtl433_id: i64 = row.get(8)?;
+    let tx_interval_median: Option<i64> = row.get(9)?;
+    let tx_interval_samples: i64 = row.get(10)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now())
     };
+
+    // Reconstruct the in-memory tx_intervals_ms ring buffer: we don't persist
+    // individual intervals, so after a DB reload the buffer is empty and the
+    // median will be recalculated from live traffic.  We do carry over the
+    // sample count / median so the DB row reflects the last-known state.
+    let _ = tx_interval_samples; // acknowledged but not used for ring buffer
 
     Ok(VehicleTrack {
         vehicle_id: Uuid::parse_str(&vid).unwrap_or_else(|_| Uuid::nil()),
@@ -194,5 +229,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         pressure_signature: serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]),
         make_model_hint: make_model,
         battery_ok: true,
+        tx_intervals_ms: VecDeque::new(),
+        tx_interval_median_ms: tx_interval_median.map(|ms| ms as u32),
     })
 }
