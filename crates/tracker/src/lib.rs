@@ -2,11 +2,19 @@ pub mod db;
 pub mod jaccard;
 pub mod resolver;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Cross-receiver deduplication constants
+// ---------------------------------------------------------------------------
+
+/// Two sightings of the same vehicle fingerprint from different receivers
+/// within this window (ms) are treated as the same physical event.
+pub const CROSS_RECEIVER_WINDOW_MS: u64 = 5_000;
 
 // ---------------------------------------------------------------------------
 // TX-interval tuning constants
@@ -44,6 +52,15 @@ pub struct TpmsPacket {
     /// older JSON captures — defaults to `true`.
     #[serde(default = "default_pressure_reliable")]
     pub pressure_kpa_reliable: bool,
+    /// Identifier for the receiver node that captured this packet.  Populated
+    /// from `--receiver-id` on the sending node; defaults to `"default"` when
+    /// absent in the JSON stream.
+    #[serde(default = "default_receiver_id")]
+    pub receiver_id: String,
+}
+
+fn default_receiver_id() -> String {
+    "default".to_string()
 }
 
 fn default_pressure_reliable() -> bool {
@@ -87,6 +104,8 @@ pub struct Sighting {
     /// same protocol in the input stream.  `None` for the very first packet of
     /// a protocol or when the gap exceeds `TX_INTERVAL_MAX_MS`.
     pub tx_interval_hint_ms: Option<u32>,
+    /// Identifier for the receiver node that captured this packet.
+    pub receiver_id: String,
 }
 
 /// Long-lived record for a vehicle inferred from repeated sightings.
@@ -121,6 +140,10 @@ pub struct VehicleTrack {
     /// ID of the car group this vehicle belongs to (set by Jaccard grouping).
     /// `None` until the co-occurrence grouper has enough data to assign it.
     pub car_id: Option<Uuid>,
+    /// Per-receiver sighting timestamps.  Keys are receiver IDs; values are
+    /// chronologically ordered timestamps of sightings from that receiver.
+    /// Used for direction-of-travel inference and cross-receiver metadata.
+    pub receiver_sightings: HashMap<String, Vec<DateTime<Utc>>>,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.
