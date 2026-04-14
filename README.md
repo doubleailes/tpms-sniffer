@@ -108,7 +108,7 @@ cargo build --release
 
 ### Human-readable (default)
 
-```
+```text
 [2026-04-13 15:00:26] [241] EezTire/Carchet/TST-507  0xFFFFFFFF   51.1 kPa (  7.4 psi)  205.0 °C  conf=65% ⚠ALARM 🔋LOW  raw=[FF FF FF FF FB FF FF EF FF]
 [2026-04-13 15:00:26] [208] AVE-TPMS                 0xFFFFBFFF  382.5 kPa ( 55.5 psi)  151.0 °C  conf=65%               raw=[FF FF BF FF FF BF]
 [2026-04-13 15:02:22] [140] Hyundai-Elantra-2012      0xFFFFFFFF  253.0 kPa ( 36.7 psi)  215.0 °C  conf=75%               raw=[FF FF FF FF FD FF FF F7]
