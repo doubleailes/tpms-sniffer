@@ -18,7 +18,7 @@ transmission rates that require a longer window; the mapping lives in
 | rtl_433 ID | Protocol  | Expiry | Rationale |
 |-----------:|-----------|-------:|-----------|
 | 208        | AVE-TPMS  | 600 s  | Aftermarket AVE clip-on sensors transmit every 2–8 minutes when the vehicle is stationary. A 5-minute window leaks the track between sightings and spawns a fresh UUID for what is the same physical vehicle. |
-| 241        | EezTire   | 480 s  | EezTire sensors may transmit infrequently when in alarm state or when the battery is low, with gaps of up to 6+ minutes observed in the field. |
+| 241        | EezTire   | 480 s  | EezTire sensors may transmit infrequently when the battery is low, with gaps of up to 6+ minutes observed in the field. |
 | 298        | TRW-OOK   | 480 s  | Similar slow stationary TX cadence to EezTire. |
 | *(any other)* | *(default)* | 300 s | Matches the prior behaviour of a single global constant. |
 
