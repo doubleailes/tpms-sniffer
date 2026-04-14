@@ -5,18 +5,40 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  release:
+    types: [ published ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  fmt:
     runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt --all -- --check
 
+  build:
+    needs: fmt
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  release:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build release binary
+      run: cargo build --release --verbose
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-binary
+        path: target/release/
