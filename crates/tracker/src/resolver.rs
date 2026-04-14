@@ -57,15 +57,27 @@ const PRESSURE_MATCH_TOLERANCE_KPA: f32 = 5.0;
 /// gone out of range and any new match is a different vehicle.
 ///
 /// Some protocols transmit infrequently when the vehicle is stationary and
-/// need a longer expiry than the default.  AVE-TPMS (rtl_433 id 208) is a
-/// known low-transmission-rate protocol — aftermarket AVE sensors idle at
-/// 2–8 minute intervals when parked, so a 5-minute expiry leaks the track
-/// and spawns a fresh vehicle UUID for every other sighting. See
-/// `crates/tracker/README.md` for the documented per-protocol values.
+/// need a longer expiry than the default.  See `crates/tracker/README.md`
+/// for the documented per-protocol values and rationale.
 fn vehicle_expiry_for(rtl433_id: u16) -> Duration {
     match rtl433_id {
         208 => Duration::seconds(600), // AVE-TPMS: low TX rate when parked
+        241 => Duration::seconds(480), // EezTire: may be slow when low battery
+        298 => Duration::seconds(480), // TRW-OOK: similar
         _ => Duration::seconds(300),   // default: 5 minutes
+    }
+}
+
+/// Compute the effective expiry for a vehicle, extending the base per-protocol
+/// window when the sensor has reported low battery.  A low-battery sensor may
+/// transmit less frequently but is still physically present; the extension
+/// avoids spurious track restarts.
+fn effective_expiry(vehicle: &VehicleTrack) -> Duration {
+    let base = vehicle_expiry_for(vehicle.rtl433_id);
+    if !vehicle.battery_ok {
+        base + Duration::seconds(300) // extend by 5 min for low-battery sensors
+    } else {
+        base
     }
 }
 
@@ -226,6 +238,7 @@ impl Resolver {
                         fixed_sensor_id: Some(sensor_id),
                         pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                         make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+                        battery_ok: sighting.battery_ok,
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -243,6 +256,7 @@ impl Resolver {
                     fixed_sensor_id: Some(sensor_id),
                     pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                     make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+                    battery_ok: sighting.battery_ok,
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -260,6 +274,7 @@ impl Resolver {
                 fixed_sensor_id: Some(sensor_id),
                 pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                 make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+                battery_ok: sighting.battery_ok,
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
@@ -270,6 +285,7 @@ impl Resolver {
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
         vehicle.last_seen = sighting.ts;
         vehicle.sighting_count += 1;
+        vehicle.battery_ok = sighting.battery_ok;
         if sighting.pressure_reliable {
             ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
         }
@@ -298,7 +314,6 @@ impl Resolver {
         let pressure = sighting.pressure_kpa;
         let protocol = sighting.protocol.clone();
         let rtl433_id = sighting.rtl433_id;
-        let expiry = vehicle_expiry_for(rtl433_id);
 
         // Find an active vehicle of the same protocol whose pressure
         // signature is within tolerance.  Use `rtl433_id` (not the display
@@ -310,7 +325,7 @@ impl Resolver {
             .vehicles
             .values()
             .filter(|v| v.rtl433_id == rtl433_id && v.fixed_sensor_id.is_none())
-            .filter(|v| now.signed_duration_since(v.last_seen) < expiry)
+            .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
             .find(|v| (v.pressure_signature[0] - pressure).abs() <= PRESSURE_MATCH_TOLERANCE_KPA)
             .map(|v| v.vehicle_id);
 
@@ -328,6 +343,7 @@ impl Resolver {
                 fixed_sensor_id: None,
                 pressure_signature: [pressure, 0.0, 0.0, 0.0],
                 make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
+                battery_ok: sighting.battery_ok,
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -337,6 +353,7 @@ impl Resolver {
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
         vehicle.last_seen = now;
         vehicle.sighting_count += 1;
+        vehicle.battery_ok = sighting.battery_ok;
         if sighting.pressure_reliable {
             ema_update(&mut vehicle.pressure_signature[0], pressure);
         }
@@ -416,7 +433,6 @@ impl Resolver {
     fn resolve_burst(&mut self, burst: &BurstAccumulator) -> Result<Option<Uuid>> {
         let now = burst.last_ts;
         let sig = burst_to_signature(&burst.pressures);
-        let expiry = vehicle_expiry_for(burst.rtl433_id);
 
         // Find an existing rolling-ID vehicle whose pressure signature is close
         // enough and that was seen recently enough to still be active.  We copy
@@ -426,7 +442,7 @@ impl Resolver {
             .vehicles
             .values()
             .filter(|v| v.fixed_sensor_id.is_none() && v.rtl433_id == burst.rtl433_id)
-            .filter(|v| now.signed_duration_since(v.last_seen) < expiry)
+            .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
             .find(|v| l1_per_wheel(&v.pressure_signature, &sig) < PRESSURE_MATCH_TOLERANCE_KPA)
             .map(|v| v.vehicle_id);
 
@@ -445,6 +461,7 @@ impl Resolver {
                 fixed_sensor_id: None,
                 pressure_signature: sig,
                 make_model_hint: make_model_hint(burst.rtl433_id).map(str::to_owned),
+                battery_ok: true,
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -557,6 +574,28 @@ mod tests {
             alarm: Some(false),
             confidence: 90,
             pressure_kpa_reliable,
+        }
+    }
+
+    fn make_packet_at_battery(
+        timestamp: &str,
+        sensor_id: &str,
+        protocol: &str,
+        rtl433_id: u16,
+        pressure_kpa: f32,
+        battery_ok: bool,
+    ) -> TpmsPacket {
+        TpmsPacket {
+            timestamp: timestamp.to_string(),
+            protocol: protocol.to_string(),
+            rtl433_id,
+            sensor_id: sensor_id.to_string(),
+            pressure_kpa,
+            temp_c: Some(25.0),
+            battery_ok: Some(battery_ok),
+            alarm: Some(false),
+            confidence: 90,
+            pressure_kpa_reliable: true,
         }
     }
 
@@ -725,8 +764,9 @@ mod tests {
 
     #[test]
     fn eeztire_packet_after_expiry_creates_new_vehicle() {
-        // After VEHICLE_EXPIRY (5 minutes) of silence a new EezTire packet at
-        // the same pressure should resolve to a *different* vehicle UUID.
+        // After EezTire VEHICLE_EXPIRY (8 minutes / 480 s) of silence a new
+        // EezTire packet at the same pressure should resolve to a *different*
+        // vehicle UUID.
         let mut resolver = in_memory_resolver();
 
         let p1 = make_packet_at(
@@ -747,9 +787,10 @@ mod tests {
         let vid2 = resolver.process(&p2).unwrap().unwrap();
         assert_eq!(vid1, vid2, "packets inside the expiry window must merge");
 
-        // > 5 minutes later, a new sighting should not merge with the earlier vehicle.
+        // > 8 minutes after last sighting, a new sighting should not merge
+        // with the earlier vehicle. Last sighting was at 12:00:10.
         let p3 = make_packet_at(
-            "2025-06-01 12:05:11.000",
+            "2025-06-01 12:08:11.000",
             "0x7FFFFF7F",
             "EezTire",
             241,
@@ -999,12 +1040,12 @@ mod tests {
     }
 
     #[test]
-    fn ave_has_longer_vehicle_expiry_than_default() {
-        // Documented per-protocol expiry: AVE-TPMS (208) uses 10 minutes,
-        // everything else (e.g. EezTire 241) keeps the 5-minute default.
-        assert_eq!(vehicle_expiry_for(208), Duration::seconds(600));
-        assert_eq!(vehicle_expiry_for(241), Duration::seconds(300));
-        assert_eq!(vehicle_expiry_for(0), Duration::seconds(300));
+    fn per_protocol_vehicle_expiry() {
+        // Documented per-protocol expiry values.
+        assert_eq!(vehicle_expiry_for(208), Duration::seconds(600)); // AVE-TPMS
+        assert_eq!(vehicle_expiry_for(241), Duration::seconds(480)); // EezTire
+        assert_eq!(vehicle_expiry_for(298), Duration::seconds(480)); // TRW-OOK
+        assert_eq!(vehicle_expiry_for(0), Duration::seconds(300));   // default
     }
 
     #[test]
@@ -1335,5 +1376,121 @@ mod tests {
         let trw_vehicle = &resolver.vehicles[&vid1];
         assert_eq!(trw_vehicle.protocol, "TRW-OOK");
         assert_eq!(trw_vehicle.rtl433_id, 298);
+    }
+
+    #[test]
+    fn eeztire_low_battery_survives_9_minute_gap() {
+        // EezTire (241) base expiry is 480 s.  With battery_ok=false, the
+        // effective expiry extends by 300 s to 780 s (13 min).  A 9-minute
+        // gap (540 s) must NOT create a new vehicle.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_battery(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+            false, // low battery
+        );
+        let vid1 = resolver.process(&p1).unwrap().unwrap();
+
+        // 9 minutes later — within the extended 780 s window.
+        let p2 = make_packet_at_battery(
+            "2025-06-01 12:09:00.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+            false,
+        );
+        let vid2 = resolver.process(&p2).unwrap().unwrap();
+        assert_eq!(
+            vid1, vid2,
+            "EezTire with battery_ok=false must survive a 9-minute gap"
+        );
+    }
+
+    #[test]
+    fn eeztire_good_battery_expires_after_8_minutes() {
+        // EezTire (241) base expiry is 480 s.  With battery_ok=true, there is
+        // no extension.  A gap of 481 s must create a new vehicle.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at_battery(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+            true, // good battery
+        );
+        let vid1 = resolver.process(&p1).unwrap().unwrap();
+
+        // 8 minutes + 1 second later — just past the 480 s window.
+        let p2 = make_packet_at_battery(
+            "2025-06-01 12:08:01.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+            true,
+        );
+        let vid2 = resolver.process(&p2).unwrap().unwrap();
+        assert_ne!(
+            vid1, vid2,
+            "EezTire with battery_ok=true must expire after 8 minutes"
+        );
+    }
+
+    #[test]
+    fn effective_expiry_battery_extension() {
+        // Verify the effective_expiry function applies the 300 s battery
+        // extension correctly for various protocols.
+        let make_track = |rtl433_id: u16, battery_ok: bool| -> VehicleTrack {
+            VehicleTrack {
+                vehicle_id: Uuid::new_v4(),
+                first_seen: Utc::now(),
+                last_seen: Utc::now(),
+                sighting_count: 1,
+                protocol: String::new(),
+                rtl433_id,
+                fixed_sensor_id: None,
+                pressure_signature: [0.0; 4],
+                make_model_hint: None,
+                battery_ok,
+            }
+        };
+
+        // EezTire, good battery: 480 s
+        assert_eq!(
+            effective_expiry(&make_track(241, true)),
+            Duration::seconds(480)
+        );
+        // EezTire, low battery: 480 + 300 = 780 s
+        assert_eq!(
+            effective_expiry(&make_track(241, false)),
+            Duration::seconds(780)
+        );
+        // AVE-TPMS, good battery: 600 s
+        assert_eq!(
+            effective_expiry(&make_track(208, true)),
+            Duration::seconds(600)
+        );
+        // AVE-TPMS, low battery: 600 + 300 = 900 s
+        assert_eq!(
+            effective_expiry(&make_track(208, false)),
+            Duration::seconds(900)
+        );
+        // Default protocol, good battery: 300 s
+        assert_eq!(
+            effective_expiry(&make_track(0, true)),
+            Duration::seconds(300)
+        );
+        // Default protocol, low battery: 300 + 300 = 600 s
+        assert_eq!(
+            effective_expiry(&make_track(0, false)),
+            Duration::seconds(600)
+        );
     }
 }
