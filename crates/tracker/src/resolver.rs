@@ -416,14 +416,17 @@ impl Resolver {
     fn resolve_burst(&mut self, burst: &BurstAccumulator) -> Result<Option<Uuid>> {
         let now = burst.last_ts;
         let sig = burst_to_signature(&burst.pressures);
+        let expiry = vehicle_expiry_for(burst.rtl433_id);
 
         // Find an existing rolling-ID vehicle whose pressure signature is close
-        // enough.  We copy the Uuid (it's Copy) so we drop the shared borrow
-        // before taking the mutable one below.
+        // enough and that was seen recently enough to still be active.  We copy
+        // the Uuid (it's Copy) so we drop the shared borrow before taking the
+        // mutable one below.
         let matched_vid: Option<Uuid> = self
             .vehicles
             .values()
             .filter(|v| v.fixed_sensor_id.is_none() && v.protocol == burst.protocol)
+            .filter(|v| now.signed_duration_since(v.last_seen) < expiry)
             .find(|v| l1_per_wheel(&v.pressure_signature, &sig) < PRESSURE_MATCH_TOLERANCE_KPA)
             .map(|v| v.vehicle_id);
 
@@ -922,6 +925,136 @@ mod tests {
         assert_eq!(vehicle_expiry_for(208), Duration::seconds(600));
         assert_eq!(vehicle_expiry_for(241), Duration::seconds(300));
         assert_eq!(vehicle_expiry_for(0), Duration::seconds(300));
+    }
+
+    #[test]
+    fn ave_burst_after_expiry_creates_new_vehicle() {
+        // AVE-TPMS (protocol 208) has a 600 s expiry.  Two bursts of the same
+        // pressure separated by more than 600 s must resolve to *distinct*
+        // vehicle UUIDs.  This verifies that the expiry filter in resolve_burst
+        // is actually evaluated (not just the function return value).
+        let mut resolver = in_memory_resolver();
+
+        // First burst: two packets within the 200 ms burst window.
+        let p1a = make_packet_at(
+            "2025-06-01 10:00:00.000",
+            "0x11111111",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        let p1b = make_packet_at(
+            "2025-06-01 10:00:00.100",
+            "0x22222222",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        resolver.process(&p1a).unwrap();
+        resolver.process(&p1b).unwrap();
+        resolver.flush().unwrap();
+
+        let vid1 = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "AVE-TPMS")
+            .map(|v| v.vehicle_id)
+            .expect("first burst must create a vehicle");
+
+        // Second burst: exactly the same pressure, but more than 600 s later.
+        // resolve_burst must reject the existing vehicle as stale and create a
+        // new UUID instead of re-using vid1.
+        let p2a = make_packet_at(
+            "2025-06-01 10:10:01.000",
+            "0x33333333",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        let p2b = make_packet_at(
+            "2025-06-01 10:10:01.100",
+            "0x44444444",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        resolver.process(&p2a).unwrap();
+        resolver.process(&p2b).unwrap();
+        resolver.flush().unwrap();
+
+        let ave_vehicles: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "AVE-TPMS")
+            .collect();
+        assert_eq!(
+            ave_vehicles.len(),
+            2,
+            "burst after AVE expiry (600 s) must create a second vehicle"
+        );
+        let vid2 = ave_vehicles
+            .iter()
+            .find(|v| v.vehicle_id != vid1)
+            .map(|v| v.vehicle_id)
+            .expect("second vehicle must exist");
+        assert_ne!(
+            vid1, vid2,
+            "the two bursts separated by >600 s must not share a vehicle UUID"
+        );
+    }
+
+    #[test]
+    fn ave_burst_within_expiry_reuses_vehicle() {
+        // Complement of the above: two AVE bursts separated by less than 600 s
+        // at matching pressure must still collapse into a single vehicle UUID.
+        let mut resolver = in_memory_resolver();
+
+        let p1a = make_packet_at(
+            "2025-06-01 10:00:00.000",
+            "0xAAAAAAAA",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        let p1b = make_packet_at(
+            "2025-06-01 10:00:00.100",
+            "0xBBBBBBBB",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        resolver.process(&p1a).unwrap();
+        resolver.process(&p1b).unwrap();
+        resolver.flush().unwrap();
+
+        // Second burst 599 s later — still within the 600 s AVE window.
+        let p2a = make_packet_at(
+            "2025-06-01 10:09:59.000",
+            "0xCCCCCCCC",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        let p2b = make_packet_at(
+            "2025-06-01 10:09:59.100",
+            "0xDDDDDDDD",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        resolver.process(&p2a).unwrap();
+        resolver.process(&p2b).unwrap();
+        resolver.flush().unwrap();
+
+        let ave_count = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "AVE-TPMS")
+            .count();
+        assert_eq!(
+            ave_count, 1,
+            "two AVE bursts within the 600 s window must collapse to a single vehicle"
+        );
     }
 
     #[test]
