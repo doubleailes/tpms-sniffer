@@ -87,6 +87,34 @@ impl Database {
             )?;
         }
 
+        // Migration: add cars table and car_id column for Jaccard wheel
+        // grouping.  The `cars` table stores aggregated car-level records; each
+        // vehicle track may reference a car via `car_id`.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cars (
+                car_id      TEXT PRIMARY KEY,
+                first_seen  TEXT,
+                last_seen   TEXT,
+                wheel_count INTEGER,
+                make_model  TEXT,
+                notes       TEXT
+            );
+            "#,
+        )?;
+
+        let has_car_id: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='car_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_car_id == 0 {
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN car_id TEXT REFERENCES cars(car_id)",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -99,8 +127,8 @@ impl Database {
             r#"
             INSERT INTO vehicles
                 (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig,
-                 tx_interval_median_ms, tx_interval_samples)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 tx_interval_median_ms, tx_interval_samples, car_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
@@ -108,7 +136,8 @@ impl Database {
                 rtl433_id      = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.rtl433_id ELSE vehicles.rtl433_id END,
                 protocol       = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.protocol   ELSE vehicles.protocol   END,
                 tx_interval_median_ms = excluded.tx_interval_median_ms,
-                tx_interval_samples   = excluded.tx_interval_samples
+                tx_interval_samples   = excluded.tx_interval_samples,
+                car_id                = COALESCE(excluded.car_id, vehicles.car_id)
             "#,
             params![
                 v.vehicle_id.to_string(),
@@ -122,6 +151,7 @@ impl Database {
                 pressure_sig,
                 v.tx_interval_median_ms.map(|ms| ms as i64),
                 v.tx_intervals_ms.len() as i64,
+                v.car_id.map(|id| id.to_string()),
             ],
         )?;
         Ok(())
@@ -166,7 +196,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
-                    tx_interval_median_ms, tx_interval_samples
+                    tx_interval_median_ms, tx_interval_samples, car_id
              FROM vehicles WHERE sensor_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![sensor_id as i64])?;
@@ -182,13 +212,51 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
-                    tx_interval_median_ms, tx_interval_samples
+                    tx_interval_median_ms, tx_interval_samples, car_id
              FROM vehicles ORDER BY last_seen DESC",
         )?;
         let vehicles = stmt
             .query_map([], row_to_vehicle)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(vehicles)
+    }
+
+    /// Upsert a car group record.
+    pub fn upsert_car(
+        &self,
+        car_id: Uuid,
+        first_seen: &str,
+        last_seen: &str,
+        wheel_count: usize,
+        make_model: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO cars (car_id, first_seen, last_seen, wheel_count, make_model)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(car_id) DO UPDATE SET
+                last_seen   = excluded.last_seen,
+                wheel_count = excluded.wheel_count,
+                make_model  = COALESCE(excluded.make_model, cars.make_model)
+            "#,
+            params![
+                car_id.to_string(),
+                first_seen,
+                last_seen,
+                wheel_count as i64,
+                make_model,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Set the `car_id` of a vehicle.
+    pub fn set_vehicle_car_id(&self, vehicle_id: Uuid, car_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "UPDATE vehicles SET car_id = ?1 WHERE vehicle_id = ?2",
+            params![car_id.to_string(), vehicle_id.to_string()],
+        )?;
+        Ok(())
     }
 }
 
@@ -204,12 +272,15 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let rtl433_id: i64 = row.get(8)?;
     let tx_interval_median: Option<i64> = row.get(9)?;
     let _tx_interval_samples: i64 = row.get(10)?;
+    let car_id_s: Option<String> = row.get(11)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now())
     };
+
+    let car_id_uuid = car_id_s.and_then(|s| Uuid::parse_str(&s).ok());
 
     Ok(VehicleTrack {
         vehicle_id: Uuid::parse_str(&vid).unwrap_or_else(|_| Uuid::nil()),
@@ -225,5 +296,6 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         battery_ok: true,
         tx_intervals_ms: VecDeque::new(),
         tx_interval_median_ms: tx_interval_median.map(|ms| ms as u32),
+        car_id: car_id_uuid,
     })
 }

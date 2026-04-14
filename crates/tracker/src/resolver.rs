@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::jaccard::{self, CoOccurrenceMatrix, group_vehicles_into_cars, WINDOW_SIZE_S};
 use crate::{
     Sighting, TpmsPacket, VehicleTrack, compute_median, make_model_hint, TX_INTERVAL_MAX_MS,
     TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW,
@@ -120,6 +121,10 @@ pub struct Resolver {
     /// compute `tx_interval_hint_ms` on incoming sightings.
     last_seen_by_protocol: HashMap<u16, DateTime<Utc>>,
     db: Database,
+    /// Jaccard co-occurrence matrix for wheel grouping.
+    cooccurrence: CoOccurrenceMatrix,
+    /// Timestamp of the last window advance.
+    last_window_advance: Option<DateTime<Utc>>,
 }
 
 impl Resolver {
@@ -131,6 +136,8 @@ impl Resolver {
             pending_burst: None,
             last_seen_by_protocol: HashMap::new(),
             db,
+            cooccurrence: CoOccurrenceMatrix::new(),
+            last_window_advance: None,
         };
         r.load_from_db()?;
         Ok(r)
@@ -258,6 +265,7 @@ impl Resolver {
                         battery_ok: sighting.battery_ok,
                         tx_intervals_ms: VecDeque::new(),
                         tx_interval_median_ms: None,
+                        car_id: None,
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -278,6 +286,7 @@ impl Resolver {
                     battery_ok: sighting.battery_ok,
                     tx_intervals_ms: VecDeque::new(),
                     tx_interval_median_ms: None,
+                    car_id: None,
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -298,6 +307,7 @@ impl Resolver {
                 battery_ok: sighting.battery_ok,
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
+                car_id: None,
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
@@ -305,24 +315,33 @@ impl Resolver {
         };
 
         // Update in-memory state.
-        let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
-        // Accumulate inter-packet interval before updating last_seen.
-        let interval_ms = (sighting.ts - vehicle.last_seen).num_milliseconds() as u32;
-        if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
-            vehicle.tx_intervals_ms.push_back(interval_ms);
-            if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
-                vehicle.tx_intervals_ms.pop_front();
+        {
+            let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+            // Accumulate inter-packet interval before updating last_seen.
+            let interval_ms = (sighting.ts - vehicle.last_seen).num_milliseconds() as u32;
+            if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+                vehicle.tx_intervals_ms.push_back(interval_ms);
+                if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                    vehicle.tx_intervals_ms.pop_front();
+                }
+                vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
             }
-            vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
-        }
-        vehicle.last_seen = sighting.ts;
-        vehicle.sighting_count += 1;
-        vehicle.battery_ok = sighting.battery_ok;
-        if sighting.pressure_reliable {
-            ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
+            vehicle.last_seen = sighting.ts;
+            vehicle.sighting_count += 1;
+            vehicle.battery_ok = sighting.battery_ok;
+            if sighting.pressure_reliable {
+                ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
+            }
         }
 
+        // Record co-occurrence.
+        self.cooccurrence.record(vehicle_id);
+
+        // Advance window if enough time has elapsed.
+        self.maybe_advance_window(sighting.ts);
+
         // Persist.
+        let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
         self.db.insert_sighting(&sighting, vehicle_id)?;
 
@@ -399,30 +418,40 @@ impl Resolver {
                 battery_ok: sighting.battery_ok,
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
+                car_id: None,
             };
             self.vehicles.insert(vid, vehicle);
             vid
         };
 
         // Update in-memory state.
-        let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
-        // Accumulate inter-packet interval before updating last_seen.
-        let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
-        if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
-            vehicle.tx_intervals_ms.push_back(interval_ms);
-            if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
-                vehicle.tx_intervals_ms.pop_front();
+        {
+            let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+            // Accumulate inter-packet interval before updating last_seen.
+            let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
+            if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+                vehicle.tx_intervals_ms.push_back(interval_ms);
+                if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                    vehicle.tx_intervals_ms.pop_front();
+                }
+                vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
             }
-            vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
-        }
-        vehicle.last_seen = now;
-        vehicle.sighting_count += 1;
-        vehicle.battery_ok = sighting.battery_ok;
-        if sighting.pressure_reliable {
-            ema_update(&mut vehicle.pressure_signature[0], pressure);
+            vehicle.last_seen = now;
+            vehicle.sighting_count += 1;
+            vehicle.battery_ok = sighting.battery_ok;
+            if sighting.pressure_reliable {
+                ema_update(&mut vehicle.pressure_signature[0], pressure);
+            }
         }
 
+        // Record co-occurrence.
+        self.cooccurrence.record(vehicle_id);
+
+        // Advance window if enough time has elapsed.
+        self.maybe_advance_window(now);
+
         // Persist.
+        let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
         self.db.insert_sighting(&sighting, vehicle_id)?;
 
@@ -552,32 +581,119 @@ impl Resolver {
                 battery_ok: true,
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
+                car_id: None,
             };
             self.vehicles.insert(vid, vehicle);
             vid
         };
 
         // Update in-memory state.
-        let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
-        // Accumulate inter-burst interval before updating last_seen.
-        let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
-        if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
-            vehicle.tx_intervals_ms.push_back(interval_ms);
-            if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
-                vehicle.tx_intervals_ms.pop_front();
+        {
+            let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+            // Accumulate inter-burst interval before updating last_seen.
+            let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
+            if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+                vehicle.tx_intervals_ms.push_back(interval_ms);
+                if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                    vehicle.tx_intervals_ms.pop_front();
+                }
+                vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
             }
-            vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
-        }
-        vehicle.last_seen = now;
-        vehicle.sighting_count += 1;
-        for (i, &p) in burst.pressures.iter().enumerate().take(4) {
-            ema_update(&mut vehicle.pressure_signature[i], p);
+            vehicle.last_seen = now;
+            vehicle.sighting_count += 1;
+            for (i, &p) in burst.pressures.iter().enumerate().take(4) {
+                ema_update(&mut vehicle.pressure_signature[i], p);
+            }
         }
 
+        // Record co-occurrence.
+        self.cooccurrence.record(vehicle_id);
+
+        // Advance window if enough time has elapsed.
+        self.maybe_advance_window(now);
+
         // Persist.
+        let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
 
         Ok(Some(vehicle_id))
+    }
+
+    // -----------------------------------------------------------------------
+    // Jaccard co-occurrence window management
+    // -----------------------------------------------------------------------
+
+    /// Advance the co-occurrence window if at least `WINDOW_SIZE_S` seconds
+    /// have elapsed since the last advance.  After advancing, runs the grouping
+    /// algorithm and persists car assignments.
+    fn maybe_advance_window(&mut self, now: DateTime<Utc>) {
+        let should_advance = match self.last_window_advance {
+            Some(prev) => {
+                (now - prev).num_seconds() >= WINDOW_SIZE_S as i64
+            }
+            None => {
+                // First packet ever — initialise the timer but don't advance.
+                self.last_window_advance = Some(now);
+                false
+            }
+        };
+        if should_advance {
+            self.last_window_advance = Some(now);
+            self.cooccurrence.advance_window();
+            // Best-effort grouping; errors are non-fatal.
+            let _ = self.run_grouping();
+        }
+    }
+
+    /// Run the Jaccard grouping algorithm and persist car assignments.
+    fn run_grouping(&mut self) -> Result<()> {
+        if self.cooccurrence.windows_accumulated < jaccard::MIN_WINDOWS {
+            return Ok(());
+        }
+        let ids: Vec<Uuid> = self.vehicles.keys().copied().collect();
+        let groups = group_vehicles_into_cars(&self.cooccurrence, &ids);
+        for group in &groups {
+            // Determine aggregate first/last seen for the car.
+            let mut first = None::<DateTime<Utc>>;
+            let mut last = None::<DateTime<Utc>>;
+            let mut make_model: Option<String> = None;
+            for &vid in &group.members {
+                if let Some(v) = self.vehicles.get(&vid) {
+                    first = Some(first.map_or(v.first_seen, |f: DateTime<Utc>| f.min(v.first_seen)));
+                    last = Some(last.map_or(v.last_seen, |l: DateTime<Utc>| l.max(v.last_seen)));
+                    if make_model.is_none() {
+                        make_model = v.make_model_hint.clone();
+                    }
+                }
+            }
+            let first_s = first.map(|d| d.to_rfc3339()).unwrap_or_default();
+            let last_s = last.map(|d| d.to_rfc3339()).unwrap_or_default();
+
+            self.db.upsert_car(
+                group.car_id,
+                &first_s,
+                &last_s,
+                group.wheel_count(),
+                make_model.as_deref(),
+            )?;
+            for &vid in &group.members {
+                if let Some(v) = self.vehicles.get_mut(&vid) {
+                    v.car_id = Some(group.car_id);
+                }
+                self.db.set_vehicle_car_id(vid, group.car_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a reference to the co-occurrence matrix for export.
+    pub fn cooccurrence_matrix(&self) -> &CoOccurrenceMatrix {
+        &self.cooccurrence
+    }
+
+    /// Return a reference to the in-memory vehicles map.
+    pub fn vehicles(&self) -> &HashMap<Uuid, VehicleTrack> {
+        &self.vehicles
     }
 }
 
@@ -1560,6 +1676,7 @@ mod tests {
                 battery_ok,
                 tx_intervals_ms: VecDeque::new(),
                 tx_interval_median_ms: None,
+                car_id: None,
             }
         };
 

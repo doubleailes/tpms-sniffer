@@ -23,6 +23,11 @@ struct Args {
     /// Minimum confidence score (0–100) to process.
     #[arg(long, default_value_t = 65)]
     confidence: u8,
+
+    /// Export the Jaccard co-occurrence matrix as JSON to the specified file
+    /// after processing all input.
+    #[arg(long)]
+    export_jaccard: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -53,8 +58,14 @@ fn main() -> Result<()> {
 
         match resolver.process(&packet) {
             Ok(Some(vid)) if args.verbose => {
+                let car_id = resolver
+                    .vehicles()
+                    .get(&vid)
+                    .and_then(|v| v.car_id)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "none".to_string());
                 println!(
-                    "{} | vehicle={vid} | sensor={} | {:.1} kPa | {}",
+                    "{} | vehicle={vid} | car={car_id} | sensor={} | {:.1} kPa | {}",
                     packet.timestamp, packet.sensor_id, packet.pressure_kpa, packet.protocol,
                 );
             }
@@ -65,6 +76,14 @@ fn main() -> Result<()> {
 
     // Flush any incomplete rolling-ID burst accumulated at end of stream.
     resolver.flush()?;
+
+    // Export Jaccard matrix if requested.
+    if let Some(ref path) = args.export_jaccard {
+        let export = resolver.cooccurrence_matrix().export();
+        let json = serde_json::to_string_pretty(&export)?;
+        std::fs::write(path, json)?;
+        eprintln!("Jaccard matrix exported to {path}");
+    }
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 pub mod db;
+pub mod jaccard;
 pub mod resolver;
 
 use std::collections::VecDeque;
@@ -117,6 +118,9 @@ pub struct VehicleTrack {
     /// Median of `tx_intervals_ms`; `None` until at least
     /// `TX_INTERVAL_MIN_SAMPLES` intervals have been collected.
     pub tx_interval_median_ms: Option<u32>,
+    /// ID of the car group this vehicle belongs to (set by Jaccard grouping).
+    /// `None` until the co-occurrence grouper has enough data to assign it.
+    pub car_id: Option<Uuid>,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.
