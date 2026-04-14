@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod db;
 pub mod jaccard;
 pub mod resolver;
