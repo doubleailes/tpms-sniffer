@@ -145,6 +145,9 @@ pub struct VehicleTrack {
     /// chronologically ordered timestamps of sightings from that receiver.
     /// Used for direction-of-travel inference and cross-receiver metadata.
     pub receiver_sightings: HashMap<String, Vec<DateTime<Utc>>>,
+    /// Inferred wheel position (FL/FR/RL/RR) based on trailing-byte analysis.
+    /// `None` when inference is not possible or not applicable.
+    pub wheel_position: Option<jaccard::WheelPosition>,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.

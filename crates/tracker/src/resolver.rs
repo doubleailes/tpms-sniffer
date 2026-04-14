@@ -6,7 +6,10 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::jaccard::{self, CoOccurrenceMatrix, group_vehicles_into_cars, WINDOW_SIZE_S};
+use crate::jaccard::{
+    self, CoOccurrenceMatrix, VehicleMeta, group_vehicles_into_cars_with_meta,
+    infer_wheel_positions, WINDOW_SIZE_S,
+};
 use crate::{
     CROSS_RECEIVER_WINDOW_MS, Sighting, TpmsPacket, VehicleTrack, compute_median,
     make_model_hint, TX_INTERVAL_MAX_MS, TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW,
@@ -314,6 +317,7 @@ impl Resolver {
                         tx_interval_median_ms: None,
                         car_id: None,
                         receiver_sightings: HashMap::new(),
+                        wheel_position: None,
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -336,6 +340,7 @@ impl Resolver {
                     tx_interval_median_ms: None,
                     car_id: None,
                     receiver_sightings: HashMap::new(),
+                    wheel_position: None,
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -358,6 +363,7 @@ impl Resolver {
                 tx_interval_median_ms: None,
                 car_id: None,
                 receiver_sightings: HashMap::new(),
+                wheel_position: None,
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
@@ -490,6 +496,7 @@ impl Resolver {
                 tx_interval_median_ms: None,
                 car_id: None,
                 receiver_sightings: HashMap::new(),
+                wheel_position: None,
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -674,6 +681,7 @@ impl Resolver {
                 tx_interval_median_ms: None,
                 car_id: None,
                 receiver_sightings: HashMap::new(),
+                wheel_position: None,
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -759,7 +767,19 @@ impl Resolver {
             return Ok(());
         }
         let ids: Vec<Uuid> = self.vehicles.keys().copied().collect();
-        let groups = group_vehicles_into_cars(&self.cooccurrence, &ids);
+
+        // Build vehicle metadata for prefix-based pre-filtering.
+        let meta: Vec<VehicleMeta> = self
+            .vehicles
+            .values()
+            .map(|v| VehicleMeta {
+                vehicle_id: v.vehicle_id,
+                rtl433_id: v.rtl433_id,
+                fixed_sensor_id: v.fixed_sensor_id,
+            })
+            .collect();
+
+        let groups = group_vehicles_into_cars_with_meta(&self.cooccurrence, &ids, &meta);
         for group in &groups {
             // Determine aggregate first/last seen for the car.
             let mut first = None::<DateTime<Utc>>;
@@ -784,11 +804,34 @@ impl Resolver {
                 group.wheel_count(),
                 make_model.as_deref(),
             )?;
+
+            // Attempt wheel-position inference for groups of exactly 4 fixed-ID
+            // sensors whose trailing bytes are consecutive.
+            let group_sensor_ids: Vec<u32> = group
+                .members
+                .iter()
+                .filter_map(|vid| {
+                    self.vehicles.get(vid).and_then(|v| v.fixed_sensor_id)
+                })
+                .collect();
+            let wheel_map = infer_wheel_positions(&group_sensor_ids);
+
             for &vid in &group.members {
                 if let Some(v) = self.vehicles.get_mut(&vid) {
                     v.car_id = Some(group.car_id);
+                    // Assign inferred wheel position if available.
+                    if let (Some(wm), Some(sid)) = (&wheel_map, v.fixed_sensor_id) {
+                        v.wheel_position = wm.get(&sid).copied();
+                    }
                 }
                 self.db.set_vehicle_car_id(vid, group.car_id)?;
+            }
+
+            // Persist updated vehicles (including wheel_position) after grouping.
+            for &vid in &group.members {
+                if let Some(v) = self.vehicles.get(&vid) {
+                    self.db.upsert_vehicle(v)?;
+                }
             }
         }
         Ok(())
@@ -1788,6 +1831,7 @@ mod tests {
                 tx_interval_median_ms: None,
                 car_id: None,
                 receiver_sightings: HashMap::new(),
+                wheel_position: None,
             }
         };
 

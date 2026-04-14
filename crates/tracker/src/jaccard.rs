@@ -19,6 +19,144 @@ pub const MIN_WINDOWS: u32 = 3;
 /// Iterative threshold descent: start strict, relax until all grouped.
 pub const THRESHOLDS: &[f32] = &[0.75, 0.60, 0.45, 0.30];
 
+/// Minimum number of shared most-significant bytes for two fixed-ID sensors
+/// to be considered candidate wheel-mates via prefix grouping.
+pub const MIN_PREFIX_BYTES: u8 = 2;
+
+// ---------------------------------------------------------------------------
+// Prefix byte similarity
+// ---------------------------------------------------------------------------
+
+/// Returns the number of most-significant bytes shared between two sensor IDs.
+/// e.g. 0xA3B2C100 and 0xA3B2C200 share 3 bytes → returns 3.
+pub fn common_prefix_bytes(a: u32, b: u32) -> u8 {
+    let xor = a ^ b;
+    if xor & 0xFF00_0000 != 0 {
+        return 0;
+    }
+    if xor & 0x00FF_0000 != 0 {
+        return 1;
+    }
+    if xor & 0x0000_FF00 != 0 {
+        return 2;
+    }
+    if xor & 0x0000_00FF != 0 {
+        return 3;
+    }
+    4 // identical
+}
+
+// ---------------------------------------------------------------------------
+// Wheel position
+// ---------------------------------------------------------------------------
+
+/// Inferred wheel position for a fixed-ID sensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum WheelPosition {
+    FL,
+    FR,
+    RL,
+    RR,
+}
+
+impl WheelPosition {
+    /// Parse from a string (e.g. database column).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "FL" => Some(Self::FL),
+            "FR" => Some(Self::FR),
+            "RL" => Some(Self::RL),
+            "RR" => Some(Self::RR),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical string label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FL => "FL",
+            Self::FR => "FR",
+            Self::RL => "RL",
+            Self::RR => "RR",
+        }
+    }
+}
+
+impl std::fmt::Display for WheelPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Attempt to infer wheel positions for a group of 4 sensor IDs.
+///
+/// Returns a mapping from sensor ID → wheel position when all 4 sensors share
+/// a common byte prefix and their trailing bytes form 4 consecutive values (in
+/// any order).  The lowest trailing byte is assigned FL, then FR, RL, RR.
+pub fn infer_wheel_positions(group: &[u32]) -> Option<HashMap<u32, WheelPosition>> {
+    if group.len() != 4 {
+        return None;
+    }
+    let trailing: Vec<u8> = group.iter().map(|&id| (id & 0xFF) as u8).collect();
+    let mut sorted = trailing.clone();
+    sorted.sort();
+    let is_consecutive = sorted.windows(2).all(|w| w[1] == w[0] + 1);
+    if !is_consecutive {
+        return None;
+    }
+    let positions = [
+        WheelPosition::FL,
+        WheelPosition::FR,
+        WheelPosition::RL,
+        WheelPosition::RR,
+    ];
+    Some(
+        sorted
+            .iter()
+            .zip(positions.iter())
+            .map(|(&byte, &pos)| {
+                let id = *group
+                    .iter()
+                    .find(|&&id| (id & 0xFF) as u8 == byte)
+                    .unwrap();
+                (id, pos)
+            })
+            .collect(),
+    )
+}
+
+/// Metadata for a vehicle track needed by prefix-based candidate filtering.
+pub struct VehicleMeta {
+    pub vehicle_id: Uuid,
+    pub rtl433_id: u16,
+    pub fixed_sensor_id: Option<u32>,
+}
+
+/// Return candidate wheel-mate vehicle IDs for `target` by filtering on
+/// shared sensor-ID byte prefix.  Only applies to fixed-ID protocols; vehicles
+/// without a `fixed_sensor_id` are excluded.
+pub fn candidate_wheel_mates(
+    target: &VehicleMeta,
+    all_vehicles: &[VehicleMeta],
+) -> Vec<Uuid> {
+    let Some(target_sid) = target.fixed_sensor_id else {
+        return vec![];
+    };
+    all_vehicles
+        .iter()
+        .filter(|v| v.rtl433_id == target.rtl433_id)
+        .filter(|v| v.vehicle_id != target.vehicle_id)
+        .filter(|v| {
+            if let Some(b) = v.fixed_sensor_id {
+                common_prefix_bytes(target_sid, b) >= MIN_PREFIX_BYTES
+            } else {
+                false
+            }
+        })
+        .map(|v| v.vehicle_id)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // CoOccurrenceMatrix
 // ---------------------------------------------------------------------------
@@ -185,9 +323,90 @@ pub fn group_vehicles_into_cars(
     matrix: &CoOccurrenceMatrix,
     vehicle_ids: &[Uuid],
 ) -> Vec<CarGroup> {
+    group_vehicles_into_cars_with_meta(matrix, vehicle_ids, &[])
+}
+
+/// Extended grouping that uses sensor-ID prefix similarity to seed groups
+/// for fixed-ID protocols before applying Jaccard co-occurrence scores.
+///
+/// When `vehicle_meta` is non-empty, vehicles whose fixed sensor IDs share
+/// at least `MIN_PREFIX_BYTES` most-significant bytes are pre-grouped before
+/// the iterative threshold descent.  Rolling-ID vehicles (those without a
+/// `fixed_sensor_id`) skip the prefix step entirely and are grouped only by
+/// Jaccard score.
+pub fn group_vehicles_into_cars_with_meta(
+    matrix: &CoOccurrenceMatrix,
+    vehicle_ids: &[Uuid],
+    vehicle_meta: &[VehicleMeta],
+) -> Vec<CarGroup> {
     let mut groups: Vec<CarGroup> = vec![];
     let mut ungrouped: HashSet<Uuid> = vehicle_ids.iter().copied().collect();
 
+    // --- Phase 0: Prefix-based seeding for fixed-ID protocols ---------------
+    if !vehicle_meta.is_empty() {
+        let meta_map: HashMap<Uuid, &VehicleMeta> =
+            vehicle_meta.iter().map(|m| (m.vehicle_id, m)).collect();
+
+        // Group by (rtl433_id, prefix) for each candidate in `ungrouped`.
+        // We iterate in sorted order for determinism.
+        let mut sorted_ungrouped: Vec<Uuid> = ungrouped.iter().copied().collect();
+        sorted_ungrouped.sort();
+
+        for &a in &sorted_ungrouped {
+            if !ungrouped.contains(&a) {
+                continue;
+            }
+            let Some(meta_a) = meta_map.get(&a) else {
+                continue;
+            };
+            let Some(sid_a) = meta_a.fixed_sensor_id else {
+                continue;
+            };
+
+            // Find prefix-matching peers among ungrouped vehicles.
+            let mates: Vec<Uuid> = candidate_wheel_mates(
+                meta_a,
+                &ungrouped
+                    .iter()
+                    .filter_map(|&id| meta_map.get(&id).map(|m| VehicleMeta {
+                        vehicle_id: m.vehicle_id,
+                        rtl433_id: m.rtl433_id,
+                        fixed_sensor_id: m.fixed_sensor_id,
+                    }))
+                    .collect::<Vec<_>>(),
+            );
+
+            if mates.is_empty() {
+                continue;
+            }
+
+            // Find or create a group for `a`.
+            let group = if let Some(g) = groups.iter_mut().find(|g| g.contains(a)) {
+                g
+            } else {
+                ungrouped.remove(&a);
+                let g = CarGroup::new(a);
+                groups.push(g);
+                groups.last_mut().unwrap()
+            };
+
+            for mate_id in mates {
+                if ungrouped.contains(&mate_id) {
+                    // Only add if sensor IDs also share a prefix with `a`.
+                    if let Some(meta_b) = meta_map.get(&mate_id) {
+                        if let Some(sid_b) = meta_b.fixed_sensor_id {
+                            if common_prefix_bytes(sid_a, sid_b) >= MIN_PREFIX_BYTES {
+                                group.add(mate_id);
+                                ungrouped.remove(&mate_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Phase 1: Iterative Jaccard threshold descent -----------------------
     for &threshold in THRESHOLDS {
         // Iterate over a snapshot so we can mutate `ungrouped`.
         let snapshot: Vec<Uuid> = ungrouped.iter().copied().collect();
@@ -466,5 +685,215 @@ mod tests {
         // Should be serializable to JSON.
         let json = serde_json::to_string_pretty(&export).unwrap();
         assert!(json.contains("jaccard"));
+    }
+
+    // -----------------------------------------------------------------------
+    // common_prefix_bytes tests (0–4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn common_prefix_bytes_returns_0_for_first_byte_diff() {
+        // 0xA3... vs 0xB3... → differ in byte 0.
+        assert_eq!(common_prefix_bytes(0xA300_0000, 0xB300_0000), 0);
+    }
+
+    #[test]
+    fn common_prefix_bytes_returns_1_for_second_byte_diff() {
+        // Same first byte, different second byte.
+        assert_eq!(common_prefix_bytes(0xA3B2_0000, 0xA3C2_0000), 1);
+    }
+
+    #[test]
+    fn common_prefix_bytes_returns_2_for_third_byte_diff() {
+        // Same first two bytes, different third byte.
+        assert_eq!(common_prefix_bytes(0xA3B2_C100, 0xA3B2_C200), 2);
+    }
+
+    #[test]
+    fn common_prefix_bytes_returns_3_for_fourth_byte_diff() {
+        // Same first three bytes, different last byte.
+        assert_eq!(common_prefix_bytes(0xA3B2_C101, 0xA3B2_C102), 3);
+    }
+
+    #[test]
+    fn common_prefix_bytes_returns_4_for_identical() {
+        assert_eq!(common_prefix_bytes(0xA3B2_C1D4, 0xA3B2_C1D4), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // infer_wheel_positions tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn infer_wheel_positions_consecutive_trailing_bytes() {
+        let ids = [0xA3B2C100, 0xA3B2C101, 0xA3B2C102, 0xA3B2C103];
+        let result = infer_wheel_positions(&ids).unwrap();
+        assert_eq!(result[&0xA3B2C100], WheelPosition::FL);
+        assert_eq!(result[&0xA3B2C101], WheelPosition::FR);
+        assert_eq!(result[&0xA3B2C102], WheelPosition::RL);
+        assert_eq!(result[&0xA3B2C103], WheelPosition::RR);
+    }
+
+    #[test]
+    fn infer_wheel_positions_shuffled_order() {
+        // IDs in non-sorted order; trailing bytes 0x05..0x08 are consecutive.
+        let ids = [0xA3B2C107, 0xA3B2C105, 0xA3B2C108, 0xA3B2C106];
+        let result = infer_wheel_positions(&ids).unwrap();
+        assert_eq!(result[&0xA3B2C105], WheelPosition::FL);
+        assert_eq!(result[&0xA3B2C106], WheelPosition::FR);
+        assert_eq!(result[&0xA3B2C107], WheelPosition::RL);
+        assert_eq!(result[&0xA3B2C108], WheelPosition::RR);
+    }
+
+    #[test]
+    fn infer_wheel_positions_non_consecutive_returns_none() {
+        let ids = [0xA3B2C100, 0xA3B2C102, 0xA3B2C104, 0xA3B2C106];
+        assert!(infer_wheel_positions(&ids).is_none());
+    }
+
+    #[test]
+    fn infer_wheel_positions_wrong_group_size_returns_none() {
+        let ids = [0xA3B2C100, 0xA3B2C101, 0xA3B2C102];
+        assert!(infer_wheel_positions(&ids).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // candidate_wheel_mates tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn candidate_wheel_mates_filters_by_prefix() {
+        let target = VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 298,
+            fixed_sensor_id: Some(0xA3B2C100),
+        };
+        let mate = VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 298,
+            fixed_sensor_id: Some(0xA3B2C201),
+        };
+        let stranger = VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 298,
+            fixed_sensor_id: Some(0xFF00_0000),
+        };
+        let all = vec![
+            VehicleMeta { vehicle_id: target.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
+            VehicleMeta { vehicle_id: mate.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C201) },
+            VehicleMeta { vehicle_id: stranger.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xFF00_0000) },
+        ];
+        let result = candidate_wheel_mates(&target, &all);
+        assert!(result.contains(&mate.vehicle_id));
+        assert!(!result.contains(&stranger.vehicle_id));
+        assert!(!result.contains(&target.vehicle_id));
+    }
+
+    #[test]
+    fn candidate_wheel_mates_skips_rolling_id() {
+        let target = VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 208,
+            fixed_sensor_id: None,
+        };
+        let all = vec![
+            VehicleMeta { vehicle_id: Uuid::new_v4(), rtl433_id: 208, fixed_sensor_id: None },
+        ];
+        let result = candidate_wheel_mates(&target, &all);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn candidate_wheel_mates_different_protocol_not_matched() {
+        let target = VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 298,
+            fixed_sensor_id: Some(0xA3B2C100),
+        };
+        let other = VehicleMeta {
+            vehicle_id: Uuid::new_v4(),
+            rtl433_id: 140,
+            fixed_sensor_id: Some(0xA3B2C200),
+        };
+        let all = vec![
+            VehicleMeta { vehicle_id: target.vehicle_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
+            VehicleMeta { vehicle_id: other.vehicle_id, rtl433_id: 140, fixed_sensor_id: Some(0xA3B2C200) },
+        ];
+        let result = candidate_wheel_mates(&target, &all);
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefix-seeded grouping tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prefix_seeded_grouping_groups_same_prefix_sensors() {
+        // 4 fixed-ID sensors sharing a 3-byte prefix should be pre-grouped
+        // even with an empty co-occurrence matrix (zero Jaccard windows).
+        let m = CoOccurrenceMatrix::new();
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let v3 = Uuid::new_v4();
+        let v4 = Uuid::new_v4();
+        let outsider = Uuid::new_v4();
+
+        let ids = vec![v1, v2, v3, v4, outsider];
+        let meta = vec![
+            VehicleMeta { vehicle_id: v1, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
+            VehicleMeta { vehicle_id: v2, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C101) },
+            VehicleMeta { vehicle_id: v3, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C102) },
+            VehicleMeta { vehicle_id: v4, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C103) },
+            VehicleMeta { vehicle_id: outsider, rtl433_id: 298, fixed_sensor_id: Some(0xFF000001) },
+        ];
+        let groups = group_vehicles_into_cars_with_meta(&m, &ids, &meta);
+
+        let car = groups.iter().find(|g| g.contains(v1)).unwrap();
+        assert!(car.contains(v2));
+        assert!(car.contains(v3));
+        assert!(car.contains(v4));
+        assert_eq!(car.wheel_count(), 4);
+        assert!(!car.contains(outsider));
+    }
+
+    #[test]
+    fn prefix_seeded_grouping_candidate_reduction() {
+        // Fixture: 25 fixed-ID sensors of the same protocol.
+        // 4 share a prefix → candidates for one target should be ≤ 3 (not 24).
+        let target_id = Uuid::new_v4();
+        let mut meta: Vec<VehicleMeta> = vec![
+            VehicleMeta { vehicle_id: target_id, rtl433_id: 298, fixed_sensor_id: Some(0xA3B2C100) },
+        ];
+        // 3 peers with the same prefix.
+        for i in 1..=3u32 {
+            meta.push(VehicleMeta {
+                vehicle_id: Uuid::new_v4(),
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xA3B2C100 + i),
+            });
+        }
+        // 21 other sensors with different prefixes.
+        for i in 0..21u32 {
+            meta.push(VehicleMeta {
+                vehicle_id: Uuid::new_v4(),
+                rtl433_id: 298,
+                fixed_sensor_id: Some(0xDD000000 + i * 0x0100_0000),
+            });
+        }
+        let target = &meta[0];
+        let mates = candidate_wheel_mates(target, &meta);
+        // Should find exactly 3 candidates (the peers), not all 24.
+        assert_eq!(mates.len(), 3);
+        // That is a reduction of at least 80% from the 24 non-target vehicles.
+        assert!(mates.len() as f32 / 24.0 <= 0.2);
+    }
+
+    #[test]
+    fn wheel_position_round_trip() {
+        for pos in &[WheelPosition::FL, WheelPosition::FR, WheelPosition::RL, WheelPosition::RR] {
+            let s = pos.as_str();
+            let parsed = WheelPosition::from_str(s).unwrap();
+            assert_eq!(*pos, parsed);
+        }
     }
 }

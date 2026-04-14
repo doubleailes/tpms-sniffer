@@ -182,6 +182,19 @@ impl Database {
             "#,
         )?;
 
+        // Migration: add wheel_position column for prefix-byte wheel inference.
+        let has_wheel_position: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='wheel_position'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_wheel_position == 0 {
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN wheel_position TEXT",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -194,8 +207,8 @@ impl Database {
             r#"
             INSERT INTO vehicles
                 (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig,
-                 tx_interval_median_ms, tx_interval_samples, car_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 tx_interval_median_ms, tx_interval_samples, car_id, wheel_position)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
@@ -204,7 +217,8 @@ impl Database {
                 protocol       = CASE WHEN vehicles.rtl433_id = 0 THEN excluded.protocol   ELSE vehicles.protocol   END,
                 tx_interval_median_ms = excluded.tx_interval_median_ms,
                 tx_interval_samples   = excluded.tx_interval_samples,
-                car_id                = COALESCE(excluded.car_id, vehicles.car_id)
+                car_id                = COALESCE(excluded.car_id, vehicles.car_id),
+                wheel_position        = COALESCE(excluded.wheel_position, vehicles.wheel_position)
             "#,
             params![
                 v.vehicle_id.to_string(),
@@ -219,6 +233,7 @@ impl Database {
                 v.tx_interval_median_ms.map(|ms| ms as i64),
                 v.tx_intervals_ms.len() as i64,
                 v.car_id.map(|id| id.to_string()),
+                v.wheel_position.map(|wp| wp.as_str().to_string()),
             ],
         )?;
         Ok(())
@@ -264,7 +279,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
-                    tx_interval_median_ms, tx_interval_samples, car_id
+                    tx_interval_median_ms, tx_interval_samples, car_id, wheel_position
              FROM vehicles WHERE sensor_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![sensor_id as i64])?;
@@ -280,7 +295,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
-                    tx_interval_median_ms, tx_interval_samples, car_id
+                    tx_interval_median_ms, tx_interval_samples, car_id, wheel_position
              FROM vehicles ORDER BY last_seen DESC",
         )?;
         let vehicles = stmt
@@ -697,7 +712,7 @@ impl Database {
 
         // Get vehicles belonging to this car.
         let mut stmt = self.conn.prepare(
-            "SELECT vehicle_id, protocol, make_model, pressure_sig \
+            "SELECT vehicle_id, protocol, make_model, pressure_sig, wheel_position \
              FROM vehicles WHERE car_id = ?1",
         )?;
         let vehicles: Vec<VehicleSummary> = stmt
@@ -706,6 +721,7 @@ impl Database {
                 let protocol: String = row.get(1)?;
                 let make_model: Option<String> = row.get(2)?;
                 let pressure_sig_s: String = row.get(3)?;
+                let wheel_position: Option<String> = row.get(4)?;
                 let sig: [f32; 4] =
                     serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
                 let avg = sig.iter().filter(|&&p| p > 0.0).sum::<f32>()
@@ -715,6 +731,7 @@ impl Database {
                     protocol,
                     make_model,
                     avg_pressure_kpa: avg,
+                    wheel_position,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -773,6 +790,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let tx_interval_median: Option<i64> = row.get(9)?;
     let _tx_interval_samples: i64 = row.get(10)?;
     let car_id_s: Option<String> = row.get(11)?;
+    let wheel_position_s: Option<String> = row.get(12)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -798,6 +816,8 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         tx_interval_median_ms: tx_interval_median.map(|ms| ms as u32),
         car_id: car_id_uuid,
         receiver_sightings: HashMap::new(),
+        wheel_position: wheel_position_s
+            .and_then(|s| crate::jaccard::WheelPosition::from_str(&s)),
     })
 }
 
@@ -857,6 +877,7 @@ mod tests {
             tx_interval_median_ms: None,
             car_id: Some(car_id),
             receiver_sightings: HashMap::new(),
+            wheel_position: None,
         };
         db.upsert_vehicle(&vehicle).unwrap();
 
@@ -911,6 +932,7 @@ mod tests {
             tx_interval_median_ms: None,
             car_id: Some(car_id),
             receiver_sightings: HashMap::new(),
+            wheel_position: None,
         };
         db.upsert_vehicle(&vehicle).unwrap();
 
