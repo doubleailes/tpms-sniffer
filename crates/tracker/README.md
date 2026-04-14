@@ -56,3 +56,65 @@ The sniffer side sets `pressure_kpa_reliable = false` on those frames (see
 `AVE_MIN_RELIABLE_KPA` in `crates/sniffer/src/decoder.rs`). The tracker then
 skips pressure-fingerprint updates for them so the half-range value does not
 drift the vehicle's signature and does not spawn a duplicate UUID.
+
+## TX-interval fingerprint
+
+Rolling-ID sensors (AVE-TPMS, post-2018 EezTire, etc.) rotate their `sensor_id`
+per packet, making the ID useless as a stable identifier.  However, the
+transmission interval — the median time between consecutive packets from the
+same sensor — is determined by the sensor's firmware and crystal oscillator.
+It is stable across ID rotations, across sessions, and across power cycles.
+
+The tracker accumulates inter-packet (or inter-burst) intervals in a ring
+buffer on each `VehicleTrack` and computes a running median.  When both the
+candidate vehicle and the incoming sighting carry enough interval data, the
+interval is used as a secondary matching signal alongside the pressure
+fingerprint.  This prevents false merges between sensors at the same pressure
+but different TX rates.
+
+The implementation lives in `src/lib.rs` (data types, constants, `compute_median`)
+and `src/resolver.rs` (accumulation logic, matching guards).
+
+### Tuning constants
+
+All constants are defined in `src/lib.rs` and require calibration against real
+capture data before the feature is considered stable.
+
+| Constant | Value | Rationale |
+|---|---:|---|
+| `TX_INTERVAL_WINDOW` | 8 | Ring buffer depth — last 8 intervals (9 consecutive packets). Enough for a stable median without significant memory cost per vehicle. |
+| `TX_INTERVAL_MIN_SAMPLES` | 3 | Minimum intervals before the median is used in matching. Below this threshold the interval check is skipped and pressure match alone is sufficient. Avoids false rejections during track establishment. |
+| `TX_INTERVAL_MAX_MS` | 120 000 (2 min) | Gap threshold above which an interval is not recorded. Gaps longer than 2 minutes are likely caused by the sensor going out of range or the SDR restarting, not by normal TX cadence. |
+| `TX_INTERVAL_TOLERANCE_MS` | 8 000 (±8 s) | Match tolerance for comparing two interval medians (or the observed gap vs. a median). Deliberately wide for the initial implementation: sensor crystals drift with temperature, and the tracker's interval measurement includes jitter from SDR sample timing. Tighten after collecting calibration data from known single-vehicle sessions. |
+
+### Database schema
+
+Two columns are added to the `vehicles` table via an automatic migration:
+
+```sql
+ALTER TABLE vehicles ADD COLUMN tx_interval_median_ms INTEGER;
+ALTER TABLE vehicles ADD COLUMN tx_interval_samples    INTEGER NOT NULL DEFAULT 0;
+```
+
+`tx_interval_median_ms` is `NULL` until at least `TX_INTERVAL_MIN_SAMPLES`
+intervals have been collected.  `tx_interval_samples` reflects the current
+ring-buffer depth (0–8).
+
+### Matching behaviour
+
+- **Fingerprint path** (EezTire, sentinel-rejected IDs): the interval check
+  compares the vehicle's stored median against the sighting's
+  `tx_interval_hint_ms` (gap since the last packet of the same protocol).
+  If both sides have data and the intervals differ by more than the tolerance,
+  the candidate is rejected even if pressure matches.
+
+- **Burst path** (AVE-TPMS rolling-ID): the interval check compares the
+  vehicle's stored median against the actual gap between the new burst and
+  the vehicle's `last_seen`.  Same tolerance applies.
+
+- **Fixed-ID path**: the interval is accumulated for fingerprint enrichment
+  but is not used for matching (the fixed sensor ID is already a stable key).
+
+In all cases, the interval check is **skipped** when either side has fewer than
+`TX_INTERVAL_MIN_SAMPLES` — pressure match alone is sufficient during track
+establishment.

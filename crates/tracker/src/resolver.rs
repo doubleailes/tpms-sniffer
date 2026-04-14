@@ -2,10 +2,14 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::{Sighting, TpmsPacket, VehicleTrack, make_model_hint};
+use crate::{
+    Sighting, TpmsPacket, VehicleTrack, compute_median, make_model_hint, TX_INTERVAL_MAX_MS,
+    TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW,
+};
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
 /// For these we cluster packets into time-window bursts and fingerprint by
@@ -112,6 +116,9 @@ pub struct Resolver {
     vehicles: HashMap<Uuid, VehicleTrack>,
     /// Accumulator for an in-progress rolling-ID burst.
     pending_burst: Option<BurstAccumulator>,
+    /// Tracks the timestamp of the last packet seen per `rtl433_id`, used to
+    /// compute `tx_interval_hint_ms` on incoming sightings.
+    last_seen_by_protocol: HashMap<u16, DateTime<Utc>>,
     db: Database,
 }
 
@@ -122,6 +129,7 @@ impl Resolver {
             fixed_map: HashMap::new(),
             vehicles: HashMap::new(),
             pending_burst: None,
+            last_seen_by_protocol: HashMap::new(),
             db,
         };
         r.load_from_db()?;
@@ -153,6 +161,14 @@ impl Resolver {
         // Discard temperature sentinel values (≥ 200 °C means "not available").
         let temp_c = packet.temp_c.filter(|&t| t < 200.0);
 
+        // Compute tx_interval_hint from the last packet of the same protocol.
+        let hint = self
+            .last_seen_by_protocol
+            .get(&packet.rtl433_id)
+            .map(|&prev| (ts - prev).num_milliseconds() as u32)
+            .filter(|&ms| ms < TX_INTERVAL_MAX_MS);
+        self.last_seen_by_protocol.insert(packet.rtl433_id, ts);
+
         let sighting = Sighting {
             ts,
             protocol: packet.protocol.clone(),
@@ -163,6 +179,7 @@ impl Resolver {
             alarm: packet.alarm.unwrap_or(false),
             battery_ok: packet.battery_ok.unwrap_or(true),
             pressure_reliable: packet.pressure_kpa_reliable,
+            tx_interval_hint_ms: hint,
         };
 
         if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
@@ -239,6 +256,8 @@ impl Resolver {
                         pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                         make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
                         battery_ok: sighting.battery_ok,
+                        tx_intervals_ms: VecDeque::new(),
+                        tx_interval_median_ms: None,
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -257,6 +276,8 @@ impl Resolver {
                     pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                     make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
                     battery_ok: sighting.battery_ok,
+                    tx_intervals_ms: VecDeque::new(),
+                    tx_interval_median_ms: None,
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -275,6 +296,8 @@ impl Resolver {
                 pressure_signature: [sighting.pressure_kpa, 0.0, 0.0, 0.0],
                 make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
                 battery_ok: sighting.battery_ok,
+                tx_intervals_ms: VecDeque::new(),
+                tx_interval_median_ms: None,
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
@@ -283,6 +306,15 @@ impl Resolver {
 
         // Update in-memory state.
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+        // Accumulate inter-packet interval before updating last_seen.
+        let interval_ms = (sighting.ts - vehicle.last_seen).num_milliseconds() as u32;
+        if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+            vehicle.tx_intervals_ms.push_back(interval_ms);
+            if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                vehicle.tx_intervals_ms.pop_front();
+            }
+            vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
+        }
         vehicle.last_seen = sighting.ts;
         vehicle.sighting_count += 1;
         vehicle.battery_ok = sighting.battery_ok;
@@ -314,6 +346,7 @@ impl Resolver {
         let pressure = sighting.pressure_kpa;
         let protocol = sighting.protocol.clone();
         let rtl433_id = sighting.rtl433_id;
+        let hint = sighting.tx_interval_hint_ms;
 
         // Find an active vehicle of the same protocol whose pressure
         // signature is within tolerance.  Use `rtl433_id` (not the display
@@ -321,12 +354,32 @@ impl Resolver {
         // including sentinel-rejected fixed-ID packets that fall through to
         // this path.  Copy the Uuid so we drop the shared borrow before
         // taking a mutable one below.
+        //
+        // The interval check is applied only when both the candidate vehicle
+        // and the sighting carry enough samples.  When either side lacks data,
+        // pressure match alone is sufficient.
         let matched_vid: Option<Uuid> = self
             .vehicles
             .values()
             .filter(|v| v.rtl433_id == rtl433_id && v.fixed_sensor_id.is_none())
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
-            .find(|v| (v.pressure_signature[0] - pressure).abs() <= PRESSURE_MATCH_TOLERANCE_KPA)
+            .find(|v| {
+                let pressure_ok =
+                    (v.pressure_signature[0] - pressure).abs() <= PRESSURE_MATCH_TOLERANCE_KPA;
+                if !pressure_ok {
+                    return false;
+                }
+                // Interval guard: reject if both sides have data and intervals differ.
+                if let (Some(v_interval), Some(s_interval)) =
+                    (v.tx_interval_median_ms, hint)
+                {
+                    let delta = (v_interval as i64 - s_interval as i64).unsigned_abs() as u32;
+                    if delta > TX_INTERVAL_TOLERANCE_MS {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|v| v.vehicle_id);
 
         let vehicle_id = if let Some(vid) = matched_vid {
@@ -344,6 +397,8 @@ impl Resolver {
                 pressure_signature: [pressure, 0.0, 0.0, 0.0],
                 make_model_hint: make_model_hint(rtl433_id).map(str::to_owned),
                 battery_ok: sighting.battery_ok,
+                tx_intervals_ms: VecDeque::new(),
+                tx_interval_median_ms: None,
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -351,6 +406,15 @@ impl Resolver {
 
         // Update in-memory state.
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+        // Accumulate inter-packet interval before updating last_seen.
+        let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
+        if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+            vehicle.tx_intervals_ms.push_back(interval_ms);
+            if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                vehicle.tx_intervals_ms.pop_front();
+            }
+            vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
+        }
         vehicle.last_seen = now;
         vehicle.sighting_count += 1;
         vehicle.battery_ok = sighting.battery_ok;
@@ -438,12 +502,36 @@ impl Resolver {
         // enough and that was seen recently enough to still be active.  We copy
         // the Uuid (it's Copy) so we drop the shared borrow before taking the
         // mutable one below.
+        //
+        // When a candidate vehicle has an established interval median, also
+        // check that the gap since the vehicle's last sighting is compatible
+        // with its typical TX interval.  This prevents merging two sensors at
+        // the same pressure when they transmit at different rates.
         let matched_vid: Option<Uuid> = self
             .vehicles
             .values()
             .filter(|v| v.fixed_sensor_id.is_none() && v.rtl433_id == burst.rtl433_id)
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
-            .find(|v| l1_per_wheel(&v.pressure_signature, &sig) < PRESSURE_MATCH_TOLERANCE_KPA)
+            .find(|v| {
+                let pressure_ok =
+                    l1_per_wheel(&v.pressure_signature, &sig) < PRESSURE_MATCH_TOLERANCE_KPA;
+                if !pressure_ok {
+                    return false;
+                }
+                // Interval guard: if the vehicle has an established median,
+                // verify the gap since its last sighting is compatible.
+                if let Some(v_median) = v.tx_interval_median_ms {
+                    let gap_ms = now.signed_duration_since(v.last_seen).num_milliseconds();
+                    if gap_ms > 0 && (gap_ms as u32) < TX_INTERVAL_MAX_MS {
+                        let delta =
+                            (v_median as i64 - gap_ms).unsigned_abs() as u32;
+                        if delta > TX_INTERVAL_TOLERANCE_MS {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
             .map(|v| v.vehicle_id);
 
         let vehicle_id = if let Some(vid) = matched_vid {
@@ -462,6 +550,8 @@ impl Resolver {
                 pressure_signature: sig,
                 make_model_hint: make_model_hint(burst.rtl433_id).map(str::to_owned),
                 battery_ok: true,
+                tx_intervals_ms: VecDeque::new(),
+                tx_interval_median_ms: None,
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -469,6 +559,15 @@ impl Resolver {
 
         // Update in-memory state.
         let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
+        // Accumulate inter-burst interval before updating last_seen.
+        let interval_ms = (now - vehicle.last_seen).num_milliseconds() as u32;
+        if interval_ms > 0 && interval_ms < TX_INTERVAL_MAX_MS {
+            vehicle.tx_intervals_ms.push_back(interval_ms);
+            if vehicle.tx_intervals_ms.len() > TX_INTERVAL_WINDOW {
+                vehicle.tx_intervals_ms.pop_front();
+            }
+            vehicle.tx_interval_median_ms = compute_median(&vehicle.tx_intervals_ms);
+        }
         vehicle.last_seen = now;
         vehicle.sighting_count += 1;
         for (i, &p) in burst.pressures.iter().enumerate().take(4) {
@@ -1459,6 +1558,8 @@ mod tests {
                 pressure_signature: [0.0; 4],
                 make_model_hint: None,
                 battery_ok,
+                tx_intervals_ms: VecDeque::new(),
+                tx_interval_median_ms: None,
             }
         };
 
@@ -1491,6 +1592,204 @@ mod tests {
         assert_eq!(
             effective_expiry(&make_track(0, false)),
             Duration::seconds(600)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TX-interval fingerprint tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_median_basic() {
+        use crate::compute_median;
+
+        let mut buf = VecDeque::new();
+        // Not enough samples → None.
+        buf.push_back(1000);
+        buf.push_back(2000);
+        assert_eq!(compute_median(&buf), None);
+
+        // 3 samples → median is the middle value.
+        buf.push_back(3000);
+        assert_eq!(compute_median(&buf), Some(2000));
+
+        // 4 samples → average of the two middle values.
+        buf.push_back(4000);
+        assert_eq!(compute_median(&buf), Some(2500));
+
+        // 5 samples (odd).
+        buf.push_back(5000);
+        assert_eq!(compute_median(&buf), Some(3000));
+    }
+
+    #[test]
+    fn tx_interval_accumulated_on_fingerprint_path() {
+        // Feed EezTire (fingerprint path) packets at 30 s intervals and
+        // verify the vehicle accumulates intervals and computes a median.
+        let mut resolver = in_memory_resolver();
+
+        let timestamps = [
+            "2025-06-01 12:00:00.000",
+            "2025-06-01 12:00:30.000",
+            "2025-06-01 12:01:00.000",
+            "2025-06-01 12:01:30.000",
+            "2025-06-01 12:02:00.000",
+        ];
+
+        for ts in &timestamps {
+            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+
+        let v = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .expect("EezTire vehicle must exist");
+
+        // 5 packets → 4 intervals of 30_000 ms each.
+        assert_eq!(v.tx_intervals_ms.len(), 4);
+        assert_eq!(v.tx_interval_median_ms, Some(30_000));
+    }
+
+    #[test]
+    fn two_ave_same_pressure_different_intervals_separate() {
+        // Two simulated AVE-TPMS vehicles at identical pressure (382.5 kPa)
+        // but different TX intervals (45 s vs 71 s) must resolve to separate
+        // vehicle UUIDs after enough bursts to establish interval medians.
+        //
+        // Process bursts in chronological order, interleaving the two vehicles.
+        let mut resolver = in_memory_resolver();
+
+        // Chronological sequence of bursts (each burst = 2 packets 100 ms apart):
+        // A@0s, B@5s, A@45s, B@76s, A@90s, B@147s, A@135s, B@218s
+        let bursts: &[(&str, &str, &str)] = &[
+            // (ts1, ts2, vehicle_label)
+            ("2025-06-01 10:00:00.000", "2025-06-01 10:00:00.100", "A"),
+            ("2025-06-01 10:00:05.000", "2025-06-01 10:00:05.100", "B"),
+            ("2025-06-01 10:00:45.000", "2025-06-01 10:00:45.100", "A"),
+            ("2025-06-01 10:01:16.000", "2025-06-01 10:01:16.100", "B"),
+            ("2025-06-01 10:01:30.000", "2025-06-01 10:01:30.100", "A"),
+            ("2025-06-01 10:02:27.000", "2025-06-01 10:02:27.100", "B"),
+            ("2025-06-01 10:02:15.000", "2025-06-01 10:02:15.100", "A"),
+            ("2025-06-01 10:03:38.000", "2025-06-01 10:03:38.100", "B"),
+        ];
+
+        // Sort by first timestamp to ensure chronological processing.
+        let mut sorted: Vec<_> = bursts.to_vec();
+        sorted.sort_by_key(|(ts1, _, _)| ts1.to_string());
+
+        for (ts1, ts2, _label) in &sorted {
+            let p1 = make_packet_at(ts1, "0xA1000001", "AVE-TPMS", 208, 382.5);
+            let p2 = make_packet_at(ts2, "0xA1000002", "AVE-TPMS", 208, 382.5);
+            resolver.process(&p1).unwrap();
+            resolver.process(&p2).unwrap();
+            resolver.flush().unwrap();
+        }
+
+        let ave_vehicles: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "AVE-TPMS")
+            .collect();
+        assert!(
+            ave_vehicles.len() >= 2,
+            "two AVE-TPMS sensors at identical pressure but different TX intervals \
+             must resolve to separate vehicle UUIDs (got {} vehicles)",
+            ave_vehicles.len()
+        );
+    }
+
+    #[test]
+    fn single_vehicle_noisy_interval_does_not_split() {
+        // A single EezTire vehicle with jittery interval (30 s ± 5 s) must
+        // remain a single vehicle UUID.
+        let mut resolver = in_memory_resolver();
+
+        let timestamps = [
+            "2025-06-01 12:00:00.000",
+            "2025-06-01 12:00:25.000", // 25 s
+            "2025-06-01 12:00:55.000", // 30 s
+            "2025-06-01 12:01:30.000", // 35 s
+            "2025-06-01 12:01:58.000", // 28 s
+            "2025-06-01 12:02:31.000", // 33 s
+            "2025-06-01 12:02:56.000", // 25 s
+            "2025-06-01 12:03:26.000", // 30 s
+        ];
+
+        for ts in &timestamps {
+            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+
+        let eez_count = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .count();
+        assert_eq!(
+            eez_count, 1,
+            "a single vehicle with ±5 s jitter must not be split into multiple UUIDs"
+        );
+    }
+
+    #[test]
+    fn interval_check_skipped_when_insufficient_samples() {
+        // When a vehicle has fewer than TX_INTERVAL_MIN_SAMPLES intervals, the
+        // interval check must be skipped and only pressure matching is used.
+        // Two packets 1 s apart at the same pressure must merge even though
+        // the vehicle has only 1 interval sample (below MIN_SAMPLES).
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let p2 = make_packet_at(
+            "2025-06-01 12:00:01.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let vid1 = resolver.process(&p1).unwrap().unwrap();
+        let vid2 = resolver.process(&p2).unwrap().unwrap();
+        assert_eq!(
+            vid1, vid2,
+            "with < MIN_SAMPLES intervals, pressure match alone must be sufficient"
+        );
+
+        // Vehicle should have 1 interval sample and no usable median yet.
+        let v = &resolver.vehicles[&vid1];
+        assert_eq!(v.tx_intervals_ms.len(), 1);
+        assert_eq!(v.tx_interval_median_ms, None);
+    }
+
+    #[test]
+    fn tx_interval_ring_buffer_capped() {
+        // Verify the ring buffer never exceeds TX_INTERVAL_WINDOW.
+        let mut resolver = in_memory_resolver();
+
+        // Send 12 EezTire packets 30 s apart → 11 intervals.
+        for i in 0..12 {
+            let ts = format!("2025-06-01 12:{:02}:{:02}.000", i / 2, (i % 2) * 30);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+
+        let v = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .unwrap();
+        assert!(
+            v.tx_intervals_ms.len() <= crate::TX_INTERVAL_WINDOW,
+            "ring buffer must not exceed TX_INTERVAL_WINDOW ({}), got {}",
+            crate::TX_INTERVAL_WINDOW,
+            v.tx_intervals_ms.len()
         );
     }
 }

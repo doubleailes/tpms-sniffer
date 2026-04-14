@@ -1,9 +1,29 @@
 pub mod db;
 pub mod resolver;
 
+use std::collections::VecDeque;
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// TX-interval tuning constants
+// ---------------------------------------------------------------------------
+
+/// Ring buffer depth for inter-packet intervals.
+pub const TX_INTERVAL_WINDOW: usize = 8;
+
+/// Minimum number of recorded intervals before the median is used in matching.
+pub const TX_INTERVAL_MIN_SAMPLES: usize = 3;
+
+/// Intervals longer than this (ms) are discarded (e.g. expiry gaps, silence).
+pub const TX_INTERVAL_MAX_MS: u32 = 120_000;
+
+/// Match tolerance (ms) for comparing two interval medians.  ±8 s is
+/// deliberately wide for the initial implementation — sensor crystals drift
+/// with temperature and the tracker's interval measurement includes SDR jitter.
+pub const TX_INTERVAL_TOLERANCE_MS: u32 = 8_000;
 
 /// Raw packet emitted by `tpms-sniffer` on stdout (one JSON object per line).
 /// Only the fields the tracker needs are declared; unknown fields are ignored.
@@ -62,6 +82,10 @@ pub struct Sighting {
     /// tracker skips pressure-fingerprint updates for unreliable readings so
     /// they do not drift the vehicle's stored average.
     pub pressure_reliable: bool,
+    /// Interval hint (ms) computed from the gap since the last packet of the
+    /// same protocol in the input stream.  `None` for the very first packet of
+    /// a protocol or when the gap exceeds `TX_INTERVAL_MAX_MS`.
+    pub tx_interval_hint_ms: Option<u32>,
 }
 
 /// Long-lived record for a vehicle inferred from repeated sightings.
@@ -87,6 +111,12 @@ pub struct VehicleTrack {
     /// battery is OK; `false` means the sensor has flagged low battery.
     /// Defaults to `true` when no battery field is present in the packet.
     pub battery_ok: bool,
+    /// Ring buffer of recent inter-packet intervals (ms), capped at
+    /// `TX_INTERVAL_WINDOW`.
+    pub tx_intervals_ms: VecDeque<u32>,
+    /// Median of `tx_intervals_ms`; `None` until at least
+    /// `TX_INTERVAL_MIN_SAMPLES` intervals have been collected.
+    pub tx_interval_median_ms: Option<u32>,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.
@@ -115,5 +145,21 @@ pub fn parse_sensor_id(s: &str) -> Option<u32> {
         u32::from_str_radix(hex, 16).ok()
     } else {
         t.parse().ok()
+    }
+}
+
+/// Compute the median of a `VecDeque<u32>`.  Returns `None` when the deque has
+/// fewer than `TX_INTERVAL_MIN_SAMPLES` elements.
+pub fn compute_median(buf: &VecDeque<u32>) -> Option<u32> {
+    if buf.len() < TX_INTERVAL_MIN_SAMPLES {
+        return None;
+    }
+    let mut sorted: Vec<u32> = buf.iter().copied().collect();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Some((sorted[mid - 1] + sorted[mid]) / 2)
+    } else {
+        Some(sorted[mid])
     }
 }
