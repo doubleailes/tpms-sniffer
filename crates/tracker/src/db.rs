@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use uuid::Uuid;
 
-use crate::analytics::{self, CarReport, GeoSighting, PressureEvent, PressureReading, PresenceSlot, VehicleSummary};
+use crate::analytics::{
+    self, CarReport, GeoSighting, PresenceSlot, PressureEvent, PressureReading, VehicleSummary,
+};
 use crate::{Sighting, VehicleTrack};
 
 pub struct Database {
@@ -189,10 +191,8 @@ impl Database {
             |row| row.get(0),
         )?;
         if has_wheel_position == 0 {
-            self.conn.execute(
-                "ALTER TABLE vehicles ADD COLUMN wheel_position TEXT",
-                [],
-            )?;
+            self.conn
+                .execute("ALTER TABLE vehicles ADD COLUMN wheel_position TEXT", [])?;
         }
 
         Ok(())
@@ -354,9 +354,7 @@ impl Database {
         ts: &DateTime<Utc>,
         receiver_id: &str,
     ) -> Result<()> {
-        let slot_start = ts
-            .format("%Y-%m-%dT%H:00:00+00:00")
-            .to_string();
+        let slot_start = ts.format("%Y-%m-%dT%H:00:00+00:00").to_string();
         let slot_end = (*ts + chrono::Duration::hours(1))
             .format("%Y-%m-%dT%H:00:00+00:00")
             .to_string();
@@ -422,9 +420,7 @@ impl Database {
                 let utc = dt.with_timezone(&Utc);
                 // Drop the borrow on `rows` by using direct SQL here to avoid
                 // borrow issues with self.
-                let slot_start = utc
-                    .format("%Y-%m-%dT%H:00:00+00:00")
-                    .to_string();
+                let slot_start = utc.format("%Y-%m-%dT%H:00:00+00:00").to_string();
                 let slot_end = (utc + chrono::Duration::hours(1))
                     .format("%Y-%m-%dT%H:00:00+00:00")
                     .to_string();
@@ -647,10 +643,7 @@ impl Database {
     // -----------------------------------------------------------------------
 
     /// Get all sightings with GPS coordinates for GeoJSON export.
-    pub fn get_geo_sightings(
-        &self,
-        car_id: Option<&str>,
-    ) -> Result<Vec<GeoSighting>> {
+    pub fn get_geo_sightings(&self, car_id: Option<&str>) -> Result<Vec<GeoSighting>> {
         let map_row = |row: &rusqlite::Row<'_>| {
             let car_id: String = row.get(0)?;
             let ts_s: String = row.get(1)?;
@@ -722,8 +715,7 @@ impl Database {
                 let make_model: Option<String> = row.get(2)?;
                 let pressure_sig_s: String = row.get(3)?;
                 let wheel_position: Option<String> = row.get(4)?;
-                let sig: [f32; 4] =
-                    serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
+                let sig: [f32; 4] = serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
                 let avg = sig.iter().filter(|&&p| p > 0.0).sum::<f32>()
                     / sig.iter().filter(|&&p| p > 0.0).count().max(1) as f32;
                 Ok(VehicleSummary {
@@ -769,7 +761,9 @@ impl Database {
 
     /// List all car IDs in the database.
     pub fn all_car_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT car_id FROM cars ORDER BY last_seen DESC")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT car_id FROM cars ORDER BY last_seen DESC")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -816,16 +810,15 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         tx_interval_median_ms: tx_interval_median.map(|ms| ms as u32),
         car_id: car_id_uuid,
         receiver_sightings: HashMap::new(),
-        wheel_position: wheel_position_s
-            .and_then(|s| crate::jaccard::WheelPosition::from_str(&s)),
+        wheel_position: wheel_position_s.and_then(|s| crate::jaccard::WheelPosition::from_str(&s)),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use crate::Sighting;
+    use chrono::TimeZone;
 
     fn test_db() -> Database {
         Database::open(":memory:").expect("in-memory DB should open")
@@ -835,8 +828,14 @@ mod tests {
     fn presence_slot_upsert_and_query() {
         let db = test_db();
         let car_id = Uuid::new_v4();
-        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 4, None)
-            .unwrap();
+        db.upsert_car(
+            car_id,
+            "2026-04-13T08:00:00+00:00",
+            "2026-04-13T10:00:00+00:00",
+            4,
+            None,
+        )
+        .unwrap();
 
         let ts1 = Utc.with_ymd_and_hms(2026, 4, 13, 8, 15, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 4, 13, 8, 45, 0).unwrap();
@@ -858,8 +857,14 @@ mod tests {
         let car_id = Uuid::new_v4();
 
         // Create car first (FK constraint).
-        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 1, None)
-            .unwrap();
+        db.upsert_car(
+            car_id,
+            "2026-04-13T08:00:00+00:00",
+            "2026-04-13T10:00:00+00:00",
+            1,
+            None,
+        )
+        .unwrap();
 
         // Create vehicle and car.
         let vehicle = VehicleTrack {
@@ -905,8 +910,14 @@ mod tests {
         let count = db.backfill_presence_slots().unwrap();
         assert_eq!(count, 2);
 
-        let slots = db.get_presence_slots(&car_id.to_string(), None, None).unwrap();
-        assert_eq!(slots.len(), 2, "two distinct hours should produce two slots");
+        let slots = db
+            .get_presence_slots(&car_id.to_string(), None, None)
+            .unwrap();
+        assert_eq!(
+            slots.len(),
+            2,
+            "two distinct hours should produce two slots"
+        );
     }
 
     #[test]
@@ -914,8 +925,14 @@ mod tests {
         let db = test_db();
         let car_id = Uuid::new_v4();
         let vid = Uuid::new_v4();
-        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 1, None)
-            .unwrap();
+        db.upsert_car(
+            car_id,
+            "2026-04-13T08:00:00+00:00",
+            "2026-04-13T10:00:00+00:00",
+            1,
+            None,
+        )
+        .unwrap();
         // Create a vehicle so the FK to vehicles(vehicle_id) is satisfied.
         let vehicle = VehicleTrack {
             vehicle_id: vid,
@@ -946,17 +963,27 @@ mod tests {
 
         let events = db.get_pressure_events(&car_id.to_string()).unwrap();
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], PressureEvent::SuddenIncrease { delta_kpa, .. } if (*delta_kpa - 15.0).abs() < 0.1));
+        assert!(
+            matches!(&events[0], PressureEvent::SuddenIncrease { delta_kpa, .. } if (*delta_kpa - 15.0).abs() < 0.1)
+        );
     }
 
     #[test]
     fn generate_car_report_with_no_data() {
         let db = test_db();
         let car_id = Uuid::new_v4();
-        db.upsert_car(car_id, "2026-04-13T08:00:00+00:00", "2026-04-13T10:00:00+00:00", 1, None)
-            .unwrap();
+        db.upsert_car(
+            car_id,
+            "2026-04-13T08:00:00+00:00",
+            "2026-04-13T10:00:00+00:00",
+            1,
+            None,
+        )
+        .unwrap();
 
-        let report = db.generate_car_report(&car_id.to_string(), None, None).unwrap();
+        let report = db
+            .generate_car_report(&car_id.to_string(), None, None)
+            .unwrap();
         assert_eq!(report.car_id, car_id.to_string());
         assert_eq!(report.total_sessions, 0);
         assert!(report.routine.is_none());

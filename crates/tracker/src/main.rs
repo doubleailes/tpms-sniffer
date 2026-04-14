@@ -78,8 +78,19 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
-        Some(Command::Report { car, from, to, json }) => {
-            return run_report(&args.db, car.as_deref(), from.as_deref(), to.as_deref(), *json);
+        Some(Command::Report {
+            car,
+            from,
+            to,
+            json,
+        }) => {
+            return run_report(
+                &args.db,
+                car.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                *json,
+            );
         }
         Some(Command::Backfill) => {
             return run_backfill(&args.db);
@@ -124,7 +135,10 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "none".to_string());
                 println!(
                     "{} | vehicle={vid} | car={car_id} | sensor={} | {:.1} kPa | {} | receiver={}",
-                    packet.timestamp, packet.sensor_id, packet.pressure_kpa, packet.protocol,
+                    packet.timestamp,
+                    packet.sensor_id,
+                    packet.pressure_kpa,
+                    packet.protocol,
                     packet.receiver_id,
                 );
             }
@@ -213,10 +227,7 @@ fn run_report(
             }
 
             for v in &report.vehicles {
-                let mm = v
-                    .make_model
-                    .as_deref()
-                    .unwrap_or("unknown");
+                let mm = v.make_model.as_deref().unwrap_or("unknown");
                 println!(
                     "  Vehicle {} ({}) — avg {:.0} kPa",
                     v.vehicle_id, mm, v.avg_pressure_kpa
@@ -252,9 +263,7 @@ fn run_report(
                             ts,
                             ..
                         } => {
-                            println!(
-                                "    {vehicle_id}: ALARM {pressure_kpa:.0} kPa at {ts}"
-                            );
+                            println!("    {vehicle_id}: ALARM {pressure_kpa:.0} kPa at {ts}");
                         }
                     }
                 }
@@ -274,11 +283,7 @@ fn run_backfill(db_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_geojson(
-    db_path: &str,
-    car: Option<&str>,
-    output: Option<&str>,
-) -> Result<()> {
+fn run_geojson(db_path: &str, car: Option<&str>, output: Option<&str>) -> Result<()> {
     let db = Database::open(db_path)?;
     let sightings = db.get_geo_sightings(car)?;
     let fc = analytics::build_geojson(&sightings);

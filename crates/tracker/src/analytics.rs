@@ -382,10 +382,7 @@ pub fn build_geojson(sightings: &[GeoSighting]) -> GeoJsonFeatureCollection {
         }
         car_sightings.sort_by_key(|s| s.ts);
         let first_ts = car_sightings[0].ts.to_rfc3339();
-        let coordinates: Vec<[f64; 2]> = car_sightings
-            .iter()
-            .map(|s| [s.lon, s.lat])
-            .collect();
+        let coordinates: Vec<[f64; 2]> = car_sightings.iter().map(|s| [s.lon, s.lat]).collect();
         features.push(GeoJsonFeature {
             feature_type: "Feature".to_string(),
             properties: GeoJsonProperties {
@@ -506,7 +503,9 @@ mod tests {
             },
         ];
         let events = detect_pressure_events("car1", "v1", &readings);
-        let has_sudden = events.iter().any(|e| matches!(e, PressureEvent::SuddenIncrease { delta_kpa, .. } if *delta_kpa > 10.0));
+        let has_sudden = events.iter().any(
+            |e| matches!(e, PressureEvent::SuddenIncrease { delta_kpa, .. } if *delta_kpa > 10.0),
+        );
         assert!(has_sudden, "should detect a sudden increase event");
     }
 
@@ -528,7 +527,10 @@ mod tests {
         let has_sudden = events
             .iter()
             .any(|e| matches!(e, PressureEvent::SuddenIncrease { .. }));
-        assert!(!has_sudden, "should not detect a sudden increase below threshold");
+        assert!(
+            !has_sudden,
+            "should not detect a sudden increase below threshold"
+        );
     }
 
     #[test]
