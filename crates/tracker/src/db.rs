@@ -188,7 +188,9 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         last_seen: parse_dt(&last_seen_s),
         sighting_count: sighting_count as u32,
         protocol,
-        rtl433_id: rtl433_id as u16,
+        rtl433_id: u16::try_from(rtl433_id).map_err(|_| {
+            rusqlite::Error::IntegralValueOutOfRange(8, rtl433_id)
+        })?,
         fixed_sensor_id: sensor_id.map(|id| id as u32),
         pressure_signature: serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]),
         make_model_hint: make_model,
