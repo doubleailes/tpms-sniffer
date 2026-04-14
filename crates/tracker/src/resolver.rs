@@ -632,7 +632,7 @@ impl Resolver {
                 (now - prev).num_seconds() >= WINDOW_SIZE_S as i64
             }
             None => {
-                // First packet ever — initialise the timer but don't advance.
+                // First packet ever — initialize the timer but don't advance.
                 self.last_window_advance = Some(now);
                 false
             }

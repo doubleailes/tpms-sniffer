@@ -250,7 +250,7 @@ pub struct JaccardExport {
 }
 
 impl CoOccurrenceMatrix {
-    /// Produce a serialisable export of all non-zero Jaccard pairs.
+    /// Produce a serializable export of all non-zero Jaccard pairs.
     pub fn export(&self) -> JaccardExport {
         let mut pairs = Vec::new();
         for (&(a, b), _) in &self.counts {
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(export.windows_accumulated, 5);
         assert!(!export.pairs.is_empty());
 
-        // Should be serialisable to JSON.
+        // Should be serializable to JSON.
         let json = serde_json::to_string_pretty(&export).unwrap();
         assert!(json.contains("jaccard"));
     }
