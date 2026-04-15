@@ -125,10 +125,13 @@ pub fn infer_vehicle_class(pressure_kpa: f32, sensor_count: Option<usize>) -> Ve
 // ---------------------------------------------------------------------------
 
 /// Approximate pressure increase per °C of temperature rise above the cold
-/// inflation baseline.
+/// inflation baseline.  Based on the ideal gas law approximation for tire
+/// pressure temperature dependence.
 const KPA_PER_DEGREE_C: f32 = 0.9;
 
-/// Reference temperature for cold inflation (°C).
+/// Standard cold inflation reference temperature (°C), per automotive industry
+/// conventions.  Most tire pressure specifications assume cold inflation at
+/// approximately 20 °C ambient.
 const COLD_TEMP_C: f32 = 20.0;
 
 /// Adjust a raw pressure reading back to its cold-equivalent value based on
