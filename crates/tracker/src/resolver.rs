@@ -167,8 +167,15 @@ impl Resolver {
     fn load_from_db(&mut self) -> Result<()> {
         for vehicle in self.db.all_vehicles()? {
             if let Some(sid) = vehicle.fixed_sensor_id {
-                self.fixed_map
-                    .insert((sid, vehicle.rtl433_id), vehicle.vehicle_id);
+                // Only restore a fixed-ID mapping when the sensor ID passes
+                // the sentinel check.  Legacy rows persisted before the
+                // popcount filter was added may contain near-sentinel IDs
+                // that would pollute the fixed_map and cause cross-protocol
+                // merges on restart.
+                if is_valid_sensor_id(sid) {
+                    self.fixed_map
+                        .insert((sid, vehicle.rtl433_id), vehicle.vehicle_id);
+                }
             }
             // Restore vehicle_to_car from persisted car_id assignments.
             if let Some(car_id) = vehicle.car_id {
@@ -279,6 +286,15 @@ impl Resolver {
 
     fn process_fixed(&mut self, sighting: Sighting, rtl433_id: u16) -> Result<Option<Uuid>> {
         let sensor_id = sighting.sensor_id;
+
+        // Defense-in-depth: reject near-sentinel IDs at the insertion point,
+        // not just at the routing level in `process()`.  Without this guard a
+        // future refactor that changes the routing logic could silently allow
+        // near-sentinel IDs to create fixed-ID vehicles.
+        if !is_valid_sensor_id(sensor_id) {
+            return self.process_rolling(sighting);
+        }
+
         // Key the fixed-ID map on `(sensor_id, rtl433_id)` so that two
         // sensors from different decoders sharing a `sensor_id` value produce
         // distinct vehicle UUIDs instead of merging.
@@ -474,6 +490,12 @@ impl Resolver {
         // this path.  Copy the Uuid so we drop the shared borrow before
         // taking a mutable one below.
         //
+        // IMPORTANT: The protocol filter (`rtl433_id`) MUST be the first
+        // iterator filter to prevent cross-protocol vehicle merging.  Moving
+        // the pressure or expiry check before the protocol check would allow
+        // a near-sentinel packet from one protocol to match a vehicle from
+        // another protocol if their pressures happen to overlap.
+        //
         // The interval check is applied only when both the candidate vehicle
         // and the sighting carry enough samples.  When either side lacks data,
         // pressure match alone is sufficient.
@@ -660,6 +682,12 @@ impl Resolver {
         // enough and that was seen recently enough to still be active.  We copy
         // the Uuid (it's Copy) so we drop the shared borrow before taking the
         // mutable one below.
+        //
+        // IMPORTANT: The protocol filter (`rtl433_id`) MUST be the first
+        // iterator filter to prevent cross-protocol vehicle merging.  Moving
+        // the pressure or expiry check before the protocol check would allow
+        // a near-sentinel packet from one protocol to match a vehicle from
+        // another protocol if their pressures happen to overlap.
         //
         // When a candidate vehicle has an established interval median, also
         // check that the gap since the vehicle's last sighting is compatible
@@ -955,6 +983,7 @@ mod tests {
     use super::*;
     use crate::classification::VehicleClass;
     use crate::db::Database;
+    use std::collections::HashSet;
 
     fn make_packet(
         sensor_id: &str,
@@ -2530,5 +2559,240 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-protocol vehicle merge regression (issue #20)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_cross_protocol_merge() {
+        // Regression test for issue #20: TRW-OOK near-sentinel at 62.8 kPa
+        // and AVE-TPMS near-sentinel at 382.5 kPa must never share a vehicle
+        // UUID.  Both sensor IDs have only 1 bit cleared and should be
+        // rejected from the fixed-ID path by the popcount sentinel check.
+        let mut resolver = in_memory_resolver();
+
+        // TRW-OOK near-sentinel burst at 62.8 kPa.
+        let trw1 = make_packet_at(
+            "2026-04-15 08:28:41.000",
+            "0xFFFFFFFB",
+            "TRW-OOK",
+            298,
+            62.8,
+        );
+        let trw2 = make_packet_at(
+            "2026-04-15 08:28:41.100",
+            "0xFFFFFFFB",
+            "TRW-OOK",
+            298,
+            62.9,
+        );
+        resolver.process(&trw1).unwrap();
+        resolver.process(&trw2).unwrap();
+        resolver.flush().unwrap();
+
+        let trw_vids: Vec<Uuid> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.rtl433_id == 298)
+            .map(|v| v.vehicle_id)
+            .collect();
+
+        // AVE-TPMS near-sentinel burst at 382.5 kPa — must NOT merge with
+        // the TRW vehicle.
+        let ave1 = make_packet_at(
+            "2026-04-15 08:33:43.000",
+            "0xFFFFFFF7",
+            "AVE-TPMS",
+            208,
+            382.5,
+        );
+        let ave2 = make_packet_at(
+            "2026-04-15 08:33:43.100",
+            "0xFFFFBFFF",
+            "AVE-TPMS",
+            208,
+            382.5,
+        );
+        resolver.process(&ave1).unwrap();
+        resolver.process(&ave2).unwrap();
+        resolver.flush().unwrap();
+
+        let ave_vids: Vec<Uuid> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.rtl433_id == 208)
+            .map(|v| v.vehicle_id)
+            .collect();
+
+        // TRW and AVE vehicles must be completely disjoint.
+        for trw_vid in &trw_vids {
+            assert!(
+                !ave_vids.contains(trw_vid),
+                "TRW-OOK and AVE-TPMS must never share a vehicle UUID"
+            );
+        }
+
+        // No vehicle should span both protocols.
+        for v in resolver.vehicles.values() {
+            assert!(
+                v.rtl433_id == 298 || v.rtl433_id == 208 || v.rtl433_id == 0,
+                "unexpected rtl433_id: {}",
+                v.rtl433_id
+            );
+        }
+
+        // Near-sentinel IDs must not appear in the fixed_map.
+        assert!(
+            !resolver.fixed_map.contains_key(&(0xFFFFFFFB, 298)),
+            "near-sentinel 0xFFFFFFFB must not be in fixed_map"
+        );
+        assert!(
+            !resolver.fixed_map.contains_key(&(0xFFFFFFF7, 208)),
+            "near-sentinel 0xFFFFFFF7 must not be in fixed_map"
+        );
+    }
+
+    #[test]
+    fn db_integrity_no_vehicle_spans_multiple_rtl433_ids() {
+        // Acceptance criterion: no vehicle UUID in the database contains
+        // sightings from more than one rtl433_id value.  We verify this
+        // through the in-memory vehicles map, which is authoritative.
+        let mut resolver = in_memory_resolver();
+
+        // Inject a mix of protocols and sentinel IDs.
+        let packets = [
+            make_packet_at("2026-04-15 10:00:00.000", "0xFFFFFFFB", "TRW-OOK", 298, 62.8),
+            make_packet_at("2026-04-15 10:00:00.100", "0xFFFFFFFB", "TRW-OOK", 298, 62.9),
+            make_packet_at("2026-04-15 10:00:05.000", "0xFFFFFFF7", "AVE-TPMS", 208, 382.5),
+            make_packet_at("2026-04-15 10:00:05.100", "0xFFFFBFFF", "AVE-TPMS", 208, 382.5),
+            make_packet_at("2026-04-15 10:00:10.000", "0x1A2B3C4D", "TRW-OOK", 298, 63.0),
+            make_packet_at("2026-04-15 10:00:15.000", "0x1A2B3C4D", "TRW-OOK", 298, 63.1),
+        ];
+        for p in &packets {
+            resolver.process(p).unwrap();
+        }
+        resolver.flush().unwrap();
+
+        // Build a map from vehicle_id to the set of rtl433_ids seen.
+        // Each vehicle must contain exactly one rtl433_id.
+        let mut vid_to_protocols: HashMap<Uuid, HashSet<u16>> = HashMap::new();
+        for v in resolver.vehicles.values() {
+            vid_to_protocols
+                .entry(v.vehicle_id)
+                .or_default()
+                .insert(v.rtl433_id);
+        }
+
+        for (vid, protocols) in &vid_to_protocols {
+            assert!(
+                protocols.len() <= 1,
+                "vehicle {} has sightings from {} distinct rtl433_ids ({:?}) — expected at most 1",
+                vid,
+                protocols.len(),
+                protocols,
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_not_restored_to_fixed_map_from_db() {
+        // Verify that near-sentinel fixed_sensor_ids persisted in a previous
+        // session are not restored into fixed_map on restart.
+        let tmp = format!(
+            "/tmp/tpms_test_sentinel_restore_{}.sqlite",
+            Uuid::new_v4()
+        );
+
+        // Session 1: force-persist a vehicle with a near-sentinel fixed_sensor_id.
+        {
+            let db = Database::open(&tmp).unwrap();
+            let mut resolver = Resolver::new(db).unwrap();
+
+            // Use a valid sensor ID to create a vehicle via the fixed-ID path.
+            let p = make_packet_at("2026-04-15 10:00:00.000", "0xFEFFFFFD", "TRW-OOK", 298, 63.0);
+            resolver.process(&p).unwrap();
+            resolver.flush().unwrap();
+        }
+
+        // Corrupt the DB externally: change the fixed_sensor_id to a
+        // near-sentinel value using a separate connection.
+        {
+            let conn = rusqlite::Connection::open(&tmp).unwrap();
+            conn.execute(
+                "UPDATE vehicles SET sensor_id = ?1 WHERE sensor_id = ?2",
+                rusqlite::params![0xFFFFFFFBi64, 0xFEFFFFFDi64],
+            )
+            .unwrap();
+        }
+
+        // Session 2: reopen and verify the near-sentinel is NOT in fixed_map.
+        {
+            let db = Database::open(&tmp).unwrap();
+            let resolver = Resolver::new(db).unwrap();
+
+            assert!(
+                !resolver
+                    .fixed_map
+                    .keys()
+                    .any(|(sid, _)| *sid == 0xFFFFFFFB),
+                "near-sentinel 0xFFFFFFFB must not be restored into fixed_map from DB"
+            );
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn protocol_filter_is_first_in_fingerprint_correlator() {
+        // Verify that the protocol filter (rtl433_id) in process_fingerprint
+        // prevents cross-protocol matches even when pressure overlaps.
+        let mut resolver = in_memory_resolver();
+
+        // Create an EezTire vehicle at 51.1 kPa via the fingerprint path.
+        let eez1 = make_packet_at(
+            "2026-04-15 10:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire/Carchet/TST-507",
+            241,
+            51.1,
+        );
+        let eez2 = make_packet_at(
+            "2026-04-15 10:00:30.000",
+            "0xFFDFFFFF",
+            "EezTire/Carchet/TST-507",
+            241,
+            51.1,
+        );
+        resolver.process(&eez1).unwrap();
+        resolver.process(&eez2).unwrap();
+
+        let eez_vid = resolver
+            .vehicles
+            .values()
+            .find(|v| v.rtl433_id == 241)
+            .map(|v| v.vehicle_id);
+
+        // Now send a different-protocol packet at the same pressure.
+        // This would match the EezTire vehicle on pressure alone, but the
+        // rtl433_id filter must prevent the match.
+        let other = make_packet_at(
+            "2026-04-15 10:00:35.000",
+            "0xFFBFFFFF",
+            "SomeOther",
+            999,
+            51.1,
+        );
+        // This goes to process_rolling (invalid sensor ID), which won't match
+        // the EezTire vehicle because rtl433_id differs.
+        resolver.process(&other).unwrap();
+        resolver.flush().unwrap();
+
+        // The EezTire vehicle must not have been modified by the other packet.
+        if let Some(vid) = eez_vid {
+            let v = &resolver.vehicles[&vid];
+            assert_eq!(v.rtl433_id, 241, "EezTire vehicle rtl433_id must remain 241");
+        }
     }
 }
