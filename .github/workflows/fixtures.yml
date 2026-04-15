@@ -1,0 +1,22 @@
+name: Fixture replay
+
+on: [push, pull_request]
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Replay fixtures
+        run: |
+          for f in tests/fixtures/wild/*.jsonl.gz; do
+            [ -e "$f" ] || continue
+            echo "=== Replaying $f ==="
+            ./target/release/tpms-tracker \
+              --replay "$f" \
+              --db :memory: \
+              --assert-consistency
+          done

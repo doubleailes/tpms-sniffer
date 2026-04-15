@@ -4,6 +4,8 @@ mod framer;
 mod manchester;
 mod reporter;
 
+use std::time::Instant;
+
 use clap::Parser;
 use tracing::info;
 
@@ -49,6 +51,10 @@ struct Args {
     ///   airpuxem | truck
     #[arg(long, default_value = "all")]
     protocol: String,
+
+    /// Stop capturing after this many seconds (omit for unlimited)
+    #[arg(long)]
+    duration_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -126,7 +132,14 @@ async fn main() -> anyhow::Result<()> {
     let mut fsk_demod = demod::FskDemod::new(args.rate);
     let mut framer = framer::Framer::new();
 
+    let start = Instant::now();
     while let Some(Ok(chunk)) = stream.next().await {
+        if let Some(d) = args.duration_secs {
+            if start.elapsed().as_secs() >= d {
+                break;
+            }
+        }
+
         let bits_ook = ook_demod.process(&chunk);
         let bits_fsk = fsk_demod.process(&chunk);
 
