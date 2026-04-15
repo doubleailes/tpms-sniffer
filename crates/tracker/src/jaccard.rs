@@ -19,6 +19,11 @@ pub const MIN_WINDOWS: u32 = 3;
 /// Iterative threshold descent: start strict, relax until all grouped.
 pub const THRESHOLDS: &[f32] = &[0.75, 0.60, 0.45, 0.30];
 
+/// Jaccard score threshold for merging two existing CarGroups.
+/// When the inter-group Jaccard score exceeds this value, the groups are
+/// consolidated into a single car.
+pub const JACCARD_MERGE_THRESHOLD: f32 = 0.60;
+
 /// Minimum number of shared most-significant bytes for two fixed-ID sensors
 /// to be considered candidate wheel-mates via prefix grouping.
 pub const MIN_PREFIX_BYTES: u8 = 2;
@@ -270,6 +275,43 @@ impl CoOccurrenceMatrix {
     /// Return all vehicle IDs that have appeared in any window.
     pub fn known_vehicles(&self) -> HashSet<Uuid> {
         self.appearances.keys().copied().collect()
+    }
+
+    /// Compute the Jaccard score between two groups of vehicle IDs.
+    ///
+    /// The score represents the fraction of time windows where at least one
+    /// member of group A and at least one member of group B appear together.
+    /// Uses the maximum pairwise co-occurrence count between members of A and
+    /// B as the intersection, and the maximum individual appearance counts as
+    /// the union components.
+    pub fn inter_group_jaccard(&self, members_a: &HashSet<Uuid>, members_b: &HashSet<Uuid>) -> f32 {
+        let intersection: u32 = members_a
+            .iter()
+            .flat_map(|va| {
+                members_b.iter().map(move |vb| {
+                    let key = ordered_pair(*va, *vb);
+                    *self.counts.get(&key).unwrap_or(&0)
+                })
+            })
+            .max()
+            .unwrap_or(0);
+
+        let union_a = members_a
+            .iter()
+            .map(|v| self.appearances.get(v).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let union_b = members_b
+            .iter()
+            .map(|v| self.appearances.get(v).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+
+        let union = union_a + union_b - intersection;
+        if union == 0 {
+            return 0.0;
+        }
+        intersection as f32 / union as f32
     }
 }
 
@@ -935,5 +977,142 @@ mod tests {
             let parsed = WheelPosition::from_str(s).unwrap();
             assert_eq!(*pos, parsed);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // inter_group_jaccard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inter_group_jaccard_high_cooccurrence() {
+        // Two groups of vehicles with high co-occurrence should produce a
+        // score above JACCARD_MERGE_THRESHOLD.
+        let mut m = CoOccurrenceMatrix::new();
+        let a1 = Uuid::new_v4();
+        let b1 = Uuid::new_v4();
+
+        // Both appear together in 5 out of 6 windows (≈83%).
+        // Keep total windows below N_WINDOWS to avoid eviction.
+        for i in 0..6 {
+            m.record(a1);
+            if i < 5 {
+                m.record(b1);
+            }
+            m.advance_window();
+        }
+
+        let group_a: HashSet<Uuid> = [a1].into_iter().collect();
+        let group_b: HashSet<Uuid> = [b1].into_iter().collect();
+        let score = m.inter_group_jaccard(&group_a, &group_b);
+
+        assert!(
+            score >= JACCARD_MERGE_THRESHOLD,
+            "high co-occurrence should produce score >= {JACCARD_MERGE_THRESHOLD}, got {score}"
+        );
+    }
+
+    #[test]
+    fn inter_group_jaccard_low_cooccurrence() {
+        // Two groups of vehicles with low co-occurrence should produce a
+        // low inter-group Jaccard score (well below JACCARD_MERGE_THRESHOLD).
+        let mut m = CoOccurrenceMatrix::new();
+        let a1 = Uuid::new_v4();
+        let b1 = Uuid::new_v4();
+
+        // a1 in 5 windows, b1 overlaps only in 1, then b1 alone in 3 more.
+        // Total: 8 advances, all within N_WINDOWS (no eviction).
+        for i in 0..5 {
+            m.record(a1);
+            if i == 0 {
+                m.record(b1);
+            }
+            m.advance_window();
+        }
+        for _ in 0..3 {
+            m.record(b1);
+            m.advance_window();
+        }
+
+        let group_a: HashSet<Uuid> = [a1].into_iter().collect();
+        let group_b: HashSet<Uuid> = [b1].into_iter().collect();
+        let score = m.inter_group_jaccard(&group_a, &group_b);
+
+        assert!(
+            score < 0.30,
+            "low co-occurrence should produce score < 0.30, got {score}"
+        );
+    }
+
+    #[test]
+    fn inter_group_jaccard_empty_groups() {
+        let m = CoOccurrenceMatrix::new();
+        let group_a: HashSet<Uuid> = HashSet::new();
+        let group_b: HashSet<Uuid> = HashSet::new();
+
+        assert_eq!(m.inter_group_jaccard(&group_a, &group_b), 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge acceptance criteria tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn high_cooccurrence_vehicles_grouped_into_one_car() {
+        // Two vehicle tracks with high co-occurrence should end up in the
+        // same CarGroup after grouping.
+        let mut m = CoOccurrenceMatrix::new();
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+
+        // Both appear together in 5 out of 6 windows (≈83%).
+        // Keep total windows below N_WINDOWS to avoid eviction.
+        for i in 0..6 {
+            m.record(v1);
+            if i < 5 {
+                m.record(v2);
+            }
+            m.advance_window();
+        }
+
+        let groups = group_vehicles_into_cars(&m, &[v1, v2]);
+
+        // Both should be in the same group.
+        let g = groups.iter().find(|g| g.contains(v1)).unwrap();
+        assert!(
+            g.contains(v2),
+            "vehicles with high co-occurrence should share a car_id"
+        );
+    }
+
+    #[test]
+    fn low_cooccurrence_vehicles_not_grouped_together() {
+        // Two vehicle tracks with low co-occurrence should end up in
+        // separate CarGroups.
+        let mut m = CoOccurrenceMatrix::new();
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+
+        // v1 in 5 windows, v2 overlaps only in 1, then v2 alone in 3 more.
+        // Total: 8 advances, all within N_WINDOWS (no eviction).
+        for i in 0..5 {
+            m.record(v1);
+            if i == 0 {
+                m.record(v2);
+            }
+            m.advance_window();
+        }
+        for _ in 0..3 {
+            m.record(v2);
+            m.advance_window();
+        }
+
+        let groups = group_vehicles_into_cars(&m, &[v1, v2]);
+
+        // They should be in different groups.
+        let g1 = groups.iter().find(|g| g.contains(v1)).unwrap();
+        assert!(
+            !g1.contains(v2),
+            "vehicles with low co-occurrence should NOT share a car_id"
+        );
     }
 }
