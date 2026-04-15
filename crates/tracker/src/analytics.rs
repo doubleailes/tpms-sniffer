@@ -426,6 +426,7 @@ pub struct VehicleSummary {
     pub make_model: Option<String>,
     pub avg_pressure_kpa: f32,
     pub wheel_position: Option<String>,
+    pub vehicle_class: String,
 }
 
 // ---------------------------------------------------------------------------

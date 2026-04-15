@@ -282,6 +282,8 @@ impl CoOccurrenceMatrix {
 pub struct CarGroup {
     pub car_id: Uuid,
     pub members: HashSet<Uuid>,
+    /// Inherited from member vehicles; must be consistent.
+    pub vehicle_class: crate::classification::VehicleClass,
 }
 
 impl CarGroup {
@@ -291,6 +293,7 @@ impl CarGroup {
         Self {
             car_id: Uuid::new_v4(),
             members,
+            vehicle_class: crate::classification::VehicleClass::Unknown,
         }
     }
 

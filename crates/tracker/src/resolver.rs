@@ -5,14 +5,16 @@ use chrono::{DateTime, Duration, Utc};
 use std::collections::VecDeque;
 use uuid::Uuid;
 
+use crate::classification::{compensate_pressure, infer_vehicle_class};
 use crate::db::Database;
 use crate::jaccard::{
     self, CoOccurrenceMatrix, VehicleMeta, WINDOW_SIZE_S, group_vehicles_into_cars_with_meta,
     infer_wheel_positions,
 };
 use crate::{
-    CROSS_RECEIVER_WINDOW_MS, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_TOLERANCE_MS,
-    TX_INTERVAL_WINDOW, TpmsPacket, VehicleTrack, compute_median, make_model_hint,
+    CROSS_RECEIVER_WINDOW_MS, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_MIN_SAMPLES,
+    TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW, TpmsPacket, VehicleTrack, compute_median,
+    make_model_hint,
 };
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
@@ -57,7 +59,10 @@ const BURST_GAP_MS: i64 = 200;
 const BURST_MAX_WHEELS: usize = 4;
 
 /// L1 distance threshold (kPa, per-wheel average) for matching a new burst
-/// against a known vehicle's pressure signature.
+/// against a known vehicle's pressure signature.  Retained as a fallback
+/// constant; the per-vehicle dynamic tolerance from
+/// `VehicleClass::pressure_tolerance_kpa()` is used in active matching.
+#[allow(dead_code)]
 const PRESSURE_MATCH_TOLERANCE_KPA: f32 = 5.0;
 
 /// How long a vehicle remains eligible for pressure-fingerprint correlation
@@ -314,6 +319,7 @@ impl Resolver {
                         car_id: None,
                         receiver_sightings: HashMap::new(),
                         wheel_position: None,
+                        vehicle_class: infer_vehicle_class(sighting.pressure_kpa, None),
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -337,6 +343,7 @@ impl Resolver {
                     car_id: None,
                     receiver_sightings: HashMap::new(),
                     wheel_position: None,
+                    vehicle_class: infer_vehicle_class(sighting.pressure_kpa, None),
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -360,6 +367,7 @@ impl Resolver {
                 car_id: None,
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
+                vehicle_class: infer_vehicle_class(sighting.pressure_kpa, None),
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
@@ -389,7 +397,19 @@ impl Resolver {
             vehicle.last_seen = sighting.ts;
             vehicle.battery_ok = sighting.battery_ok;
             if sighting.pressure_reliable {
-                ema_update(&mut vehicle.pressure_signature[0], sighting.pressure_kpa);
+                let compensated = compensate_pressure(sighting.pressure_kpa, sighting.temp_c);
+                ema_update(&mut vehicle.pressure_signature[0], compensated);
+                // Recompute vehicle class from updated pressure average.
+                let new_class = infer_vehicle_class(vehicle.pressure_signature[0], None);
+                if new_class != vehicle.vehicle_class
+                    && vehicle.sighting_count >= TX_INTERVAL_MIN_SAMPLES as u32
+                {
+                    eprintln!(
+                        "warn: vehicle {} class changed from {} to {} after stabilisation",
+                        vehicle.vehicle_id, vehicle.vehicle_class, new_class
+                    );
+                }
+                vehicle.vehicle_class = new_class;
             }
         }
 
@@ -431,7 +451,9 @@ impl Resolver {
     /// vehicle via the fixed-ID path.
     fn process_fingerprint(&mut self, sighting: Sighting) -> Result<Option<Uuid>> {
         let now = sighting.ts;
-        let pressure = sighting.pressure_kpa;
+        // Use temperature-compensated pressure for matching and EMA updates;
+        // the raw pressure is persisted in the sighting row via insert_sighting.
+        let pressure = compensate_pressure(sighting.pressure_kpa, sighting.temp_c);
         let protocol = sighting.protocol.clone();
         let rtl433_id = sighting.rtl433_id;
         let hint = sighting.tx_interval_hint_ms;
@@ -452,8 +474,9 @@ impl Resolver {
             .filter(|v| v.rtl433_id == rtl433_id && v.fixed_sensor_id.is_none())
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
             .find(|v| {
+                let tolerance = v.vehicle_class.pressure_tolerance_kpa();
                 let pressure_ok =
-                    (v.pressure_signature[0] - pressure).abs() <= PRESSURE_MATCH_TOLERANCE_KPA;
+                    (v.pressure_signature[0] - pressure).abs() <= tolerance;
                 if !pressure_ok {
                     return false;
                 }
@@ -488,6 +511,7 @@ impl Resolver {
                 car_id: None,
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
+                vehicle_class: infer_vehicle_class(pressure, None),
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -517,6 +541,17 @@ impl Resolver {
             vehicle.battery_ok = sighting.battery_ok;
             if sighting.pressure_reliable {
                 ema_update(&mut vehicle.pressure_signature[0], pressure);
+                // Recompute vehicle class from updated pressure average.
+                let new_class = infer_vehicle_class(vehicle.pressure_signature[0], None);
+                if new_class != vehicle.vehicle_class
+                    && vehicle.sighting_count >= TX_INTERVAL_MIN_SAMPLES as u32
+                {
+                    eprintln!(
+                        "warn: vehicle {} class changed from {} to {} after stabilisation",
+                        vehicle.vehicle_id, vehicle.vehicle_class, new_class
+                    );
+                }
+                vehicle.vehicle_class = new_class;
             }
         }
 
@@ -628,8 +663,9 @@ impl Resolver {
             .filter(|v| v.fixed_sensor_id.is_none() && v.rtl433_id == burst.rtl433_id)
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
             .find(|v| {
+                let tolerance = v.vehicle_class.pressure_tolerance_kpa();
                 let pressure_ok =
-                    l1_per_wheel(&v.pressure_signature, &sig) < PRESSURE_MATCH_TOLERANCE_KPA;
+                    l1_per_wheel(&v.pressure_signature, &sig) < tolerance;
                 if !pressure_ok {
                     return false;
                 }
@@ -653,6 +689,8 @@ impl Resolver {
         } else {
             // First sighting of this vehicle — create a new record.
             let vid = Uuid::new_v4();
+            // Use the first non-zero pressure in the signature for classification.
+            let class_pressure = sig.iter().find(|&&p| p > 0.0).copied().unwrap_or(0.0);
             let vehicle = VehicleTrack {
                 vehicle_id: vid,
                 first_seen: now,
@@ -669,6 +707,7 @@ impl Resolver {
                 car_id: None,
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
+                vehicle_class: infer_vehicle_class(class_pressure, None),
             };
             self.vehicles.insert(vid, vehicle);
             vid
@@ -696,6 +735,23 @@ impl Resolver {
             for (i, &p) in burst.pressures.iter().enumerate().take(4) {
                 ema_update(&mut vehicle.pressure_signature[i], p);
             }
+            // Recompute vehicle class from updated pressure average.
+            let class_pressure = vehicle
+                .pressure_signature
+                .iter()
+                .find(|&&p| p > 0.0)
+                .copied()
+                .unwrap_or(0.0);
+            let new_class = infer_vehicle_class(class_pressure, None);
+            if new_class != vehicle.vehicle_class
+                && vehicle.sighting_count >= TX_INTERVAL_MIN_SAMPLES as u32
+            {
+                eprintln!(
+                    "warn: vehicle {} class changed from {} to {} after stabilisation",
+                    vehicle.vehicle_id, vehicle.vehicle_class, new_class
+                );
+            }
+            vehicle.vehicle_class = new_class;
         }
 
         // Record co-occurrence.
@@ -877,6 +933,7 @@ fn ema_update(slot: &mut f32, new_val: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classification::VehicleClass;
     use crate::db::Database;
 
     fn make_packet(
@@ -1828,6 +1885,7 @@ mod tests {
                 car_id: None,
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
+                vehicle_class: VehicleClass::Unknown,
             }
         };
 

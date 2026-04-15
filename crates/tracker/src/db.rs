@@ -195,6 +195,19 @@ impl Database {
                 .execute("ALTER TABLE vehicles ADD COLUMN wheel_position TEXT", [])?;
         }
 
+        // Migration: add vehicle_class column for pressure-based classification.
+        let has_vehicle_class: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='vehicle_class'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_vehicle_class == 0 {
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN vehicle_class TEXT NOT NULL DEFAULT 'Unknown'",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -207,8 +220,8 @@ impl Database {
             r#"
             INSERT INTO vehicles
                 (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig,
-                 tx_interval_median_ms, tx_interval_samples, car_id, wheel_position)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 tx_interval_median_ms, tx_interval_samples, car_id, wheel_position, vehicle_class)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
@@ -218,7 +231,8 @@ impl Database {
                 tx_interval_median_ms = excluded.tx_interval_median_ms,
                 tx_interval_samples   = excluded.tx_interval_samples,
                 car_id                = COALESCE(excluded.car_id, vehicles.car_id),
-                wheel_position        = COALESCE(excluded.wheel_position, vehicles.wheel_position)
+                wheel_position        = COALESCE(excluded.wheel_position, vehicles.wheel_position),
+                vehicle_class         = excluded.vehicle_class
             "#,
             params![
                 v.vehicle_id.to_string(),
@@ -234,6 +248,7 @@ impl Database {
                 v.tx_intervals_ms.len() as i64,
                 v.car_id.map(|id| id.to_string()),
                 v.wheel_position.map(|wp| wp.as_str().to_string()),
+                v.vehicle_class.as_str(),
             ],
         )?;
         Ok(())
@@ -705,7 +720,7 @@ impl Database {
 
         // Get vehicles belonging to this car.
         let mut stmt = self.conn.prepare(
-            "SELECT vehicle_id, protocol, make_model, pressure_sig, wheel_position \
+            "SELECT vehicle_id, protocol, make_model, pressure_sig, wheel_position, vehicle_class \
              FROM vehicles WHERE car_id = ?1",
         )?;
         let vehicles: Vec<VehicleSummary> = stmt
@@ -715,6 +730,7 @@ impl Database {
                 let make_model: Option<String> = row.get(2)?;
                 let pressure_sig_s: String = row.get(3)?;
                 let wheel_position: Option<String> = row.get(4)?;
+                let vehicle_class: Option<String> = row.get(5)?;
                 let sig: [f32; 4] = serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
                 let avg = sig.iter().filter(|&&p| p > 0.0).sum::<f32>()
                     / sig.iter().filter(|&&p| p > 0.0).count().max(1) as f32;
@@ -724,6 +740,7 @@ impl Database {
                     make_model,
                     avg_pressure_kpa: avg,
                     wheel_position,
+                    vehicle_class: vehicle_class.unwrap_or_else(|| "Unknown".to_string()),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -785,6 +802,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let _tx_interval_samples: i64 = row.get(10)?;
     let car_id_s: Option<String> = row.get(11)?;
     let wheel_position_s: Option<String> = row.get(12)?;
+    let vehicle_class_s: Option<String> = row.get(13)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -811,6 +829,9 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         car_id: car_id_uuid,
         receiver_sightings: HashMap::new(),
         wheel_position: wheel_position_s.and_then(|s| crate::jaccard::WheelPosition::from_str(&s)),
+        vehicle_class: vehicle_class_s
+            .map(|s| crate::classification::VehicleClass::from_str(&s))
+            .unwrap_or(crate::classification::VehicleClass::Unknown),
     })
 }
 
@@ -883,6 +904,7 @@ mod tests {
             car_id: Some(car_id),
             receiver_sightings: HashMap::new(),
             wheel_position: None,
+            vehicle_class: crate::classification::VehicleClass::PassengerCar,
         };
         db.upsert_vehicle(&vehicle).unwrap();
 
@@ -950,6 +972,7 @@ mod tests {
             car_id: Some(car_id),
             receiver_sightings: HashMap::new(),
             wheel_position: None,
+            vehicle_class: crate::classification::VehicleClass::PassengerCar,
         };
         db.upsert_vehicle(&vehicle).unwrap();
 

@@ -118,3 +118,55 @@ ring-buffer depth (0–8).
 In all cases, the interval check is **skipped** when either side has fewer than
 `TX_INTERVAL_MIN_SAMPLES` — pressure match alone is sufficient during track
 establishment.
+
+## Vehicle class inference
+
+The tracker infers a `VehicleClass` from tire pressure range and optional
+sensor count.  Classification is available from the first packet and is refined
+as the pressure running average stabilises.
+
+| Class               | Typical pressure | Sensor count | `expected_sensor_count()` |
+|---------------------|------------------|--------------|---------------------------|
+| Motorcycle          | 200–290 kPa      | 2            | `Some(2)`                 |
+| Passenger car       | 200–280 kPa      | 4            | `Some(4)`                 |
+| SUV / light truck   | 260–340 kPa      | 4            | `Some(4)`                 |
+| Light commercial van| 350–480 kPa      | 4+           | `Some(4)`                 |
+| Heavy truck         | 550–800 kPa      | 6–18         | **`None`**                |
+| Unknown             | —                | —            | `None`                    |
+
+`HeavyTruck` returns `None` from `expected_sensor_count()` because heavy trucks
+have 6–18 sensors depending on axle count, which is too variable to fix as a
+target group size for the Jaccard grouper.
+
+### Per-class pressure tolerance
+
+Each class has a `pressure_tolerance_kpa()` value used for fingerprint matching
+instead of the former global constant.  Heavier vehicles have larger absolute
+pressure variation under load and temperature change:
+
+| Class               | Tolerance |
+|---------------------|-----------|
+| Motorcycle          | 4.0 kPa   |
+| PassengerCar        | 5.0 kPa   |
+| SuvLightTruck       | 6.0 kPa   |
+| LightCommercialVan  | 8.0 kPa   |
+| HeavyTruck          | 15.0 kPa  |
+| Unknown             | 5.0 kPa   |
+
+### Temperature-pressure compensation
+
+When a valid temperature reading is available (0 < temp_c < 100 °C), the
+tracker applies an approximate compensation of **0.9 kPa per °C** to adjust
+the pressure back to a cold-equivalent baseline (20 °C reference).  Sentinel
+values (e.g. 215 °C) and missing temperatures are left uncompensated.
+
+### Database schema
+
+The `vehicle_class` column is added to the `vehicles` table via an automatic
+migration:
+
+```sql
+ALTER TABLE vehicles ADD COLUMN vehicle_class TEXT NOT NULL DEFAULT 'Unknown';
+```
+
+`vehicle_class` is also included in JSON report output via `VehicleSummary`.
