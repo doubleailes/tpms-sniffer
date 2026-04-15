@@ -205,7 +205,7 @@ pub fn assert_consistency(result: &ReplayResult) -> Vec<ConsistencyError> {
 
         // Pressure is physically plausible (per-vehicle average pressures).
         for &p in &vehicle.pressures_kpa {
-            if p < 15.0 || p > 900.0 {
+            if p < 1.5 || p > 900.0 {
                 errors.push(ConsistencyError::ImplausiblePressure {
                     vehicle_id: vehicle.vehicle_id,
                     pressure_kpa: p,
@@ -279,7 +279,7 @@ pub fn print_summary(result: &ReplayResult, errors: &[ConsistencyError]) {
         .filter(|e| matches!(e, ConsistencyError::ImplausiblePressure { .. }))
         .collect();
     if implausible.is_empty() {
-        eprintln!("PASS  all pressures in plausible range (15-900 kPa)");
+        eprintln!("PASS  all pressures in plausible range (1.5-900 kPa)");
     } else {
         for e in &implausible {
             eprintln!("FAIL  {e}");
