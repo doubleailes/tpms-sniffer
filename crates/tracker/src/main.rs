@@ -1,8 +1,10 @@
 use std::io::{self, BufRead};
+use std::path::PathBuf;
+use std::process;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tpms_tracker::{TpmsPacket, analytics, db::Database, resolver::Resolver};
+use tpms_tracker::{TpmsPacket, analytics, db::Database, replay, resolver::Resolver};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +35,14 @@ struct Args {
     /// Used for cross-receiver deduplication in multi-node deployments.
     #[arg(long, default_value = "default")]
     receiver_id: String,
+
+    /// Replay a JSON-L (or .jsonl.gz) fixture file instead of reading stdin.
+    #[arg(long)]
+    replay: Option<PathBuf>,
+
+    /// After replay, run consistency assertions and exit non-zero on failure.
+    #[arg(long)]
+    assert_consistency: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -99,6 +109,19 @@ fn main() -> Result<()> {
             return run_geojson(&args.db, car.as_deref(), output.as_deref());
         }
         None => {}
+    }
+
+    // Replay mode: read from a fixture file instead of stdin.
+    if let Some(ref path) = args.replay {
+        let result = replay::replay(path, args.confidence)?;
+        if args.assert_consistency {
+            let errors = replay::assert_consistency(&result);
+            replay::print_summary(&result, &errors);
+            if !errors.is_empty() {
+                process::exit(1);
+            }
+        }
+        return Ok(());
     }
 
     // Default: stdin processing mode.
