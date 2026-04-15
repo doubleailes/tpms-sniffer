@@ -135,6 +135,10 @@ pub struct Resolver {
     last_window_advance: Option<DateTime<Utc>>,
     /// Receiver ID assigned to all locally-created sightings.
     receiver_id: String,
+    /// Fast inverse index: `vehicle_id → car_id`.  Persists for the lifetime
+    /// of the session so that a vehicle retains its `car_id` across grouping
+    /// evaluations.
+    vehicle_to_car: HashMap<Uuid, Uuid>,
 }
 
 impl Resolver {
@@ -154,6 +158,7 @@ impl Resolver {
             cooccurrence: CoOccurrenceMatrix::new(),
             last_window_advance: None,
             receiver_id,
+            vehicle_to_car: HashMap::new(),
         };
         r.load_from_db()?;
         Ok(r)
@@ -164,6 +169,10 @@ impl Resolver {
             if let Some(sid) = vehicle.fixed_sensor_id {
                 self.fixed_map
                     .insert((sid, vehicle.rtl433_id), vehicle.vehicle_id);
+            }
+            // Restore vehicle_to_car from persisted car_id assignments.
+            if let Some(car_id) = vehicle.car_id {
+                self.vehicle_to_car.insert(vehicle.vehicle_id, car_id);
             }
             self.vehicles.insert(vehicle.vehicle_id, vehicle);
         }
@@ -800,6 +809,11 @@ impl Resolver {
     }
 
     /// Run the Jaccard grouping algorithm and persist car assignments.
+    ///
+    /// The algorithm produces fresh `CarGroup` objects with throwaway UUIDs on
+    /// every call.  To keep `car_id` stable across evaluations we check whether
+    /// any member of a newly-computed group already has a persisted `car_id` in
+    /// `vehicle_to_car` and reuse it instead of minting a new one.
     fn run_grouping(&mut self) -> Result<()> {
         if self.cooccurrence.windows_accumulated < jaccard::MIN_WINDOWS {
             return Ok(());
@@ -819,6 +833,13 @@ impl Resolver {
 
         let groups = group_vehicles_into_cars_with_meta(&self.cooccurrence, &ids, &meta);
         for group in &groups {
+            // Reuse a previously-assigned car_id if any member already has one.
+            let stable_car_id = group
+                .members
+                .iter()
+                .find_map(|vid| self.vehicle_to_car.get(vid).copied())
+                .unwrap_or(group.car_id);
+
             // Determine aggregate first/last seen for the car.
             let mut first = None::<DateTime<Utc>>;
             let mut last = None::<DateTime<Utc>>;
@@ -837,7 +858,7 @@ impl Resolver {
             let last_s = last.map(|d| d.to_rfc3339()).unwrap_or_default();
 
             self.db.upsert_car(
-                group.car_id,
+                stable_car_id,
                 &first_s,
                 &last_s,
                 group.wheel_count(),
@@ -855,13 +876,14 @@ impl Resolver {
 
             for &vid in &group.members {
                 if let Some(v) = self.vehicles.get_mut(&vid) {
-                    v.car_id = Some(group.car_id);
+                    v.car_id = Some(stable_car_id);
                     // Assign inferred wheel position if available.
                     if let (Some(wm), Some(sid)) = (&wheel_map, v.fixed_sensor_id) {
                         v.wheel_position = wm.get(&sid).copied();
                     }
                 }
-                self.db.set_vehicle_car_id(vid, group.car_id)?;
+                self.vehicle_to_car.insert(vid, stable_car_id);
+                self.db.set_vehicle_car_id(vid, stable_car_id)?;
             }
 
             // Persist updated vehicles (including wheel_position) after grouping.
@@ -2408,5 +2430,105 @@ mod tests {
             v.receiver_sightings.contains_key("node-42"),
             "receiver_sightings must reflect the packet's receiver_id"
         );
+    }
+
+    /// Helper: send several sightings of the same fixed-ID sensor across enough
+    /// windows to trigger the Jaccard grouper, then return the set of distinct
+    /// car_id values assigned to the vehicle across all evaluations.
+    fn collect_car_ids_for_repeated_sightings(count: usize) -> (Resolver, Vec<Option<Uuid>>) {
+        let db = Database::open(":memory:").unwrap();
+        let mut resolver = Resolver::new(db).unwrap();
+        let mut car_ids: Vec<Option<Uuid>> = Vec::new();
+
+        // Use a TRW sensor (fixed-ID protocol 298) so it gets a stable
+        // vehicle UUID and enters the co-occurrence matrix.
+        for i in 0..count {
+            // Space packets 65 s apart so each one falls in a new window
+            // (WINDOW_SIZE_S = 60).  After MIN_WINDOWS (3) windows the grouper
+            // runs on every subsequent advance.
+            let ts = format!("2025-06-01 12:{:02}:{:02}.000", i * 65 / 60, (i * 65) % 60);
+            let p = make_packet_at(&ts, "0x1A2B3C01", "TRW-OOK", 298, 230.0);
+            resolver.process(&p).unwrap();
+
+            // Snapshot the car_id after each sighting.
+            let vid = resolver
+                .vehicles
+                .values()
+                .find(|v| v.fixed_sensor_id == Some(0x1A2B3C01))
+                .expect("vehicle should exist");
+            car_ids.push(vid.car_id);
+        }
+        resolver.flush().unwrap();
+        (resolver, car_ids)
+    }
+
+    #[test]
+    fn car_id_stable_across_repeated_sightings() {
+        // Acceptance criterion: 10 sightings of the same vehicle produce
+        // exactly 1 distinct car_id value (after the initial `None` period
+        // before enough windows accumulate).
+        let (_resolver, car_ids) = collect_car_ids_for_repeated_sightings(10);
+        let assigned: std::collections::HashSet<Uuid> =
+            car_ids.iter().filter_map(|c| *c).collect();
+        assert!(
+            assigned.len() <= 1,
+            "expected at most 1 distinct car_id, got {}: {:?}",
+            assigned.len(),
+            assigned
+        );
+    }
+
+    #[test]
+    fn car_id_survives_tracker_restart() {
+        // First session: send enough packets to trigger grouping and get a
+        // car_id assigned.
+        let tmp = std::env::temp_dir().join("tpms_test_restart.db");
+        // Ensure clean state.
+        let _ = std::fs::remove_file(&tmp);
+
+        let car_id_first_session;
+        let vehicle_id;
+        {
+            let db = Database::open(tmp.to_str().unwrap()).unwrap();
+            let mut resolver = Resolver::new(db).unwrap();
+            for i in 0..10 {
+                let ts = format!("2025-06-01 12:{:02}:{:02}.000", i * 65 / 60, (i * 65) % 60);
+                let p = make_packet_at(&ts, "0x1A2B3C02", "TRW-OOK", 298, 230.0);
+                resolver.process(&p).unwrap();
+            }
+            resolver.flush().unwrap();
+
+            let v = resolver
+                .vehicles
+                .values()
+                .find(|v| v.fixed_sensor_id == Some(0x1A2B3C02))
+                .expect("vehicle should exist");
+            car_id_first_session = v.car_id;
+            vehicle_id = v.vehicle_id;
+        }
+
+        // Second session: reopen the same database.  The vehicle should still
+        // have the same car_id without needing any new packets.
+        {
+            let db = Database::open(tmp.to_str().unwrap()).unwrap();
+            let resolver = Resolver::new(db).unwrap();
+            let v = resolver.vehicles.get(&vehicle_id).expect(
+                "vehicle should be restored from DB",
+            );
+            assert_eq!(
+                v.car_id, car_id_first_session,
+                "car_id must survive tracker restart"
+            );
+            // Also verify the vehicle_to_car index was restored.
+            if let Some(car_id) = car_id_first_session {
+                assert_eq!(
+                    resolver.vehicle_to_car.get(&vehicle_id).copied(),
+                    Some(car_id),
+                    "vehicle_to_car index must be restored from DB"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
