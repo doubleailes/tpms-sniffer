@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod classification;
 pub mod db;
 pub mod jaccard;
 pub mod resolver;
@@ -148,6 +149,8 @@ pub struct VehicleTrack {
     /// Inferred wheel position (FL/FR/RL/RR) based on trailing-byte analysis.
     /// `None` when inference is not possible or not applicable.
     pub wheel_position: Option<jaccard::WheelPosition>,
+    /// Inferred vehicle class based on pressure range and sensor count.
+    pub vehicle_class: classification::VehicleClass,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.
