@@ -359,6 +359,25 @@ impl Database {
         Ok(())
     }
 
+    /// Reassign all vehicles that reference `discard` to point to `keep`
+    /// instead.  Used when merging two CarGroups.
+    pub fn reassign_vehicles_car_id(&self, discard: Uuid, keep: Uuid) -> Result<u64> {
+        let affected = self.conn.execute(
+            "UPDATE vehicles SET car_id = ?1 WHERE car_id = ?2",
+            params![keep.to_string(), discard.to_string()],
+        )?;
+        Ok(affected as u64)
+    }
+
+    /// Delete a car record from the `cars` table.
+    pub fn delete_car(&self, car_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM cars WHERE car_id = ?1",
+            params![car_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Presence-slot analytics
     // -----------------------------------------------------------------------

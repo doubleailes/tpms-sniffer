@@ -842,6 +842,11 @@ impl Resolver {
     /// every call.  To keep `car_id` stable across evaluations we check whether
     /// any member of a newly-computed group already has a persisted `car_id` in
     /// `vehicle_to_car` and reuse it instead of minting a new one.
+    ///
+    /// When a fresh group contains members from multiple previously-separate
+    /// car_ids, this is a *merge event*: the distinct car_ids are consolidated
+    /// into one, the discarded car entries are removed from the database, and
+    /// all affected vehicles are re-pointed to the surviving car_id.
     fn run_grouping(&mut self) -> Result<()> {
         if self.cooccurrence.windows_accumulated < jaccard::MIN_WINDOWS {
             return Ok(());
@@ -861,12 +866,55 @@ impl Resolver {
 
         let groups = group_vehicles_into_cars_with_meta(&self.cooccurrence, &ids, &meta);
         for group in &groups {
-            // Reuse a previously-assigned car_id if any member already has one.
-            let stable_car_id = group
+            // Collect all distinct, previously-assigned car_ids for this group.
+            let mut previous_car_ids: Vec<Uuid> = group
                 .members
                 .iter()
-                .find_map(|vid| self.vehicle_to_car.get(vid).copied())
-                .unwrap_or(group.car_id);
+                .filter_map(|vid| self.vehicle_to_car.get(vid).copied())
+                .collect();
+            previous_car_ids.sort();
+            previous_car_ids.dedup();
+
+            // Reuse the first previously-assigned car_id, or mint a new one.
+            let stable_car_id = previous_car_ids.first().copied().unwrap_or(group.car_id);
+
+            // Detect and handle merge events: when the fresh grouping
+            // consolidates vehicles from multiple old car_ids.
+            if previous_car_ids.len() > 1 {
+                for &discarded in &previous_car_ids[1..] {
+                    // Compute the inter-group Jaccard score between the kept
+                    // and discarded groups for the log message.
+                    let kept_members: std::collections::HashSet<Uuid> = group
+                        .members
+                        .iter()
+                        .filter(|vid| {
+                            self.vehicle_to_car.get(vid).copied() == Some(stable_car_id)
+                        })
+                        .copied()
+                        .collect();
+                    let discarded_members: std::collections::HashSet<Uuid> = group
+                        .members
+                        .iter()
+                        .filter(|vid| {
+                            self.vehicle_to_car.get(vid).copied() == Some(discarded)
+                        })
+                        .copied()
+                        .collect();
+                    let score =
+                        self.cooccurrence.inter_group_jaccard(&kept_members, &discarded_members);
+
+                    eprintln!(
+                        "info: CarGroup merge: car {} absorbed car {} (Jaccard score: {:.3})",
+                        stable_car_id, discarded, score
+                    );
+
+                    // Reassign all vehicles in the database from discarded → kept.
+                    self.db
+                        .reassign_vehicles_car_id(discarded, stable_car_id)?;
+                    // Remove the now-empty car record.
+                    self.db.delete_car(discarded)?;
+                }
+            }
 
             // Determine aggregate first/last seen for the car.
             let mut first = None::<DateTime<Utc>>;
@@ -2833,5 +2881,203 @@ mod tests {
                 "EezTire vehicle rtl433_id must remain 241"
             );
         }
+    }
+
+    #[test]
+    fn run_grouping_merges_cars_when_vehicles_cooccur() {
+        // Set up two vehicles that initially have separate car_ids,
+        // then simulate high co-occurrence so run_grouping merges them.
+        let mut resolver = in_memory_resolver();
+
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let car_a = Uuid::new_v4();
+        let car_b = Uuid::new_v4();
+
+        let now = Utc::now();
+
+        // Create car records first (before vehicles that reference them).
+        resolver
+            .db
+            .upsert_car(car_a, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+        resolver
+            .db
+            .upsert_car(car_b, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+
+        let track1 = VehicleTrack {
+            vehicle_id: v1,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_a),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+        let track2 = VehicleTrack {
+            vehicle_id: v2,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_b),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+
+        resolver.db.upsert_vehicle(&track1).unwrap();
+        resolver.db.upsert_vehicle(&track2).unwrap();
+        resolver.db.set_vehicle_car_id(v1, car_a).unwrap();
+        resolver.db.set_vehicle_car_id(v2, car_b).unwrap();
+
+        resolver.vehicles.insert(v1, track1);
+        resolver.vehicles.insert(v2, track2);
+        resolver.vehicle_to_car.insert(v1, car_a);
+        resolver.vehicle_to_car.insert(v2, car_b);
+
+        // Build co-occurrence: both appear together in 5/6 windows (≈83%).
+        // Keep within N_WINDOWS to avoid eviction.
+        for i in 0..6 {
+            resolver.cooccurrence.record(v1);
+            if i < 5 {
+                resolver.cooccurrence.record(v2);
+            }
+            resolver.cooccurrence.advance_window();
+        }
+
+        // Run grouping — should detect a merge event.
+        resolver.run_grouping().unwrap();
+
+        // Both vehicles must now share the same car_id.
+        let cid1 = resolver.vehicle_to_car[&v1];
+        let cid2 = resolver.vehicle_to_car[&v2];
+        assert_eq!(
+            cid1, cid2,
+            "vehicles with high co-occurrence should share a car_id after merge"
+        );
+
+        // The discarded car should be removed from the database.
+        let all_cars = resolver.db.all_car_ids().unwrap();
+        let remaining: Vec<&String> = all_cars
+            .iter()
+            .filter(|c| *c == &car_a.to_string() || *c == &car_b.to_string())
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only one of the two original car_ids should remain, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn run_grouping_does_not_merge_low_cooccurrence() {
+        // Two vehicles with low co-occurrence should remain in separate cars.
+        let mut resolver = in_memory_resolver();
+
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let car_a = Uuid::new_v4();
+        let car_b = Uuid::new_v4();
+
+        let now = Utc::now();
+
+        // Create car records first (before vehicles that reference them).
+        resolver
+            .db
+            .upsert_car(car_a, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+        resolver
+            .db
+            .upsert_car(car_b, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+
+        let track1 = VehicleTrack {
+            vehicle_id: v1,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_a),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+        let track2 = VehicleTrack {
+            vehicle_id: v2,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_b),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+
+        resolver.db.upsert_vehicle(&track1).unwrap();
+        resolver.db.upsert_vehicle(&track2).unwrap();
+        resolver.db.set_vehicle_car_id(v1, car_a).unwrap();
+        resolver.db.set_vehicle_car_id(v2, car_b).unwrap();
+
+        resolver.vehicles.insert(v1, track1);
+        resolver.vehicles.insert(v2, track2);
+        resolver.vehicle_to_car.insert(v1, car_a);
+        resolver.vehicle_to_car.insert(v2, car_b);
+
+        // Build co-occurrence: only 1 overlap in 5 windows, then b1 alone.
+        // Total 8 advances, within N_WINDOWS (no eviction).
+        for i in 0..5 {
+            resolver.cooccurrence.record(v1);
+            if i == 0 {
+                resolver.cooccurrence.record(v2);
+            }
+            resolver.cooccurrence.advance_window();
+        }
+        for _ in 0..3 {
+            resolver.cooccurrence.record(v2);
+            resolver.cooccurrence.advance_window();
+        }
+
+        resolver.run_grouping().unwrap();
+
+        // They should end up with different car_ids (not merged).
+        let cid1 = resolver.vehicle_to_car[&v1];
+        let cid2 = resolver.vehicle_to_car[&v2];
+        assert_ne!(
+            cid1, cid2,
+            "vehicles with low co-occurrence should NOT share a car_id"
+        );
     }
 }
