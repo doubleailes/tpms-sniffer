@@ -475,8 +475,7 @@ impl Resolver {
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
             .find(|v| {
                 let tolerance = v.vehicle_class.pressure_tolerance_kpa();
-                let pressure_ok =
-                    (v.pressure_signature[0] - pressure).abs() <= tolerance;
+                let pressure_ok = (v.pressure_signature[0] - pressure).abs() <= tolerance;
                 if !pressure_ok {
                     return false;
                 }
@@ -664,8 +663,7 @@ impl Resolver {
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
             .find(|v| {
                 let tolerance = v.vehicle_class.pressure_tolerance_kpa();
-                let pressure_ok =
-                    l1_per_wheel(&v.pressure_signature, &sig) < tolerance;
+                let pressure_ok = l1_per_wheel(&v.pressure_signature, &sig) < tolerance;
                 if !pressure_ok {
                     return false;
                 }

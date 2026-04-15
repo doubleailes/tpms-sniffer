@@ -158,10 +158,7 @@ mod tests {
 
     #[test]
     fn boundary_200_kpa_no_count() {
-        assert_eq!(
-            infer_vehicle_class(200.0, None),
-            VehicleClass::PassengerCar
-        );
+        assert_eq!(infer_vehicle_class(200.0, None), VehicleClass::PassengerCar);
     }
 
     #[test]
@@ -260,10 +257,7 @@ mod tests {
     #[test]
     fn hyundai_elantra_254_kpa_is_passenger_car() {
         // Hyundai Elantra at ~254 kPa classified as PassengerCar
-        assert_eq!(
-            infer_vehicle_class(254.0, None),
-            VehicleClass::PassengerCar
-        );
+        assert_eq!(infer_vehicle_class(254.0, None), VehicleClass::PassengerCar);
     }
 
     #[test]
