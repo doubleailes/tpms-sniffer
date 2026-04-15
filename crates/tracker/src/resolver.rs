@@ -2468,8 +2468,7 @@ mod tests {
         // exactly 1 distinct car_id value (after the initial `None` period
         // before enough windows accumulate).
         let (_resolver, car_ids) = collect_car_ids_for_repeated_sightings(10);
-        let assigned: std::collections::HashSet<Uuid> =
-            car_ids.iter().filter_map(|c| *c).collect();
+        let assigned: std::collections::HashSet<Uuid> = car_ids.iter().filter_map(|c| *c).collect();
         assert!(
             assigned.len() <= 1,
             "expected at most 1 distinct car_id, got {}: {:?}",
@@ -2512,9 +2511,10 @@ mod tests {
         {
             let db = Database::open(tmp.to_str().unwrap()).unwrap();
             let resolver = Resolver::new(db).unwrap();
-            let v = resolver.vehicles.get(&vehicle_id).expect(
-                "vehicle should be restored from DB",
-            );
+            let v = resolver
+                .vehicles
+                .get(&vehicle_id)
+                .expect("vehicle should be restored from DB");
             assert_eq!(
                 v.car_id, car_id_first_session,
                 "car_id must survive tracker restart"
