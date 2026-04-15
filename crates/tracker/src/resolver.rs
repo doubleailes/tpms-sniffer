@@ -2663,12 +2663,48 @@ mod tests {
 
         // Inject a mix of protocols and sentinel IDs.
         let packets = [
-            make_packet_at("2026-04-15 10:00:00.000", "0xFFFFFFFB", "TRW-OOK", 298, 62.8),
-            make_packet_at("2026-04-15 10:00:00.100", "0xFFFFFFFB", "TRW-OOK", 298, 62.9),
-            make_packet_at("2026-04-15 10:00:05.000", "0xFFFFFFF7", "AVE-TPMS", 208, 382.5),
-            make_packet_at("2026-04-15 10:00:05.100", "0xFFFFBFFF", "AVE-TPMS", 208, 382.5),
-            make_packet_at("2026-04-15 10:00:10.000", "0x1A2B3C4D", "TRW-OOK", 298, 63.0),
-            make_packet_at("2026-04-15 10:00:15.000", "0x1A2B3C4D", "TRW-OOK", 298, 63.1),
+            make_packet_at(
+                "2026-04-15 10:00:00.000",
+                "0xFFFFFFFB",
+                "TRW-OOK",
+                298,
+                62.8,
+            ),
+            make_packet_at(
+                "2026-04-15 10:00:00.100",
+                "0xFFFFFFFB",
+                "TRW-OOK",
+                298,
+                62.9,
+            ),
+            make_packet_at(
+                "2026-04-15 10:00:05.000",
+                "0xFFFFFFF7",
+                "AVE-TPMS",
+                208,
+                382.5,
+            ),
+            make_packet_at(
+                "2026-04-15 10:00:05.100",
+                "0xFFFFBFFF",
+                "AVE-TPMS",
+                208,
+                382.5,
+            ),
+            make_packet_at(
+                "2026-04-15 10:00:10.000",
+                "0x1A2B3C4D",
+                "TRW-OOK",
+                298,
+                63.0,
+            ),
+            make_packet_at(
+                "2026-04-15 10:00:15.000",
+                "0x1A2B3C4D",
+                "TRW-OOK",
+                298,
+                63.1,
+            ),
         ];
         for p in &packets {
             resolver.process(p).unwrap();
@@ -2700,10 +2736,7 @@ mod tests {
     fn sentinel_not_restored_to_fixed_map_from_db() {
         // Verify that near-sentinel fixed_sensor_ids persisted in a previous
         // session are not restored into fixed_map on restart.
-        let tmp = format!(
-            "/tmp/tpms_test_sentinel_restore_{}.sqlite",
-            Uuid::new_v4()
-        );
+        let tmp = format!("/tmp/tpms_test_sentinel_restore_{}.sqlite", Uuid::new_v4());
 
         // Session 1: force-persist a vehicle with a near-sentinel fixed_sensor_id.
         {
@@ -2711,7 +2744,13 @@ mod tests {
             let mut resolver = Resolver::new(db).unwrap();
 
             // Use a valid sensor ID to create a vehicle via the fixed-ID path.
-            let p = make_packet_at("2026-04-15 10:00:00.000", "0xFEFFFFFD", "TRW-OOK", 298, 63.0);
+            let p = make_packet_at(
+                "2026-04-15 10:00:00.000",
+                "0xFEFFFFFD",
+                "TRW-OOK",
+                298,
+                63.0,
+            );
             resolver.process(&p).unwrap();
             resolver.flush().unwrap();
         }
@@ -2733,10 +2772,7 @@ mod tests {
             let resolver = Resolver::new(db).unwrap();
 
             assert!(
-                !resolver
-                    .fixed_map
-                    .keys()
-                    .any(|(sid, _)| *sid == 0xFFFFFFFB),
+                !resolver.fixed_map.keys().any(|(sid, _)| *sid == 0xFFFFFFFB),
                 "near-sentinel 0xFFFFFFFB must not be restored into fixed_map from DB"
             );
         }
@@ -2792,7 +2828,10 @@ mod tests {
         // The EezTire vehicle must not have been modified by the other packet.
         if let Some(vid) = eez_vid {
             let v = &resolver.vehicles[&vid];
-            assert_eq!(v.rtl433_id, 241, "EezTire vehicle rtl433_id must remain 241");
+            assert_eq!(
+                v.rtl433_id, 241,
+                "EezTire vehicle rtl433_id must remain 241"
+            );
         }
     }
 }
