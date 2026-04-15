@@ -132,7 +132,7 @@ fn main() -> Result<()> {
     for line in stdin.lock().lines() {
         let line = line?;
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || !line.starts_with('{') {
             continue;
         }
 
