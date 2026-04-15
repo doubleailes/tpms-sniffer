@@ -294,7 +294,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
-                    tx_interval_median_ms, tx_interval_samples, car_id, wheel_position
+                    tx_interval_median_ms, tx_interval_samples, car_id, wheel_position,
+                    vehicle_class
              FROM vehicles WHERE sensor_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![sensor_id as i64])?;
@@ -310,7 +311,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
-                    tx_interval_median_ms, tx_interval_samples, car_id, wheel_position
+                    tx_interval_median_ms, tx_interval_samples, car_id, wheel_position,
+                    vehicle_class
              FROM vehicles ORDER BY last_seen DESC",
         )?;
         let vehicles = stmt
