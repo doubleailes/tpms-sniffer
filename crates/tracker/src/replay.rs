@@ -279,7 +279,7 @@ pub fn print_summary(result: &ReplayResult, errors: &[ConsistencyError]) {
         .filter(|e| matches!(e, ConsistencyError::ImplausiblePressure { .. }))
         .collect();
     if implausible.is_empty() {
-        eprintln!("PASS  all pressures in plausible range (15\u{2013}900 kPa)");
+        eprintln!("PASS  all pressures in plausible range (15-900 kPa)");
     } else {
         for e in &implausible {
             eprintln!("FAIL  {e}");
