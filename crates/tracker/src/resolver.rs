@@ -909,6 +909,21 @@ impl Resolver {
                     self.db.reassign_vehicles_car_id(discarded, stable_car_id)?;
                     // Remove the now-empty car record.
                     self.db.delete_car(discarded)?;
+
+                    // Remap ALL in-memory vehicle_to_car entries from
+                    // discarded → kept so that no vehicle is orphaned and so
+                    // that subsequent grouping passes do not re-trigger this
+                    // merge (idempotency).
+                    for car_id in self.vehicle_to_car.values_mut() {
+                        if *car_id == discarded {
+                            *car_id = stable_car_id;
+                        }
+                    }
+                    for v in self.vehicles.values_mut() {
+                        if v.car_id == Some(discarded) {
+                            v.car_id = Some(stable_car_id);
+                        }
+                    }
                 }
             }
 
@@ -3074,6 +3089,270 @@ mod tests {
         assert_ne!(
             cid1, cid2,
             "vehicles with low co-occurrence should NOT share a car_id"
+        );
+    }
+
+    #[test]
+    fn merge_updates_all_vehicle_to_car_entries() {
+        // Regression test for Bug B: a third vehicle assigned to the discarded
+        // car_id but NOT a member of the merged group must still have its
+        // vehicle_to_car entry remapped after the merge.
+        let mut resolver = in_memory_resolver();
+
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let v3 = Uuid::new_v4(); // third-party vehicle, same car as v2
+        let car_a = Uuid::new_v4();
+        let car_b = Uuid::new_v4();
+
+        let now = Utc::now();
+
+        resolver
+            .db
+            .upsert_car(car_a, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+        resolver
+            .db
+            .upsert_car(car_b, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+
+        let track1 = VehicleTrack {
+            vehicle_id: v1,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_a),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+        let track2 = VehicleTrack {
+            vehicle_id: v2,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_b),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+        // v3 also points to car_b but will NOT be part of the merged group
+        // (it has no co-occurrence data so it ends up in its own group).
+        let track3 = VehicleTrack {
+            vehicle_id: v3,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 1,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [90.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_b),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+
+        for track in [&track1, &track2, &track3] {
+            resolver.db.upsert_vehicle(track).unwrap();
+        }
+        resolver.db.set_vehicle_car_id(v1, car_a).unwrap();
+        resolver.db.set_vehicle_car_id(v2, car_b).unwrap();
+        resolver.db.set_vehicle_car_id(v3, car_b).unwrap();
+
+        resolver.vehicles.insert(v1, track1);
+        resolver.vehicles.insert(v2, track2);
+        resolver.vehicles.insert(v3, track3);
+        resolver.vehicle_to_car.insert(v1, car_a);
+        resolver.vehicle_to_car.insert(v2, car_b);
+        resolver.vehicle_to_car.insert(v3, car_b);
+
+        // v1 and v2 co-occur strongly; v3 does not co-occur with either.
+        for i in 0..6 {
+            resolver.cooccurrence.record(v1);
+            if i < 5 {
+                resolver.cooccurrence.record(v2);
+            }
+            resolver.cooccurrence.advance_window();
+        }
+
+        resolver.run_grouping().unwrap();
+
+        // v1 and v2 must share the same car_id after merge.
+        let cid1 = resolver.vehicle_to_car[&v1];
+        let cid2 = resolver.vehicle_to_car[&v2];
+        assert_eq!(cid1, cid2, "v1 and v2 must share a car_id after merge");
+
+        // Bug B check: v3 must also point to the surviving car_id even though
+        // it was not a member of the merged group.
+        let cid3 = resolver.vehicle_to_car[&v3];
+        assert_eq!(
+            cid3, cid1,
+            "v3 must be remapped to the surviving car_id, got {cid3} instead of {cid1}"
+        );
+
+        // The in-memory VehicleTrack.car_id must also be updated.
+        assert_eq!(
+            resolver.vehicles[&v3].car_id,
+            Some(cid1),
+            "VehicleTrack.car_id for v3 must be updated after merge"
+        );
+
+        // No vehicle in the DB should reference a non-existent car.
+        let all_cars = resolver.db.all_car_ids().unwrap();
+        let car_set: HashSet<String> = all_cars.into_iter().collect();
+        for v in resolver.vehicles.values() {
+            if let Some(cid) = v.car_id {
+                assert!(
+                    car_set.contains(&cid.to_string()),
+                    "vehicle {} points to car_id {} which does not exist in cars table",
+                    v.vehicle_id,
+                    cid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_is_idempotent_across_grouping_passes() {
+        // Regression test for Bug A: calling run_grouping twice must not
+        // re-trigger the merge for the same pair.
+        let mut resolver = in_memory_resolver();
+
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let car_a = Uuid::new_v4();
+        let car_b = Uuid::new_v4();
+
+        let now = Utc::now();
+
+        resolver
+            .db
+            .upsert_car(car_a, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+        resolver
+            .db
+            .upsert_car(car_b, &now.to_rfc3339(), &now.to_rfc3339(), 1, None)
+            .unwrap();
+
+        let track1 = VehicleTrack {
+            vehicle_id: v1,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_a),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+        let track2 = VehicleTrack {
+            vehicle_id: v2,
+            first_seen: now,
+            last_seen: now,
+            sighting_count: 5,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            make_model_hint: None,
+            battery_ok: true,
+            tx_intervals_ms: VecDeque::new(),
+            tx_interval_median_ms: None,
+            car_id: Some(car_b),
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class: VehicleClass::Unknown,
+        };
+
+        resolver.db.upsert_vehicle(&track1).unwrap();
+        resolver.db.upsert_vehicle(&track2).unwrap();
+        resolver.db.set_vehicle_car_id(v1, car_a).unwrap();
+        resolver.db.set_vehicle_car_id(v2, car_b).unwrap();
+
+        resolver.vehicles.insert(v1, track1);
+        resolver.vehicles.insert(v2, track2);
+        resolver.vehicle_to_car.insert(v1, car_a);
+        resolver.vehicle_to_car.insert(v2, car_b);
+
+        // High co-occurrence to trigger a merge.
+        for i in 0..6 {
+            resolver.cooccurrence.record(v1);
+            if i < 5 {
+                resolver.cooccurrence.record(v2);
+            }
+            resolver.cooccurrence.advance_window();
+        }
+
+        // First pass — triggers the merge.
+        resolver.run_grouping().unwrap();
+
+        let cid1_after_first = resolver.vehicle_to_car[&v1];
+        let cid2_after_first = resolver.vehicle_to_car[&v2];
+        assert_eq!(
+            cid1_after_first, cid2_after_first,
+            "vehicles must share a car_id after first merge"
+        );
+
+        let cars_after_first = resolver.db.all_car_ids().unwrap();
+
+        // Second pass — must NOT re-trigger the merge.
+        resolver.run_grouping().unwrap();
+
+        let cid1_after_second = resolver.vehicle_to_car[&v1];
+        let cid2_after_second = resolver.vehicle_to_car[&v2];
+        assert_eq!(
+            cid1_after_second, cid2_after_second,
+            "vehicles must still share a car_id after second pass"
+        );
+        assert_eq!(
+            cid1_after_first, cid1_after_second,
+            "car_id must be stable across grouping passes"
+        );
+
+        // The set of cars must be identical — no car was recreated or removed.
+        let cars_after_second = resolver.db.all_car_ids().unwrap();
+        assert_eq!(
+            cars_after_first, cars_after_second,
+            "car set must be stable across grouping passes (no duplicate merge)"
+        );
+
+        // Only one of the original car_ids should remain.
+        let remaining: Vec<&String> = cars_after_second
+            .iter()
+            .filter(|c| *c == &car_a.to_string() || *c == &car_b.to_string())
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only one of the two original car_ids should remain, got {remaining:?}"
         );
     }
 }
