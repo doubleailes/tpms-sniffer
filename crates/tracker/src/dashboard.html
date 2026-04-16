@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TPMS Tracker</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f1117;--surface:#181a20;--surface2:#1e2028;--border:#2a2d38;
+  --text:#e1e3ea;--text2:#8b8fa3;--accent:#3b82f6;--green:#22c55e;
+  --red:#ef4444;--orange:#f59e0b;--grey:#4b5563;
+  --radius:8px;--font:'Segoe UI',system-ui,-apple-system,sans-serif;
+}
+html{font-size:14px}
+body{background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.5;min-height:100vh}
+a{color:var(--accent);text-decoration:none}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;background:var(--surface);border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:12px}
+.header h1{font-size:1.25rem;font-weight:700;letter-spacing:-.02em}
+.live-badge{display:flex;align-items:center;gap:6px;font-size:.8rem;color:var(--text2);background:var(--surface2);padding:4px 10px;border-radius:20px}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--grey);display:inline-block;flex-shrink:0}
+.live-dot.on{background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.header-time{font-size:.85rem;color:var(--text2);font-variant-numeric:tabular-nums}
+
+/* Stats bar */
+.stats-bar{display:flex;gap:12px;padding:16px 24px;flex-wrap:wrap}
+.stat-card{flex:1;min-width:140px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;display:flex;flex-direction:column;gap:2px}
+.stat-card .label{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text2)}
+.stat-card .value{font-size:1.6rem;font-weight:700;font-variant-numeric:tabular-nums}
+
+/* Toolbar */
+.toolbar{display:flex;align-items:center;gap:10px;padding:12px 24px;flex-wrap:wrap}
+.filter-btn{background:var(--surface);border:1px solid var(--border);color:var(--text2);padding:6px 14px;border-radius:20px;cursor:pointer;font-size:.82rem;transition:all .15s}
+.filter-btn:hover{border-color:var(--accent);color:var(--text)}
+.filter-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.search-box{margin-left:auto;position:relative}
+.search-box input{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 12px 6px 32px;border-radius:var(--radius);font-size:.85rem;width:220px;outline:none;transition:border .15s}
+.search-box input:focus{border-color:var(--accent)}
+.search-box svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--text2)}
+
+/* Table */
+.table-wrap{padding:0 24px 24px}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+thead th{text-align:left;padding:10px 14px;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);background:var(--surface2);cursor:pointer;user-select:none;white-space:nowrap;border-bottom:1px solid var(--border)}
+thead th:hover{color:var(--text)}
+thead th .sort-arrow{margin-left:4px;font-size:.65rem;opacity:.5}
+thead th.sorted .sort-arrow{opacity:1;color:var(--accent)}
+tbody tr{transition:background .15s}
+tbody tr:hover{background:var(--surface2)}
+tbody tr.alarm-row{background:rgba(239,68,68,.08)}
+tbody tr.alarm-row:hover{background:rgba(239,68,68,.14)}
+tbody td{padding:10px 14px;border-bottom:1px solid var(--border);font-size:.88rem;white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+
+/* Status dot in table */
+.status-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.status-dot.active{background:var(--green);box-shadow:0 0 4px var(--green)}
+.status-dot.inactive{background:var(--grey)}
+
+/* Battery indicator */
+.batt-icon{display:inline-flex;align-items:center;gap:3px;color:var(--orange);font-size:.78rem;margin-left:6px}
+.batt-icon svg{width:14px;height:14px}
+
+/* Expandable detail panel */
+.detail-panel{display:none;background:var(--surface2);border-bottom:1px solid var(--border)}
+.detail-panel.open{display:table-row}
+.detail-inner{padding:16px 24px;display:flex;gap:32px;flex-wrap:wrap;align-items:flex-start}
+.detail-section{display:flex;flex-direction:column;gap:4px}
+.detail-section .dl{font-size:.82rem;color:var(--text2)}
+.detail-section .dv{font-size:.92rem;color:var(--text)}
+.sparkline-wrap{display:flex;flex-direction:column;gap:4px}
+.sparkline-wrap .dl{font-size:.82rem;color:var(--text2)}
+.sparkline-wrap svg{display:block}
+
+/* Empty state */
+.empty-state{text-align:center;padding:48px 24px;color:var(--text2)}
+.empty-state p{font-size:1rem}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header class="header">
+  <div class="header-left">
+    <h1>TPMS tracker</h1>
+    <span class="live-badge"><span id="liveDot" class="live-dot"></span><span id="liveText">live</span></span>
+  </div>
+  <span id="clock" class="header-time"></span>
+</header>
+
+<!-- Stats -->
+<div class="stats-bar">
+  <div class="stat-card"><span class="label">Vehicles</span><span id="statVehicles" class="value">—</span></div>
+  <div class="stat-card"><span class="label">Active</span><span id="statActive" class="value">—</span></div>
+  <div class="stat-card"><span class="label">Alarm</span><span id="statAlarm" class="value">—</span></div>
+  <div class="stat-card"><span class="label">Grouped</span><span id="statGrouped" class="value">—</span></div>
+</div>
+
+<!-- Toolbar -->
+<div class="toolbar">
+  <button class="filter-btn active" data-filter="all">All</button>
+  <button class="filter-btn" data-filter="active">Active</button>
+  <button class="filter-btn" data-filter="alarm">Alarm</button>
+  <button class="filter-btn" data-filter="grouped">Grouped</button>
+  <div class="search-box">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input id="searchInput" type="text" placeholder="Search vehicles…">
+  </div>
+</div>
+
+<!-- Table -->
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th style="width:36px"></th>
+        <th data-sort="vehicle_id">Vehicle <span class="sort-arrow">▲</span></th>
+        <th data-sort="protocol">Protocol <span class="sort-arrow">▲</span></th>
+        <th data-sort="pressure_kpa">kPa <span class="sort-arrow">▲</span></th>
+        <th data-sort="first_seen">First seen <span class="sort-arrow">▲</span></th>
+        <th data-sort="last_seen" class="sorted">Last seen <span class="sort-arrow">▼</span></th>
+      </tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+  <div id="emptyState" class="empty-state" style="display:none"><p>No vehicles found</p></div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---- State ---- */
+let vehicles = [];
+let stats = {};
+let sortCol = "last_seen";
+let sortAsc = false;
+let currentFilter = "all";
+let searchText = "";
+let expandedId = null;
+let detailCache = {};
+
+/* ---- DOM refs ---- */
+const $body = document.getElementById("tableBody");
+const $empty = document.getElementById("emptyState");
+const $clock = document.getElementById("clock");
+const $liveDot = document.getElementById("liveDot");
+const $statV = document.getElementById("statVehicles");
+const $statA = document.getElementById("statActive");
+const $statAl = document.getElementById("statAlarm");
+const $statG = document.getElementById("statGrouped");
+const $search = document.getElementById("searchInput");
+
+/* ---- Helpers ---- */
+function relTime(iso){
+  if(!iso) return "—";
+  const d = new Date(iso);
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if(s < 5) return "just now";
+  if(s < 60) return s + "s ago";
+  if(s < 3600) return Math.floor(s/60) + " min ago";
+  if(s < 86400) return Math.floor(s/3600) + "h ago";
+  return Math.floor(s/86400) + "d ago";
+}
+function absTime(iso){
+  if(!iso) return "";
+  return new Date(iso).toLocaleString();
+}
+// Active if last_seen within 5 minutes; supplements the backend `active` flag
+// which may lag behind real-time.
+function isActive(iso){
+  if(!iso) return false;
+  return (Date.now() - new Date(iso).getTime()) < 300000;
+}
+function isVehicleActive(v){ return v.active || isActive(v.last_seen); }
+function esc(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
+
+/* ---- Fetch ---- */
+async function fetchJSON(url){
+  try{ const r = await fetch(url); if(!r.ok) throw 0; return await r.json(); }
+  catch(e){ return null; }
+}
+
+async function refresh(){
+  const [s, c] = await Promise.all([fetchJSON("/api/stats"), fetchJSON("/api/cars")]);
+  if(s) updateStats(s);
+  if(c) { vehicles = c; renderTable(); }
+}
+
+function updateStats(s){
+  stats = s;
+  $statV.textContent = s.vehicle_count ?? "—";
+  $statA.textContent = s.active_count ?? "—";
+  $statAl.textContent = s.alarm_count ?? "—";
+  $statG.textContent = s.grouped_count ?? "—";
+  // live dot
+  if(s.last_packet_ts){
+    const ago = (Date.now() - new Date(s.last_packet_ts).getTime()) / 1000;
+    $liveDot.classList.toggle("on", ago < 10);
+  } else {
+    $liveDot.classList.remove("on");
+  }
+}
+
+/* ---- Filtering & sorting ---- */
+function filtered(){
+  let list = vehicles;
+  if(currentFilter === "active") list = list.filter(v => isVehicleActive(v));
+  else if(currentFilter === "alarm") list = list.filter(v => v.alarm);
+  else if(currentFilter === "grouped") list = list.filter(v => v.car_id);
+  if(searchText){
+    const q = searchText.toLowerCase();
+    list = list.filter(v =>
+      (v.vehicle_id||"").toLowerCase().includes(q) ||
+      (v.car_id||"").toLowerCase().includes(q) ||
+      (v.protocol||"").toLowerCase().includes(q)
+    );
+  }
+  list = [...list];
+  list.sort((a,b)=>{
+    let va = a[sortCol], vb = b[sortCol];
+    if(sortCol === "last_seen" || sortCol === "first_seen"){
+      va = va ? new Date(va).getTime() : 0;
+      vb = vb ? new Date(vb).getTime() : 0;
+    }
+    if(sortCol === "pressure_kpa"){ va = va ?? -1; vb = vb ?? -1; }
+    if(typeof va === "string") va = va.toLowerCase();
+    if(typeof vb === "string") vb = vb.toLowerCase();
+    if(va < vb) return sortAsc ? -1 : 1;
+    if(va > vb) return sortAsc ? 1 : -1;
+    return 0;
+  });
+  return list;
+}
+
+/* ---- Render ---- */
+function renderTable(){
+  const list = filtered();
+  if(list.length === 0){
+    $body.innerHTML = "";
+    $empty.style.display = "block";
+    return;
+  }
+  $empty.style.display = "none";
+  const existingIds = new Set();
+  const rows = $body.querySelectorAll("tr[data-vid]");
+  const rowMap = {};
+  rows.forEach(r => { rowMap[r.dataset.vid] = r; });
+
+  const newIds = new Set(list.map(v => v.vehicle_id));
+
+  // Remove rows no longer present
+  rows.forEach(r => {
+    if(!newIds.has(r.dataset.vid)){
+      // also remove its detail row if present
+      const next = r.nextElementSibling;
+      if(next && next.classList.contains("detail-panel")) next.remove();
+      r.remove();
+    }
+  });
+
+  // Build or update rows in order
+  let refNode = null;
+  for(let i = 0; i < list.length; i++){
+    const v = list[i];
+    const vid = v.vehicle_id;
+    let row = rowMap[vid];
+    if(row){
+      updateRow(row, v);
+      // Move to correct position if needed
+      const detailRow = row.nextElementSibling && row.nextElementSibling.classList.contains("detail-panel") ? row.nextElementSibling : null;
+      const expectedAfter = refNode ? (refNode.nextElementSibling && refNode.nextElementSibling.classList.contains("detail-panel") ? refNode.nextElementSibling : refNode) : null;
+      const actualPrev = row.previousElementSibling;
+      // Ensure ordering
+      if(expectedAfter){
+        if(expectedAfter.nextElementSibling !== row){
+          expectedAfter.after(row);
+          if(detailRow) row.after(detailRow);
+        }
+      } else if(i === 0 && $body.firstChild !== row){
+        $body.prepend(row);
+        if(detailRow) row.after(detailRow);
+      }
+    } else {
+      row = createRow(v);
+      const anchor = refNode ? (refNode.nextElementSibling && refNode.nextElementSibling.classList.contains("detail-panel") ? refNode.nextElementSibling : refNode) : null;
+      if(anchor) anchor.after(row);
+      else if($body.firstChild) $body.firstChild.before(row);
+      else $body.appendChild(row);
+    }
+    refNode = row;
+  }
+
+  // Update expanded detail if still open
+  if(expandedId){
+    const detailTd = document.getElementById("detail-" + expandedId);
+    if(detailTd && detailCache[expandedId]) renderDetail(detailTd, detailCache[expandedId]);
+  }
+}
+
+function createRow(v){
+  const tr = document.createElement("tr");
+  tr.dataset.vid = v.vehicle_id;
+  tr.addEventListener("click", () => toggleDetail(v));
+  updateRow(tr, v);
+  return tr;
+}
+
+function updateRow(tr, v){
+  const act = isVehicleActive(v);
+  tr.className = v.alarm ? "alarm-row" : "";
+  const battHtml = v.battery_ok === false
+    ? '<span class="batt-icon" title="Low battery"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="1" y="6" width="18" height="12" rx="2"/><line x1="23" y1="10" x2="23" y2="14"/><line x1="5" y1="10" x2="5" y2="14"/></svg></span>'
+    : '';
+  tr.innerHTML =
+    '<td><span class="status-dot '+(act?"active":"inactive")+'" title="'+(act?"Active":"Inactive")+'"></span></td>'+
+    '<td>'+esc(v.vehicle_id||"—")+battHtml+'</td>'+
+    '<td>'+esc(v.protocol||"—")+'</td>'+
+    '<td>'+(v.pressure_kpa != null ? v.pressure_kpa.toFixed(1) : "—")+'</td>'+
+    '<td title="'+absTime(v.first_seen)+'">'+relTime(v.first_seen)+'</td>'+
+    '<td title="'+absTime(v.last_seen)+'">'+relTime(v.last_seen)+'</td>';
+}
+
+/* ---- Detail panel ---- */
+async function toggleDetail(v){
+  const vid = v.vehicle_id;
+  // Close existing
+  const existing = document.querySelector(".detail-panel.open");
+  if(existing){
+    const prevId = existing.dataset.vid;
+    existing.classList.remove("open");
+    existing.style.display = "none";
+    if(prevId === vid){ expandedId = null; return; }
+  }
+  expandedId = vid;
+
+  // Find or create detail row
+  const mainRow = $body.querySelector('tr[data-vid="'+vid+'"]');
+  if(!mainRow) return;
+  let detailRow = mainRow.nextElementSibling;
+  if(!detailRow || !detailRow.classList.contains("detail-panel")){
+    detailRow = document.createElement("tr");
+    detailRow.classList.add("detail-panel");
+    detailRow.dataset.vid = vid;
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.id = "detail-" + vid;
+    td.innerHTML = '<div class="detail-inner" style="color:var(--text2)">Loading…</div>';
+    detailRow.appendChild(td);
+    mainRow.after(detailRow);
+  }
+  detailRow.classList.add("open");
+  detailRow.style.display = "table-row";
+
+  // Fetch car detail
+  if(v.car_id){
+    const data = await fetchJSON("/api/cars/" + encodeURIComponent(v.car_id));
+    if(data){ detailCache[vid] = data; renderDetail(detailRow.querySelector("td"), data); }
+    else { detailRow.querySelector("td").innerHTML = '<div class="detail-inner" style="color:var(--text2)">No group detail available</div>'; }
+  } else {
+    detailRow.querySelector("td").innerHTML = '<div class="detail-inner">'+
+      '<div class="detail-section"><span class="dl">Vehicle ID</span><span class="dv">'+esc(v.vehicle_id)+'</span></div>'+
+      '<div class="detail-section"><span class="dl">Protocol</span><span class="dv">'+esc(v.protocol||"—")+'</span></div>'+
+      '<div class="detail-section"><span class="dl">Sightings</span><span class="dv">'+(v.sighting_count||0)+'</span></div>'+
+      '<div class="detail-section"><span class="dl">TX Interval</span><span class="dv">'+(v.tx_interval_median_ms ? (v.tx_interval_median_ms/1000).toFixed(1)+"s" : "—")+'</span></div>'+
+      '</div>';
+  }
+}
+
+function renderDetail(td, data){
+  const members = (data.members||[]).map(m => esc(m)).join(", ") || "—";
+  const sightings = data.sightings || [];
+  const sensorIds = [...new Set(sightings.map(s => s.sensor_id).filter(Boolean))];
+  const sparkSvg = buildSparkline(sightings);
+
+  td.innerHTML =
+    '<div class="detail-inner">'+
+      '<div class="detail-section"><span class="dl">Car Group</span><span class="dv">'+esc(data.car_id||"—")+'</span></div>'+
+      '<div class="detail-section"><span class="dl">Members</span><span class="dv">'+members+'</span></div>'+
+      '<div class="detail-section"><span class="dl">Sensor IDs</span><span class="dv">'+(sensorIds.length ? sensorIds.map(s=>esc(s)).join(", ") : "—")+'</span></div>'+
+      '<div class="detail-section"><span class="dl">Sightings</span><span class="dv">'+sightings.length+'</span></div>'+
+      '<div class="detail-section"><span class="dl">Class</span><span class="dv">'+esc(data.vehicle_class||"—")+'</span></div>'+
+      '<div class="sparkline-wrap"><span class="dl">Pressure History</span>'+sparkSvg+'</div>'+
+    '</div>';
+}
+
+function buildSparkline(sightings){
+  const W = 120, H = 30, PAD = 2;
+  if(!sightings || sightings.length < 2) return '<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'"><text x="50%" y="50%" text-anchor="middle" fill="#8b8fa3" font-size="10">No data</text></svg>';
+  const MAX_SPARKLINE_POINTS = 30;
+  const pts = sightings.filter(s => s.pressure_kpa != null).slice(-MAX_SPARKLINE_POINTS);
+  if(pts.length < 2) return '<svg width="'+W+'" height="'+H+'"><text x="50%" y="50%" text-anchor="middle" fill="#8b8fa3" font-size="10">No data</text></svg>';
+  const vals = pts.map(p => p.pressure_kpa);
+  const mn = Math.min(...vals), mx = Math.max(...vals);
+  const range = mx - mn || 1;
+  const points = vals.map((v,i) => {
+    const x = PAD + (i/(vals.length-1)) * (W - 2*PAD);
+    const y = PAD + (1 - (v - mn)/range) * (H - 2*PAD);
+    return x.toFixed(1)+","+y.toFixed(1);
+  });
+  const alarmPts = pts.reduce((acc, p, i) => {
+    if(p.alarm){
+      const x = PAD + (i/(vals.length-1)) * (W - 2*PAD);
+      const y = PAD + (1 - (p.pressure_kpa - mn)/range) * (H - 2*PAD);
+      acc.push({x,y});
+    }
+    return acc;
+  }, []);
+  let svg = '<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'">';
+  svg += '<polyline points="'+points.join(" ")+'" fill="none" stroke="#3b82f6" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>';
+  alarmPts.forEach(p => { svg += '<circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="2.5" fill="#ef4444"/>'; });
+  svg += '</svg>';
+  return svg;
+}
+
+/* ---- Clock ---- */
+function tickClock(){
+  const now = new Date();
+  $clock.textContent = now.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"});
+}
+
+/* ---- Sort ---- */
+document.querySelectorAll("thead th[data-sort]").forEach(th => {
+  th.addEventListener("click", () => {
+    const col = th.dataset.sort;
+    if(sortCol === col) sortAsc = !sortAsc;
+    else { sortCol = col; sortAsc = col === "pressure_kpa"; }
+    document.querySelectorAll("thead th").forEach(h => {
+      h.classList.remove("sorted");
+      const arrow = h.querySelector(".sort-arrow");
+      if(arrow) arrow.textContent = "▲";
+    });
+    th.classList.add("sorted");
+    th.querySelector(".sort-arrow").textContent = sortAsc ? "▲" : "▼";
+    renderTable();
+  });
+});
+
+/* ---- Filters ---- */
+document.querySelectorAll(".filter-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentFilter = btn.dataset.filter;
+    syncURL();
+    renderTable();
+  });
+});
+
+$search.addEventListener("input", () => {
+  searchText = $search.value.trim();
+  syncURL();
+  renderTable();
+});
+
+/* ---- URL params ---- */
+function readURL(){
+  const p = new URLSearchParams(window.location.search);
+  const f = p.get("filter");
+  if(f && ["active","alarm","grouped"].includes(f)){
+    currentFilter = f;
+    document.querySelectorAll(".filter-btn").forEach(b => {
+      b.classList.toggle("active", b.dataset.filter === f);
+    });
+  }
+  const q = p.get("q");
+  if(q){ searchText = q; $search.value = q; }
+}
+
+function syncURL(){
+  const p = new URLSearchParams();
+  if(currentFilter !== "all") p.set("filter", currentFilter);
+  if(searchText) p.set("q", searchText);
+  const qs = p.toString();
+  const url = window.location.pathname + (qs ? "?" + qs : "");
+  history.replaceState(null, "", url);
+}
+
+/* ---- Init ---- */
+readURL();
+tickClock();
+setInterval(tickClock, 1000);
+refresh();
+setInterval(refresh, 3000);
+
+// Re-render relative times every 15s
+setInterval(() => { renderTable(); }, 15000);
+
+})();
+</script>
+</body>
+</html>
