@@ -8,7 +8,7 @@ pub mod server;
 
 use std::collections::{HashMap, VecDeque};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -78,11 +78,13 @@ impl TpmsPacket {
     }
 
     /// Parse the timestamp string to `DateTime<Utc>`.
-    /// The sniffer emits local time without a timezone offset; we treat it as UTC.
+    /// The sniffer emits local time without a timezone offset; interpret it
+    /// using the host's local timezone and convert to UTC.
     pub fn parsed_ts(&self) -> Option<DateTime<Utc>> {
         NaiveDateTime::parse_from_str(&self.timestamp, "%Y-%m-%d %H:%M:%S%.3f")
             .ok()
-            .map(|ndt| ndt.and_utc())
+            .and_then(|ndt| Local.from_local_datetime(&ndt).single())
+            .map(|dt| dt.with_timezone(&Utc))
     }
 }
 
