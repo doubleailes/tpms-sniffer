@@ -4,7 +4,7 @@ use std::process;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tpms_tracker::{TpmsPacket, analytics, db::Database, replay, resolver::Resolver};
+use tpms_tracker::{TpmsPacket, analytics, db::Database, replay, resolver::Resolver, server};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +43,10 @@ struct Args {
     /// After replay, run consistency assertions and exit non-zero on failure.
     #[arg(long)]
     assert_consistency: bool,
+
+    /// Start HTTP dashboard server on this address (e.g. 0.0.0.0:8080)
+    #[arg(long, value_name = "ADDR")]
+    serve: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -124,9 +128,73 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Default: stdin processing mode.
+    // Default: stdin processing mode (with optional web server).
     let db = Database::open(&args.db)?;
-    let mut resolver = Resolver::with_receiver_id(db, args.receiver_id.clone())?;
+
+    // If --serve is given, use a tokio runtime so we can spawn the server.
+    if let Some(ref addr) = args.serve {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(run_with_server(db, &args, addr))
+    } else {
+        run_stdin(db, &args)
+    }
+}
+
+/// Run the stdin ingestion loop alongside the HTTP dashboard server.
+async fn run_with_server(db: Database, args: &Args, addr: &str) -> Result<()> {
+    let db_path = args.db.clone();
+    let addr_owned = addr.to_string();
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server::serve(&db_path, &addr_owned).await {
+            eprintln!("server error: {e}");
+        }
+    });
+
+    // Run the blocking stdin loop on a blocking thread so we don't starve
+    // the tokio runtime.
+    let verbose = args.verbose;
+    let confidence = args.confidence;
+    let export_jaccard = args.export_jaccard.clone();
+    let receiver_id = args.receiver_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        run_stdin_inner(
+            db,
+            verbose,
+            confidence,
+            &receiver_id,
+            export_jaccard.as_deref(),
+        )
+    })
+    .await??;
+
+    // Stdin has ended but the server should keep running. Wait for it.
+    eprintln!("stdin closed — dashboard server still running");
+    server_handle.await?;
+
+    Ok(())
+}
+
+/// Stdin ingestion without a tokio runtime.
+fn run_stdin(db: Database, args: &Args) -> Result<()> {
+    run_stdin_inner(
+        db,
+        args.verbose,
+        args.confidence,
+        &args.receiver_id,
+        args.export_jaccard.as_deref(),
+    )
+}
+
+/// Core stdin processing loop shared by sync and async paths.
+fn run_stdin_inner(
+    db: Database,
+    verbose: bool,
+    confidence: u8,
+    receiver_id: &str,
+    export_jaccard: Option<&str>,
+) -> Result<()> {
+    let mut resolver = Resolver::with_receiver_id(db, receiver_id.to_string())?;
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -144,12 +212,12 @@ fn main() -> Result<()> {
             }
         };
 
-        if packet.confidence < args.confidence {
+        if packet.confidence < confidence {
             continue;
         }
 
         match resolver.process(&packet) {
-            Ok(Some(vid)) if args.verbose => {
+            Ok(Some(vid)) if verbose => {
                 let car_id = resolver
                     .vehicles()
                     .get(&vid)
@@ -174,7 +242,7 @@ fn main() -> Result<()> {
     resolver.flush()?;
 
     // Export Jaccard matrix if requested.
-    if let Some(ref path) = args.export_jaccard {
+    if let Some(path) = export_jaccard {
         let export = resolver.cooccurrence_matrix().export();
         let json = serde_json::to_string_pretty(&export)?;
         std::fs::write(path, json)?;
