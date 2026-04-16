@@ -877,6 +877,7 @@ impl Database {
         );
 
         let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         match filter {
             Some("active") => {
@@ -905,11 +906,12 @@ impl Database {
 
         if let Some(q) = search {
             if !q.is_empty() {
+                let like_pattern = format!("%{}%", q.to_lowercase());
+                let idx = params.len() + 1;
                 conditions.push(format!(
-                    "(LOWER(v.protocol) LIKE '%{}%' OR LOWER(COALESCE(v.car_id,'')) LIKE '%{}%')",
-                    q.to_lowercase().replace('\'', "''"),
-                    q.to_lowercase().replace('\'', "''")
+                    "(LOWER(v.protocol) LIKE ?{idx} OR LOWER(COALESCE(v.car_id,'')) LIKE ?{idx})"
                 ));
+                params.push(Box::new(like_pattern));
             }
         }
 
@@ -920,9 +922,10 @@ impl Database {
 
         sql.push_str(" ORDER BY v.last_seen DESC");
 
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| &**p).collect();
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 let vehicle_id: String = row.get(0)?;
                 let car_id: Option<String> = row.get(1)?;
                 let protocol: String = row.get(2)?;
