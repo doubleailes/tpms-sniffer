@@ -4,6 +4,7 @@ pub mod db;
 pub mod jaccard;
 pub mod replay;
 pub mod resolver;
+pub mod server;
 
 use std::collections::{HashMap, VecDeque};
 

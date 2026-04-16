@@ -807,6 +807,256 @@ impl Database {
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
+
+    // -----------------------------------------------------------------------
+    // Web API helpers
+    // -----------------------------------------------------------------------
+
+    /// Aggregate stats for the dashboard `/api/stats` endpoint.
+    pub fn api_stats(&self) -> Result<crate::server::ApiStats> {
+        let vehicle_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM vehicles", [], |r| r.get(0))?;
+        let car_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cars", [], |r| r.get(0))?;
+        let active_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vehicles WHERE last_seen >= datetime('now', '-5 minutes')",
+            [],
+            |r| r.get(0),
+        )?;
+        let alarm_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sightings s \
+             INNER JOIN ( \
+                 SELECT vehicle_id, MAX(id) AS max_id FROM sightings GROUP BY vehicle_id \
+             ) latest ON s.id = latest.max_id \
+             WHERE s.alarm = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let grouped_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vehicles WHERE car_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let pending_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vehicles WHERE car_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let last_packet_ts: Option<String> = self
+            .conn
+            .query_row("SELECT MAX(last_seen) FROM vehicles", [], |r| r.get(0))
+            .ok()
+            .flatten();
+
+        Ok(crate::server::ApiStats {
+            vehicle_count,
+            car_count,
+            active_count,
+            alarm_count,
+            grouped_count,
+            pending_count,
+            last_packet_ts,
+        })
+    }
+
+    /// Vehicle list for `/api/cars` with optional filter and search.
+    pub fn api_vehicles(
+        &self,
+        filter: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Vec<crate::server::VehicleRow>> {
+        // Build the query dynamically based on filter/search.
+        let mut sql = String::from(
+            "SELECT v.vehicle_id, v.car_id, v.protocol, v.rtl433_id, \
+                    v.vehicle_class, v.last_seen, v.first_seen, v.sighting_count, \
+                    v.tx_interval_median_ms, v.pressure_sig, \
+                    CASE WHEN v.last_seen >= datetime('now', '-5 minutes') THEN 1 ELSE 0 END AS active \
+             FROM vehicles v",
+        );
+
+        let mut conditions: Vec<String> = Vec::new();
+
+        match filter {
+            Some("active") => {
+                conditions.push("v.last_seen >= datetime('now', '-5 minutes')".to_string());
+            }
+            Some("alarm") => {
+                // Join to latest sighting to check alarm status.
+                sql = String::from(
+                    "SELECT v.vehicle_id, v.car_id, v.protocol, v.rtl433_id, \
+                            v.vehicle_class, v.last_seen, v.first_seen, v.sighting_count, \
+                            v.tx_interval_median_ms, v.pressure_sig, \
+                            CASE WHEN v.last_seen >= datetime('now', '-5 minutes') THEN 1 ELSE 0 END AS active \
+                     FROM vehicles v \
+                     INNER JOIN ( \
+                         SELECT vehicle_id, MAX(id) AS max_id FROM sightings GROUP BY vehicle_id \
+                     ) latest ON v.vehicle_id = latest.vehicle_id \
+                     INNER JOIN sightings s ON s.id = latest.max_id",
+                );
+                conditions.push("s.alarm = 1".to_string());
+            }
+            Some("grouped") => {
+                conditions.push("v.car_id IS NOT NULL".to_string());
+            }
+            _ => {}
+        }
+
+        if let Some(q) = search {
+            if !q.is_empty() {
+                conditions.push(format!(
+                    "(LOWER(v.protocol) LIKE '%{}%' OR LOWER(COALESCE(v.car_id,'')) LIKE '%{}%')",
+                    q.to_lowercase().replace('\'', "''"),
+                    q.to_lowercase().replace('\'', "''")
+                ));
+            }
+        }
+
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        sql.push_str(" ORDER BY v.last_seen DESC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let vehicle_id: String = row.get(0)?;
+                let car_id: Option<String> = row.get(1)?;
+                let protocol: String = row.get(2)?;
+                let rtl433_id: i64 = row.get(3)?;
+                let vehicle_class: Option<String> = row.get(4)?;
+                let last_seen: String = row.get(5)?;
+                let first_seen: String = row.get(6)?;
+                let sighting_count: i64 = row.get(7)?;
+                let tx_interval_median_ms: Option<i64> = row.get(8)?;
+                let pressure_sig_s: String = row.get(9)?;
+                let active: i64 = row.get(10)?;
+
+                // Extract first non-zero pressure from signature.
+                let sig: [f64; 4] = serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
+                let pressure_kpa = sig.iter().find(|&&p| p > 0.0).copied().unwrap_or(0.0);
+
+                // Look up alarm and battery from latest sighting — done in Rust
+                // to keep the SQL simpler for all filter paths.
+                Ok(crate::server::VehicleRow {
+                    vehicle_id,
+                    car_id,
+                    protocol,
+                    rtl433_id,
+                    vehicle_class: vehicle_class.unwrap_or_else(|| "Unknown".to_string()),
+                    pressure_kpa,
+                    alarm: false,     // patched below
+                    battery_ok: true, // patched below
+                    first_seen,
+                    last_seen,
+                    sighting_count,
+                    tx_interval_median_ms,
+                    active: active != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Patch alarm / battery from latest sighting per vehicle.
+        let mut result = rows;
+        for v in &mut result {
+            if let Ok(Some((alarm, battery))) = self.latest_alarm_battery(&v.vehicle_id) {
+                v.alarm = alarm;
+                v.battery_ok = battery;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Fetch alarm and battery_ok from the most recent sighting for a vehicle.
+    fn latest_alarm_battery(&self, vehicle_id: &str) -> Result<Option<(bool, bool)>> {
+        let result = self.conn.query_row(
+            "SELECT alarm, battery_ok FROM sightings WHERE vehicle_id = ?1 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![vehicle_id],
+            |row| {
+                let alarm: i64 = row.get(0)?;
+                let battery: i64 = row.get(1)?;
+                Ok((alarm != 0, battery != 0))
+            },
+        );
+        match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Car detail for `/api/cars/:car_id` including last 50 sightings.
+    pub fn api_car_detail(&self, car_id: &str) -> Result<Option<crate::server::CarDetailResponse>> {
+        // Fetch car metadata.
+        let meta: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT first_seen, last_seen FROM cars WHERE car_id = ?1",
+                rusqlite::params![car_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if meta.is_none() {
+            return Ok(None);
+        }
+        let (first_seen, last_seen) = meta.unwrap();
+
+        // Member vehicles.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT vehicle_id, vehicle_class FROM vehicles WHERE car_id = ?1")?;
+        let members: Vec<String> = stmt
+            .query_map(rusqlite::params![car_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let vehicle_class: Option<String> = {
+            let mut cls_stmt = self
+                .conn
+                .prepare("SELECT vehicle_class FROM vehicles WHERE car_id = ?1 LIMIT 1")?;
+            cls_stmt
+                .query_row(rusqlite::params![car_id], |row| row.get(0))
+                .ok()
+        };
+
+        // Last 50 sightings across all member vehicles.
+        let mut sight_stmt = self.conn.prepare(
+            "SELECT s.ts, s.pressure_kpa, s.alarm, s.sensor_id, s.receiver_id \
+             FROM sightings s \
+             INNER JOIN vehicles v ON s.vehicle_id = v.vehicle_id \
+             WHERE v.car_id = ?1 \
+             ORDER BY s.ts DESC \
+             LIMIT 50",
+        )?;
+        let sightings = sight_stmt
+            .query_map(rusqlite::params![car_id], |row| {
+                let ts: String = row.get(0)?;
+                let pressure_kpa: f64 = row.get(1)?;
+                let alarm_i: i64 = row.get(2)?;
+                let sensor_id_i: i64 = row.get(3)?;
+                let receiver_id: String = row.get(4)?;
+                Ok(crate::server::SightingRow {
+                    ts,
+                    pressure_kpa,
+                    alarm: alarm_i != 0,
+                    sensor_id: format!("0x{:08X}", sensor_id_i),
+                    receiver_id,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(Some(crate::server::CarDetailResponse {
+            car_id: car_id.to_string(),
+            first_seen: Some(first_seen),
+            last_seen: Some(last_seen),
+            vehicle_class,
+            members,
+            sightings,
+        }))
+    }
 }
 
 fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
