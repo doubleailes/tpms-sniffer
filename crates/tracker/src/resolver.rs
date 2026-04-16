@@ -887,21 +887,18 @@ impl Resolver {
                     let kept_members: std::collections::HashSet<Uuid> = group
                         .members
                         .iter()
-                        .filter(|vid| {
-                            self.vehicle_to_car.get(vid).copied() == Some(stable_car_id)
-                        })
+                        .filter(|vid| self.vehicle_to_car.get(vid).copied() == Some(stable_car_id))
                         .copied()
                         .collect();
                     let discarded_members: std::collections::HashSet<Uuid> = group
                         .members
                         .iter()
-                        .filter(|vid| {
-                            self.vehicle_to_car.get(vid).copied() == Some(discarded)
-                        })
+                        .filter(|vid| self.vehicle_to_car.get(vid).copied() == Some(discarded))
                         .copied()
                         .collect();
-                    let score =
-                        self.cooccurrence.inter_group_jaccard(&kept_members, &discarded_members);
+                    let score = self
+                        .cooccurrence
+                        .inter_group_jaccard(&kept_members, &discarded_members);
 
                     eprintln!(
                         "info: CarGroup merge: car {} absorbed car {} (Jaccard score: {:.3})",
@@ -909,8 +906,7 @@ impl Resolver {
                     );
 
                     // Reassign all vehicles in the database from discarded → kept.
-                    self.db
-                        .reassign_vehicles_car_id(discarded, stable_car_id)?;
+                    self.db.reassign_vehicles_car_id(discarded, stable_car_id)?;
                     // Remove the now-empty car record.
                     self.db.delete_car(discarded)?;
                 }
