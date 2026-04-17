@@ -3650,4 +3650,169 @@ mod tests {
             "pressure_median_kpa must be near 51.1"
         );
     }
+
+    #[test]
+    fn fingerprint_three_sessions_three_vehicles_one_fingerprint() {
+        // Acceptance criterion: same sensor across 3 simulated sessions → 3
+        // vehicle UUIDs, 1 fingerprint, session_count=3.
+        let mut resolver = in_memory_resolver();
+
+        // Session 1: 6 sightings to establish the fingerprint.
+        for i in 0..6 {
+            let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+        let vids: Vec<Uuid> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .map(|v| v.vehicle_id)
+            .collect();
+        assert_eq!(vids.len(), 1);
+        let vid1 = vids[0];
+
+        // Session 2: after VEHICLE_EXPIRY (>480s gap).
+        for i in 0..3 {
+            let ts = format!("2025-06-01 12:09:{:02}.000", i * 10);
+            let p = make_packet_at(&ts, "0xBFFFFFFF", "EezTire", 241, 51.0);
+            resolver.process(&p).unwrap();
+        }
+        let vid2_candidates: Vec<Uuid> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire" && v.vehicle_id != vid1)
+            .map(|v| v.vehicle_id)
+            .collect();
+        assert_eq!(vid2_candidates.len(), 1);
+        let vid2 = vid2_candidates[0];
+
+        // Session 3: another >480s gap.
+        for i in 0..3 {
+            let ts = format!("2025-06-01 12:18:{:02}.000", i * 10);
+            let p = make_packet_at(&ts, "0xDFFFFFFF", "EezTire", 241, 51.2);
+            resolver.process(&p).unwrap();
+        }
+        let vid3_candidates: Vec<Uuid> = resolver
+            .vehicles
+            .values()
+            .filter(|v| {
+                v.protocol == "EezTire" && v.vehicle_id != vid1 && v.vehicle_id != vid2
+            })
+            .map(|v| v.vehicle_id)
+            .collect();
+        assert_eq!(vid3_candidates.len(), 1);
+        let vid3 = vid3_candidates[0];
+
+        // All 3 vehicle UUIDs must be different.
+        assert_ne!(vid1, vid2);
+        assert_ne!(vid2, vid3);
+        assert_ne!(vid1, vid3);
+
+        // All 3 must share the same fingerprint_id.
+        let fp1 = resolver.vehicles[&vid1]
+            .fingerprint_id
+            .clone()
+            .expect("vid1 must have fingerprint");
+        let fp2 = resolver.vehicles[&vid2]
+            .fingerprint_id
+            .clone()
+            .expect("vid2 must have fingerprint");
+        let fp3 = resolver.vehicles[&vid3]
+            .fingerprint_id
+            .clone()
+            .expect("vid3 must have fingerprint");
+        assert_eq!(fp1, fp2);
+        assert_eq!(fp2, fp3);
+
+        // Database must have 1 fingerprint with session_count=3.
+        let fps = resolver.db.api_fingerprints().unwrap();
+        assert_eq!(fps.len(), 1, "one fingerprint for the same sensor");
+        assert_eq!(fps[0].session_count, 3);
+        assert_eq!(fps[0].vehicle_ids.len(), 3);
+    }
+
+    #[test]
+    fn two_sensors_same_pressure_different_tx_interval_two_fingerprints() {
+        // Acceptance criterion: two sensors at the same pressure but different
+        // TX intervals produce 2 fingerprints once both have enough samples.
+        let mut resolver = in_memory_resolver();
+
+        // Sensor A: ~51 kPa, ~10s intervals.
+        for i in 0..8 {
+            let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+
+        // After expiry, sensor B: ~51 kPa but ~50s intervals.
+        for i in 0..8 {
+            let ts = format!("2025-06-01 12:09:{:02}.000", i * 50);
+            let p = make_packet_at(&ts, "0xBFFFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+
+        let eez_vehicles: Vec<&VehicleTrack> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .collect();
+
+        // Both sensors should have fingerprints.
+        let fp_ids: HashSet<String> = eez_vehicles
+            .iter()
+            .filter_map(|v| v.fingerprint_id.clone())
+            .collect();
+
+        // The test verifies at least 2 fingerprints exist — the tx interval
+        // differentiation prevents the second sensor from matching the first
+        // once both have accumulated enough interval samples.
+        assert!(
+            fp_ids.len() >= 2,
+            "two sensors at the same pressure but different TX intervals \
+             should produce separate fingerprints, got {} fingerprint(s)",
+            fp_ids.len()
+        );
+    }
+
+    #[test]
+    fn min_sightings_guard_prevents_premature_matching() {
+        // A fingerprint with fewer than FINGERPRINT_MIN_SIGHTINGS should not
+        // be used as a match candidate.
+        let mut resolver = in_memory_resolver();
+
+        // Create a vehicle with only 2 sightings (below threshold).
+        for i in 0..2 {
+            let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+        let vid1 = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .map(|v| v.vehicle_id)
+            .unwrap();
+
+        // After expiry, a new packet at the same pressure should NOT match
+        // the immature fingerprint.
+        let p_late = make_packet_at(
+            "2025-06-01 12:09:00.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let vid2 = resolver.process(&p_late).unwrap().unwrap();
+        assert_ne!(vid1, vid2, "new vehicle UUID after expiry");
+
+        // The two vehicles should have different fingerprints because the
+        // first had too few sightings to be a match candidate.
+        let fp1 = resolver.vehicles[&vid1].fingerprint_id.clone().unwrap();
+        let fp2 = resolver.vehicles[&vid2].fingerprint_id.clone().unwrap();
+        assert_ne!(
+            fp1, fp2,
+            "immature fingerprint must not be matched"
+        );
+    }
 }
