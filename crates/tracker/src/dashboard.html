@@ -115,6 +115,7 @@ tbody tr:last-child td{border-bottom:none}
   <button class="filter-btn" data-filter="active">Active</button>
   <button class="filter-btn" data-filter="alarm">Alarm</button>
   <button class="filter-btn" data-filter="grouped">Grouped</button>
+  <button class="filter-btn" data-filter="fingerprints">Fingerprints</button>
   <div class="search-box">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
     <input id="searchInput" type="text" placeholder="Search vehicles…">
@@ -147,6 +148,7 @@ tbody tr:last-child td{border-bottom:none}
 
 /* ---- State ---- */
 let vehicles = [];
+let fingerprints = [];
 let stats = {};
 let sortCol = "last_seen";
 let sortAsc = false;
@@ -235,6 +237,7 @@ function filtered(){
   if(currentFilter === "active") list = list.filter(v => isVehicleActive(v));
   else if(currentFilter === "alarm") list = list.filter(v => v.alarm);
   else if(currentFilter === "grouped") list = list.filter(v => v.car_id);
+  else if(currentFilter === "fingerprints") return []; // handled separately
   if(searchText){
     const q = searchText.toLowerCase();
     list = list.filter(v =>
@@ -262,6 +265,10 @@ function filtered(){
 
 /* ---- Render ---- */
 function renderTable(){
+  if(currentFilter === "fingerprints"){
+    renderFingerprints();
+    return;
+  }
   const list = filtered();
   if(list.length === 0){
     $body.innerHTML = "";
@@ -442,6 +449,30 @@ function buildSparkline(sightings){
   return svg;
 }
 
+/* ---- Fingerprints tab ---- */
+async function renderFingerprints(){
+  const data = await fetchJSON("/api/fingerprints");
+  if(!data){ $body.innerHTML=""; $empty.style.display="block"; return; }
+  fingerprints = data;
+  if(fingerprints.length === 0){ $body.innerHTML=""; $empty.style.display="block"; return; }
+  $empty.style.display="none";
+  let html = '';
+  for(const fp of fingerprints){
+    const vids = (fp.vehicle_ids||[]).map(v => esc(v.slice(0,8))).join(", ") || "—";
+    html += '<tr>'+
+      '<td></td>'+
+      '<td class="mono" title="'+esc(fp.fingerprint_id)+'">'+esc(fp.fingerprint_id)+'</td>'+
+      '<td>'+fp.rtl433_id+'</td>'+
+      '<td>'+classbadge(fp.vehicle_class)+'</td>'+
+      '<td>'+fp.pressure_median_kpa.toFixed(1)+'</td>'+
+      '<td title="'+absTime(fp.first_seen)+'">'+relTime(fp.first_seen)+'</td>'+
+      '<td title="'+absTime(fp.last_seen)+'">'+relTime(fp.last_seen)+'</td>'+
+      '<td>'+fp.total_sighting_count+'</td>'+
+      '</tr>';
+  }
+  $body.innerHTML = html;
+}
+
 /* ---- Clock ---- */
 function tickClock(){
   const now = new Date();
@@ -486,7 +517,7 @@ $search.addEventListener("input", () => {
 function readURL(){
   const p = new URLSearchParams(window.location.search);
   const f = p.get("filter");
-  if(f && ["active","alarm","grouped"].includes(f)){
+  if(f && ["active","alarm","grouped","fingerprints"].includes(f)){
     currentFilter = f;
     document.querySelectorAll(".filter-btn").forEach(b => {
       b.classList.toggle("active", b.dataset.filter === f);

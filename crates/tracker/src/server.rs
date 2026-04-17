@@ -40,7 +40,24 @@ pub struct VehicleRow {
     pub last_seen: String,
     pub sighting_count: i64,
     pub tx_interval_median_ms: Option<i64>,
+    pub fingerprint_id: Option<String>,
     pub active: bool,
+}
+
+/// Fingerprint row returned by `Database::api_fingerprints`.
+#[derive(Serialize)]
+pub struct FingerprintRow {
+    pub fingerprint_id: String,
+    pub rtl433_id: i64,
+    pub vehicle_class: String,
+    pub pressure_median_kpa: f64,
+    pub tx_interval_median_ms: Option<i64>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub total_sighting_count: i64,
+    pub session_count: i64,
+    pub alarm_rate: f64,
+    pub vehicle_ids: Vec<String>,
 }
 
 /// Car detail returned by `Database::api_car_detail`.
@@ -81,6 +98,7 @@ pub async fn serve(db_path: &str, addr: &str) -> anyhow::Result<()> {
         .route("/api/stats", get(handle_stats))
         .route("/api/cars", get(handle_cars))
         .route("/api/cars/{car_id}", get(handle_car_detail))
+        .route("/api/fingerprints", get(handle_fingerprints))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -178,4 +196,17 @@ async fn handle_car_detail(
         Some(d) => Ok(Json(d)),
         None => Err(axum::http::StatusCode::NOT_FOUND),
     }
+}
+
+async fn handle_fingerprints(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<FingerprintRow>>, axum::http::StatusCode> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = db
+        .api_fingerprints()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows))
 }

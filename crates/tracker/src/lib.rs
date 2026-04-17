@@ -38,6 +38,19 @@ pub const TX_INTERVAL_MAX_MS: u32 = 120_000;
 /// with temperature and the tracker's interval measurement includes SDR jitter.
 pub const TX_INTERVAL_TOLERANCE_MS: u32 = 8_000;
 
+// ---------------------------------------------------------------------------
+// Fingerprint store tuning constants
+// ---------------------------------------------------------------------------
+
+/// Minimum number of sightings before a stored fingerprint is used as a match
+/// candidate.  A fingerprint with fewer sightings may represent a noise event.
+pub const FINGERPRINT_MIN_SIGHTINGS: u32 = 5;
+
+/// Maximum gap (days) since a fingerprint's `last_seen` before it is considered
+/// stale and no longer eligible for matching.  Stale fingerprints are ignored;
+/// a new one is created instead.
+pub const FINGERPRINT_MAX_GAP_DAYS: u32 = 30;
+
 /// Raw packet emitted by `tpms-sniffer` on stdout (one JSON object per line).
 /// Only the fields the tracker needs are declared; unknown fields are ignored.
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +168,9 @@ pub struct VehicleTrack {
     pub wheel_position: Option<jaccard::WheelPosition>,
     /// Inferred vehicle class based on pressure range and sensor count.
     pub vehicle_class: classification::VehicleClass,
+    /// Persistent cross-session fingerprint identifier that links vehicle UUIDs
+    /// representing the same physical sensor across separate tracking sessions.
+    pub fingerprint_id: Option<String>,
 }
 
 /// Return a human-readable make/model hint for a given rtl_433 protocol ID.

@@ -208,6 +208,42 @@ impl Database {
             )?;
         }
 
+        // Migration: add fingerprints table for persistent cross-session
+        // fingerprint store.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS fingerprints (
+                fingerprint_id        TEXT PRIMARY KEY,
+                rtl433_id             INTEGER NOT NULL,
+                vehicle_class         TEXT NOT NULL,
+                pressure_median_kpa   REAL NOT NULL,
+                tx_interval_median_ms INTEGER,
+                first_seen            TEXT NOT NULL,
+                last_seen             TEXT NOT NULL,
+                total_sighting_count  INTEGER NOT NULL DEFAULT 0,
+                session_count         INTEGER NOT NULL DEFAULT 1,
+                alarm_rate            REAL,
+                notes                 TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fingerprints_protocol_pressure
+                ON fingerprints(rtl433_id, pressure_median_kpa);
+            "#,
+        )?;
+
+        // Migration: add fingerprint_id column on vehicles table.
+        let has_fingerprint_id: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='fingerprint_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_fingerprint_id == 0 {
+            self.conn.execute(
+                "ALTER TABLE vehicles ADD COLUMN fingerprint_id TEXT REFERENCES fingerprints(fingerprint_id)",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -220,8 +256,8 @@ impl Database {
             r#"
             INSERT INTO vehicles
                 (vehicle_id, first_seen, last_seen, sighting_count, protocol, rtl433_id, sensor_id, make_model, pressure_sig,
-                 tx_interval_median_ms, tx_interval_samples, car_id, wheel_position, vehicle_class)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 tx_interval_median_ms, tx_interval_samples, car_id, wheel_position, vehicle_class, fingerprint_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(vehicle_id) DO UPDATE SET
                 last_seen      = excluded.last_seen,
                 sighting_count = excluded.sighting_count,
@@ -232,7 +268,8 @@ impl Database {
                 tx_interval_samples   = excluded.tx_interval_samples,
                 car_id                = COALESCE(excluded.car_id, vehicles.car_id),
                 wheel_position        = COALESCE(excluded.wheel_position, vehicles.wheel_position),
-                vehicle_class         = excluded.vehicle_class
+                vehicle_class         = excluded.vehicle_class,
+                fingerprint_id        = COALESCE(excluded.fingerprint_id, vehicles.fingerprint_id)
             "#,
             params![
                 v.vehicle_id.to_string(),
@@ -249,6 +286,7 @@ impl Database {
                 v.car_id.map(|id| id.to_string()),
                 v.wheel_position.map(|wp| wp.as_str().to_string()),
                 v.vehicle_class.as_str(),
+                v.fingerprint_id.as_deref(),
             ],
         )?;
         Ok(())
@@ -295,7 +333,7 @@ impl Database {
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
                     tx_interval_median_ms, tx_interval_samples, car_id, wheel_position,
-                    vehicle_class
+                    vehicle_class, fingerprint_id
              FROM vehicles WHERE sensor_id = ?1 LIMIT 1",
         )?;
         let mut rows = stmt.query(params![sensor_id as i64])?;
@@ -312,7 +350,7 @@ impl Database {
             "SELECT vehicle_id, first_seen, last_seen, sighting_count, protocol,
                     sensor_id, make_model, pressure_sig, rtl433_id,
                     tx_interval_median_ms, tx_interval_samples, car_id, wheel_position,
-                    vehicle_class
+                    vehicle_class, fingerprint_id
              FROM vehicles ORDER BY last_seen DESC",
         )?;
         let vehicles = stmt
@@ -809,6 +847,137 @@ impl Database {
     }
 
     // -----------------------------------------------------------------------
+    // Fingerprint store
+    // -----------------------------------------------------------------------
+
+    /// Query for a matching fingerprint based on protocol, pressure, class, and optional TX interval.
+    pub fn find_fingerprint(
+        &self,
+        rtl433_id: u16,
+        pressure_kpa: f32,
+        vehicle_class: &crate::classification::VehicleClass,
+        tx_interval_ms: Option<u32>,
+        max_gap_days: u32,
+        now: &str,
+    ) -> Result<Option<String>> {
+        let tolerance = vehicle_class.pressure_tolerance_kpa();
+        let result = self.conn.query_row(
+            "SELECT fingerprint_id FROM fingerprints \
+             WHERE rtl433_id = ?1 \
+               AND vehicle_class = ?2 \
+               AND ABS(pressure_median_kpa - ?3) <= ?4 \
+               AND total_sighting_count >= ?5 \
+               AND julianday(?9) - julianday(last_seen) <= ?6 \
+               AND ( \
+                   tx_interval_median_ms IS NULL \
+                   OR ?7 IS NULL \
+                   OR ABS(tx_interval_median_ms - ?7) <= ?8 \
+               ) \
+             ORDER BY ABS(pressure_median_kpa - ?3) ASC, total_sighting_count DESC \
+             LIMIT 1",
+            params![
+                rtl433_id as i64,
+                vehicle_class.as_str(),
+                pressure_kpa as f64,
+                tolerance as f64,
+                crate::FINGERPRINT_MIN_SIGHTINGS as i64,
+                max_gap_days as i64,
+                tx_interval_ms.map(|v| v as i64),
+                crate::TX_INTERVAL_TOLERANCE_MS as i64,
+                now,
+            ],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(fp_id) => Ok(Some(fp_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Create a new fingerprint row.
+    pub fn create_fingerprint(
+        &self,
+        fingerprint_id: &str,
+        rtl433_id: u16,
+        vehicle_class: &str,
+        pressure_kpa: f32,
+        tx_interval_ms: Option<u32>,
+        ts: &str,
+        alarm: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO fingerprints \
+             (fingerprint_id, rtl433_id, vehicle_class, pressure_median_kpa, \
+              tx_interval_median_ms, first_seen, last_seen, total_sighting_count, \
+              session_count, alarm_rate) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, 1, ?7)",
+            params![
+                fingerprint_id,
+                rtl433_id as i64,
+                vehicle_class,
+                pressure_kpa as f64,
+                tx_interval_ms.map(|v| v as i64),
+                ts,
+                if alarm { 1.0f64 } else { 0.0f64 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update a fingerprint's running statistics with a new sighting.
+    pub fn update_fingerprint(
+        &self,
+        fingerprint_id: &str,
+        pressure_kpa: f32,
+        tx_interval_ms: Option<u32>,
+        last_seen: &str,
+        alarm: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE fingerprints SET \
+                pressure_median_kpa   = (pressure_median_kpa * total_sighting_count + ?1) \
+                                        / (total_sighting_count + 1), \
+                tx_interval_median_ms = COALESCE(?2, tx_interval_median_ms), \
+                last_seen             = ?3, \
+                total_sighting_count  = total_sighting_count + 1, \
+                alarm_rate            = (COALESCE(alarm_rate, 0.0) * total_sighting_count + ?4) \
+                                        / (total_sighting_count + 1) \
+             WHERE fingerprint_id = ?5",
+            params![
+                pressure_kpa as f64,
+                tx_interval_ms.map(|v| v as i64),
+                last_seen,
+                if alarm { 1.0f64 } else { 0.0f64 },
+                fingerprint_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Increment the session_count for a fingerprint.
+    pub fn increment_fingerprint_session(&self, fingerprint_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE fingerprints SET session_count = session_count + 1 WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+        )?;
+        Ok(())
+    }
+
+    /// Set the fingerprint_id column on a vehicle.
+    pub fn set_vehicle_fingerprint_id(
+        &self,
+        vehicle_id: Uuid,
+        fingerprint_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE vehicles SET fingerprint_id = ?1 WHERE vehicle_id = ?2",
+            params![fingerprint_id, vehicle_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Web API helpers
     // -----------------------------------------------------------------------
 
@@ -871,7 +1040,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT v.vehicle_id, v.car_id, v.protocol, v.rtl433_id, \
                     v.vehicle_class, v.last_seen, v.first_seen, v.sighting_count, \
-                    v.tx_interval_median_ms, v.pressure_sig, \
+                    v.tx_interval_median_ms, v.pressure_sig, v.fingerprint_id, \
                     CASE WHEN v.last_seen >= datetime('now', '-5 minutes') THEN 1 ELSE 0 END AS active \
              FROM vehicles v",
         );
@@ -888,7 +1057,7 @@ impl Database {
                 sql = String::from(
                     "SELECT v.vehicle_id, v.car_id, v.protocol, v.rtl433_id, \
                             v.vehicle_class, v.last_seen, v.first_seen, v.sighting_count, \
-                            v.tx_interval_median_ms, v.pressure_sig, \
+                            v.tx_interval_median_ms, v.pressure_sig, v.fingerprint_id, \
                             CASE WHEN v.last_seen >= datetime('now', '-5 minutes') THEN 1 ELSE 0 END AS active \
                      FROM vehicles v \
                      INNER JOIN ( \
@@ -936,7 +1105,8 @@ impl Database {
                 let sighting_count: i64 = row.get(7)?;
                 let tx_interval_median_ms: Option<i64> = row.get(8)?;
                 let pressure_sig_s: String = row.get(9)?;
-                let active: i64 = row.get(10)?;
+                let fingerprint_id: Option<String> = row.get(10)?;
+                let active: i64 = row.get(11)?;
 
                 // Extract first non-zero pressure from signature.
                 let sig: [f64; 4] = serde_json::from_str(&pressure_sig_s).unwrap_or([0.0; 4]);
@@ -957,6 +1127,7 @@ impl Database {
                     last_seen,
                     sighting_count,
                     tx_interval_median_ms,
+                    fingerprint_id,
                     active: active != 0,
                 })
             })?
@@ -1060,6 +1231,56 @@ impl Database {
             sightings,
         }))
     }
+
+    /// Fingerprint list for `/api/fingerprints`.
+    pub fn api_fingerprints(&self) -> Result<Vec<crate::server::FingerprintRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.fingerprint_id, f.rtl433_id, f.vehicle_class, \
+                    f.pressure_median_kpa, f.tx_interval_median_ms, \
+                    f.first_seen, f.last_seen, f.total_sighting_count, \
+                    f.session_count, f.alarm_rate \
+             FROM fingerprints f \
+             ORDER BY f.last_seen DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let fp_id: String = row.get(0)?;
+                let rtl433_id: i64 = row.get(1)?;
+                let vehicle_class: String = row.get(2)?;
+                let pressure_median_kpa: f64 = row.get(3)?;
+                let tx_interval_median_ms: Option<i64> = row.get(4)?;
+                let first_seen: String = row.get(5)?;
+                let last_seen: String = row.get(6)?;
+                let total_sighting_count: i64 = row.get(7)?;
+                let session_count: i64 = row.get(8)?;
+                let alarm_rate: Option<f64> = row.get(9)?;
+                Ok(crate::server::FingerprintRow {
+                    fingerprint_id: fp_id,
+                    rtl433_id,
+                    vehicle_class,
+                    pressure_median_kpa,
+                    tx_interval_median_ms,
+                    first_seen,
+                    last_seen,
+                    total_sighting_count,
+                    session_count,
+                    alarm_rate: alarm_rate.unwrap_or(0.0),
+                    vehicle_ids: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut result = rows;
+        for fp in &mut result {
+            let mut vstmt = self
+                .conn
+                .prepare("SELECT vehicle_id FROM vehicles WHERE fingerprint_id = ?1")?;
+            fp.vehicle_ids = vstmt
+                .query_map(params![fp.fingerprint_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+        }
+        Ok(result)
+    }
 }
 
 fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
@@ -1077,6 +1298,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
     let car_id_s: Option<String> = row.get(11)?;
     let wheel_position_s: Option<String> = row.get(12)?;
     let vehicle_class_s: Option<String> = row.get(13)?;
+    let fingerprint_id: Option<String> = row.get(14)?;
 
     let parse_dt = |s: &str| -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -1106,6 +1328,7 @@ fn row_to_vehicle(row: &rusqlite::Row<'_>) -> rusqlite::Result<VehicleTrack> {
         vehicle_class: vehicle_class_s
             .map(|s| crate::classification::VehicleClass::from_str(&s))
             .unwrap_or(crate::classification::VehicleClass::Unknown),
+        fingerprint_id,
     })
 }
 
@@ -1179,6 +1402,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: crate::classification::VehicleClass::PassengerCar,
+            fingerprint_id: None,
         };
         db.upsert_vehicle(&vehicle).unwrap();
 
@@ -1247,6 +1471,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: crate::classification::VehicleClass::PassengerCar,
+            fingerprint_id: None,
         };
         db.upsert_vehicle(&vehicle).unwrap();
 
@@ -1304,5 +1529,79 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(count, 1, "idx_pressure_events_car_ts index should exist");
+    }
+
+    #[test]
+    fn fingerprints_table_and_index_exist() {
+        let db = test_db();
+        let table_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fingerprints'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1, "fingerprints table must exist");
+
+        let index_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_fingerprints_protocol_pressure'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_count, 1,
+            "idx_fingerprints_protocol_pressure index must exist"
+        );
+    }
+
+    #[test]
+    fn fingerprint_crud_operations() {
+        let db = test_db();
+
+        db.create_fingerprint(
+            "fp-test1234",
+            241,
+            "Unknown",
+            51.1,
+            None,
+            "2025-06-01T12:00:00+00:00",
+            false,
+        )
+        .unwrap();
+
+        let fps = db.api_fingerprints().unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].fingerprint_id, "fp-test1234");
+        assert_eq!(fps[0].rtl433_id, 241);
+        assert!((fps[0].pressure_median_kpa - 51.1).abs() < 0.1);
+        assert_eq!(fps[0].total_sighting_count, 1);
+        assert_eq!(fps[0].session_count, 1);
+
+        db.update_fingerprint("fp-test1234", 51.3, None, "2025-06-01T12:01:00+00:00", false)
+            .unwrap();
+        let fps = db.api_fingerprints().unwrap();
+        assert_eq!(fps[0].total_sighting_count, 2);
+
+        db.increment_fingerprint_session("fp-test1234").unwrap();
+        let fps = db.api_fingerprints().unwrap();
+        assert_eq!(fps[0].session_count, 2);
+    }
+
+    #[test]
+    fn vehicle_fingerprint_id_column_migration() {
+        let db = test_db();
+        let has_col: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('vehicles') WHERE name='fingerprint_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1, "fingerprint_id column must exist on vehicles");
     }
 }

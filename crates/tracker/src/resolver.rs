@@ -12,9 +12,9 @@ use crate::jaccard::{
     infer_wheel_positions,
 };
 use crate::{
-    CROSS_RECEIVER_WINDOW_MS, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_MIN_SAMPLES,
-    TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW, TpmsPacket, VehicleTrack, compute_median,
-    make_model_hint,
+    CROSS_RECEIVER_WINDOW_MS, FINGERPRINT_MAX_GAP_DAYS, Sighting, TX_INTERVAL_MAX_MS,
+    TX_INTERVAL_MIN_SAMPLES, TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW, TpmsPacket,
+    VehicleTrack, compute_median, make_model_hint,
 };
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
@@ -139,6 +139,8 @@ pub struct Resolver {
     /// of the session so that a vehicle retains its `car_id` across grouping
     /// evaluations.
     vehicle_to_car: HashMap<Uuid, Uuid>,
+    /// Mapping from `vehicle_id` to its persistent fingerprint_id.
+    vehicle_to_fingerprint: HashMap<Uuid, String>,
 }
 
 impl Resolver {
@@ -159,6 +161,7 @@ impl Resolver {
             last_window_advance: None,
             receiver_id,
             vehicle_to_car: HashMap::new(),
+            vehicle_to_fingerprint: HashMap::new(),
         };
         r.load_from_db()?;
         Ok(r)
@@ -180,6 +183,11 @@ impl Resolver {
             // Restore vehicle_to_car from persisted car_id assignments.
             if let Some(car_id) = vehicle.car_id {
                 self.vehicle_to_car.insert(vehicle.vehicle_id, car_id);
+            }
+            // Restore vehicle_to_fingerprint from persisted fingerprint_id.
+            if let Some(ref fp_id) = vehicle.fingerprint_id {
+                self.vehicle_to_fingerprint
+                    .insert(vehicle.vehicle_id, fp_id.clone());
             }
             self.vehicles.insert(vehicle.vehicle_id, vehicle);
         }
@@ -345,6 +353,7 @@ impl Resolver {
                         receiver_sightings: HashMap::new(),
                         wheel_position: None,
                         vehicle_class: infer_vehicle_class(sighting.pressure_kpa, None),
+                        fingerprint_id: None,
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
@@ -369,6 +378,7 @@ impl Resolver {
                     receiver_sightings: HashMap::new(),
                     wheel_position: None,
                     vehicle_class: infer_vehicle_class(sighting.pressure_kpa, None),
+                    fingerprint_id: None,
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
@@ -393,6 +403,7 @@ impl Resolver {
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
                 vehicle_class: infer_vehicle_class(sighting.pressure_kpa, None),
+                fingerprint_id: None,
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
@@ -524,6 +535,17 @@ impl Resolver {
         let vehicle_id = if let Some(vid) = matched_vid {
             vid
         } else {
+            // Try the persistent fingerprint store before creating a genuinely new vehicle.
+            let fp_class = infer_vehicle_class(pressure, None);
+            let fp_match = self.db.find_fingerprint(
+                rtl433_id,
+                pressure,
+                &fp_class,
+                hint,
+                FINGERPRINT_MAX_GAP_DAYS,
+                &now.to_rfc3339(),
+            )?;
+
             let vid = Uuid::new_v4();
             let vehicle = VehicleTrack {
                 vehicle_id: vid,
@@ -541,9 +563,34 @@ impl Resolver {
                 car_id: None,
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
-                vehicle_class: infer_vehicle_class(pressure, None),
+                vehicle_class: fp_class,
+                fingerprint_id: fp_match.clone(),
             };
             self.vehicles.insert(vid, vehicle);
+
+            if let Some(ref fp_id) = fp_match {
+                // Known sensor returning after a gap.
+                self.vehicle_to_fingerprint.insert(vid, fp_id.clone());
+                self.db.set_vehicle_fingerprint_id(vid, fp_id)?;
+                self.db.increment_fingerprint_session(fp_id)?;
+            } else {
+                // Genuinely new sensor — create a new fingerprint.
+                let fp_id = format!("fp-{}", &vid.to_string()[..8]);
+                if let Some(v) = self.vehicles.get_mut(&vid) {
+                    v.fingerprint_id = Some(fp_id.clone());
+                }
+                self.vehicle_to_fingerprint.insert(vid, fp_id.clone());
+                self.db.create_fingerprint(
+                    &fp_id,
+                    rtl433_id,
+                    fp_class.as_str(),
+                    pressure,
+                    hint,
+                    &now.to_rfc3339(),
+                    sighting.alarm,
+                )?;
+                self.db.set_vehicle_fingerprint_id(vid, &fp_id)?;
+            }
             vid
         };
 
@@ -597,6 +644,17 @@ impl Resolver {
         let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
         self.db.insert_sighting(&sighting, vehicle_id)?;
+
+        // Update persistent fingerprint store.
+        if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
+            let _ = self.db.update_fingerprint(
+                fp_id,
+                sighting.pressure_kpa,
+                vehicle.tx_interval_median_ms,
+                &now.to_rfc3339(),
+                sighting.alarm,
+            );
+        }
 
         // Incrementally update presence slot if car_id is assigned.
         if let Some(car_id) = vehicle.car_id {
@@ -722,10 +780,19 @@ impl Resolver {
         let vehicle_id = if let Some(vid) = matched_vid {
             vid
         } else {
-            // First sighting of this vehicle — create a new record.
+            // First sighting of this vehicle — try the persistent fingerprint store.
             let vid = Uuid::new_v4();
-            // Use the first non-zero pressure in the signature for classification.
             let class_pressure = sig.iter().find(|&&p| p > 0.0).copied().unwrap_or(0.0);
+            let fp_class = infer_vehicle_class(class_pressure, None);
+            let fp_match = self.db.find_fingerprint(
+                burst.rtl433_id,
+                class_pressure,
+                &fp_class,
+                None,
+                FINGERPRINT_MAX_GAP_DAYS,
+                &now.to_rfc3339(),
+            )?;
+
             let vehicle = VehicleTrack {
                 vehicle_id: vid,
                 first_seen: now,
@@ -742,9 +809,32 @@ impl Resolver {
                 car_id: None,
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
-                vehicle_class: infer_vehicle_class(class_pressure, None),
+                vehicle_class: fp_class,
+                fingerprint_id: fp_match.clone(),
             };
             self.vehicles.insert(vid, vehicle);
+
+            if let Some(ref fp_id) = fp_match {
+                self.vehicle_to_fingerprint.insert(vid, fp_id.clone());
+                self.db.set_vehicle_fingerprint_id(vid, fp_id)?;
+                self.db.increment_fingerprint_session(fp_id)?;
+            } else {
+                let fp_id = format!("fp-{}", &vid.to_string()[..8]);
+                if let Some(v) = self.vehicles.get_mut(&vid) {
+                    v.fingerprint_id = Some(fp_id.clone());
+                }
+                self.vehicle_to_fingerprint.insert(vid, fp_id.clone());
+                self.db.create_fingerprint(
+                    &fp_id,
+                    burst.rtl433_id,
+                    fp_class.as_str(),
+                    class_pressure,
+                    None,
+                    &now.to_rfc3339(),
+                    false,
+                )?;
+                self.db.set_vehicle_fingerprint_id(vid, &fp_id)?;
+            }
             vid
         };
 
@@ -798,6 +888,23 @@ impl Resolver {
         // Persist.
         let vehicle = self.vehicles.get(&vehicle_id).unwrap();
         self.db.upsert_vehicle(vehicle)?;
+
+        // Update persistent fingerprint store.
+        if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
+            let class_pressure = vehicle
+                .pressure_signature
+                .iter()
+                .find(|&&p| p > 0.0)
+                .copied()
+                .unwrap_or(0.0);
+            let _ = self.db.update_fingerprint(
+                fp_id,
+                class_pressure,
+                vehicle.tx_interval_median_ms,
+                &now.to_rfc3339(),
+                false,
+            );
+        }
 
         // Incrementally update presence slot if car_id is assigned.
         if let Some(car_id) = vehicle.car_id {
@@ -1994,6 +2101,7 @@ mod tests {
                 receiver_sightings: HashMap::new(),
                 wheel_position: None,
                 vehicle_class: VehicleClass::Unknown,
+                fingerprint_id: None,
             }
         };
 
@@ -2934,6 +3042,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
         let track2 = VehicleTrack {
             vehicle_id: v2,
@@ -2952,6 +3061,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
 
         resolver.db.upsert_vehicle(&track1).unwrap();
@@ -3037,6 +3147,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
         let track2 = VehicleTrack {
             vehicle_id: v2,
@@ -3055,6 +3166,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
 
         resolver.db.upsert_vehicle(&track1).unwrap();
@@ -3133,6 +3245,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
         let track2 = VehicleTrack {
             vehicle_id: v2,
@@ -3151,6 +3264,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
         // v3 also points to car_b but will NOT be part of the merged group
         // (it has no co-occurrence data so it ends up in its own group).
@@ -3171,6 +3285,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
 
         for track in [&track1, &track2, &track3] {
@@ -3272,6 +3387,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
         let track2 = VehicleTrack {
             vehicle_id: v2,
@@ -3290,6 +3406,7 @@ mod tests {
             receiver_sightings: HashMap::new(),
             wheel_position: None,
             vehicle_class: VehicleClass::Unknown,
+            fingerprint_id: None,
         };
 
         resolver.db.upsert_vehicle(&track1).unwrap();
@@ -3353,6 +3470,184 @@ mod tests {
             remaining.len(),
             1,
             "only one of the two original car_ids should remain, got {remaining:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fingerprint store tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fingerprint_created_for_new_eeztire_vehicle() {
+        let mut resolver = in_memory_resolver();
+
+        let p = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let vid = resolver.process(&p).unwrap().unwrap();
+
+        // A fingerprint should have been created and linked.
+        let vehicle = &resolver.vehicles[&vid];
+        assert!(
+            vehicle.fingerprint_id.is_some(),
+            "new EezTire vehicle must have a fingerprint_id"
+        );
+        assert!(
+            resolver.vehicle_to_fingerprint.contains_key(&vid),
+            "vehicle_to_fingerprint must contain the new vehicle"
+        );
+
+        // Verify fingerprint is in the DB.
+        let fps = resolver.db.api_fingerprints().unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].fingerprint_id, vehicle.fingerprint_id.as_ref().unwrap().clone());
+        assert_eq!(fps[0].rtl433_id, 241);
+    }
+
+    #[test]
+    fn fingerprint_created_for_new_ave_burst() {
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at(
+            "2025-06-01 10:00:00.000",
+            "0x11111111",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        let p2 = make_packet_at(
+            "2025-06-01 10:00:00.100",
+            "0x22222222",
+            "AVE-TPMS",
+            208,
+            380.0,
+        );
+        resolver.process(&p1).unwrap();
+        resolver.process(&p2).unwrap();
+        resolver.flush().unwrap();
+
+        let ave_vehicle = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "AVE-TPMS")
+            .expect("AVE vehicle must exist");
+        assert!(
+            ave_vehicle.fingerprint_id.is_some(),
+            "new AVE vehicle must have a fingerprint_id"
+        );
+
+        let fps = resolver.db.api_fingerprints().unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].rtl433_id, 208);
+    }
+
+    #[test]
+    fn fingerprint_links_across_sessions() {
+        // Simulate two sessions: first creates a vehicle and fingerprint,
+        // the second (after expiry) should find the existing fingerprint.
+        let mut resolver = in_memory_resolver();
+
+        // Session 1: Create an EezTire vehicle with enough sightings.
+        for i in 0..6 {
+            let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            resolver.process(&p).unwrap();
+        }
+
+        let vid1 = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .map(|v| v.vehicle_id)
+            .unwrap();
+        let fp_id1 = resolver.vehicles[&vid1]
+            .fingerprint_id
+            .clone()
+            .expect("must have fingerprint");
+
+        // After expiry (>480s), a new packet creates a new vehicle but
+        // should match the same fingerprint since it has ≥5 sightings.
+        let p_late = make_packet_at(
+            "2025-06-01 12:09:00.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let vid2 = resolver.process(&p_late).unwrap().unwrap();
+
+        assert_ne!(vid1, vid2, "after expiry, a new vehicle UUID is created");
+        let fp_id2 = resolver.vehicles[&vid2]
+            .fingerprint_id
+            .clone()
+            .expect("second vehicle must have fingerprint");
+        assert_eq!(
+            fp_id1, fp_id2,
+            "both vehicles must share the same fingerprint_id"
+        );
+
+        // Verify the DB shows one fingerprint with session_count=2.
+        let fps = resolver.db.api_fingerprints().unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].session_count, 2);
+        assert_eq!(fps[0].vehicle_ids.len(), 2);
+    }
+
+    #[test]
+    fn different_pressures_produce_separate_fingerprints() {
+        let mut resolver = in_memory_resolver();
+
+        // Two EezTire sensors at very different pressures.
+        let hi = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        let lo = make_packet_at(
+            "2025-06-01 12:00:01.000",
+            "0xBFFFFFFF",
+            "EezTire",
+            241,
+            25.0,
+        );
+        let vhi = resolver.process(&hi).unwrap().unwrap();
+        let vlo = resolver.process(&lo).unwrap().unwrap();
+
+        assert_ne!(vhi, vlo);
+        let fp_hi = resolver.vehicles[&vhi].fingerprint_id.clone().unwrap();
+        let fp_lo = resolver.vehicles[&vlo].fingerprint_id.clone().unwrap();
+        assert_ne!(
+            fp_hi, fp_lo,
+            "sensors at different pressures must produce separate fingerprints"
+        );
+    }
+
+    #[test]
+    fn fingerprint_store_schema_and_index_exist() {
+        // Verify the fingerprint store works by creating and querying a fingerprint.
+        let mut resolver = in_memory_resolver();
+
+        let p = make_packet_at(
+            "2025-06-01 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            51.1,
+        );
+        resolver.process(&p).unwrap();
+
+        let fps = resolver.db.api_fingerprints().unwrap();
+        assert_eq!(fps.len(), 1, "one fingerprint must be created");
+        assert_eq!(fps[0].rtl433_id, 241);
+        assert!(
+            fps[0].pressure_median_kpa > 40.0 && fps[0].pressure_median_kpa < 60.0,
+            "pressure_median_kpa must be near 51.1"
         );
     }
 }
