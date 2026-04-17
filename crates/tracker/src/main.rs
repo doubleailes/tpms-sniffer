@@ -95,8 +95,7 @@ enum Command {
 }
 
 fn init_logging(level: &str) {
-    let env = env_logger::Env::default()
-        .filter_or("RUST_LOG", format!("tpms_tracker={level}"));
+    let env = env_logger::Env::default().filter_or("RUST_LOG", format!("tpms_tracker={level}"));
     env_logger::Builder::from_env(env)
         .format(|buf, record| {
             use std::io::Write;

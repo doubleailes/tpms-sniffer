@@ -310,7 +310,8 @@ impl Resolver {
                 "{} | RESOLVE | sensor={:#010X} | zeros={} | valid=false | \
                  path=fixed_id | result=rejected_sentinel",
                 sighting.ts.format("%Y-%m-%d %H:%M:%S%.3f"),
-                sensor_id, zeros,
+                sensor_id,
+                zeros,
             );
             return self.process_rolling(sighting);
         }
@@ -432,8 +433,10 @@ impl Resolver {
             "{} | RESOLVE | sensor={:#010X} | zeros={} | valid=true | \
              path=fixed_id | key=({:#010X},{}) | result={} | pressure={:.1}",
             sighting.ts.format("%Y-%m-%d %H:%M:%S%.3f"),
-            sensor_id, zeros,
-            sensor_id, rtl433_id,
+            sensor_id,
+            zeros,
+            sensor_id,
+            rtl433_id,
             result_str,
             sighting.pressure_kpa,
         );
@@ -594,7 +597,9 @@ impl Resolver {
                  match_reason=pressure_delta:{:.1}_kpa | protocol_filter=pass | \
                  pressure_before={:.1} | pressure_after={:.1}",
                 now.format("%Y-%m-%d %H:%M:%S%.3f"),
-                sensor_id, zeros, valid,
+                sensor_id,
+                zeros,
+                valid,
                 candidates,
                 &vid.to_string()[..8],
                 (pressure_before - pressure).abs(),
@@ -688,7 +693,9 @@ impl Resolver {
                  path={} | candidates={} | matched=none | \
                  result=new_vehicle | pressure={:.1}",
                 now.format("%Y-%m-%d %H:%M:%S%.3f"),
-                sensor_id, zeros, valid,
+                sensor_id,
+                zeros,
+                valid,
                 fp_path,
                 candidates,
                 pressure,
@@ -1123,10 +1130,7 @@ impl Resolver {
                 let expiry = effective_expiry(v);
                 // Emit once: expired this window but not in the previous one.
                 if age >= expiry && age < expiry + Duration::seconds(WINDOW_SIZE_S as i64) {
-                    let fp = v
-                        .fingerprint_id
-                        .as_deref()
-                        .unwrap_or("none");
+                    let fp = v.fingerprint_id.as_deref().unwrap_or("none");
                     let car_id = v
                         .car_id
                         .map(|c| c.to_string()[..8].to_string())

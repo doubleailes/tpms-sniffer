@@ -215,3 +215,135 @@ ALTER TABLE vehicles ADD COLUMN fingerprint_id TEXT REFERENCES fingerprints(fing
 - `GET /api/fingerprints` — returns all stored fingerprints ordered by
   `last_seen DESC`, including linked `vehicle_ids`.
 - `GET /api/cars` — vehicle rows now include `fingerprint_id`.
+
+## Structured logging
+
+The tracker supports three log levels, controlled via `--log-level` (default:
+`info`) or the `RUST_LOG` environment variable.  All log output goes to
+**stderr** so that the stdout JSON-L stream remains clean for piping.
+
+```bash
+# Sightings only (current default behaviour)
+./tpms-tracker --db tpms.db --log-level info
+
+# + resolver decisions (one RESOLVE line per packet)
+./tpms-tracker --db tpms.db --log-level debug
+
+# + tracker lifecycle events (vehicle created/expired, merges, fingerprints)
+./tpms-tracker --db tpms.db --log-level trace
+```
+
+The `RUST_LOG` environment variable overrides `--log-level` without a
+recompile:
+
+```bash
+RUST_LOG=tpms_tracker=debug ./tpms-tracker --db tpms.db
+```
+
+### Log streams
+
+#### INFO — sightings (`--verbose`)
+
+When `--verbose` is set, one `SIGHT` line per resolved packet:
+
+```
+2026-04-17 10:07:30.938 | SIGHT | vehicle=8294c101 | car=3c14b2d0 | fp=fp-8294c101 |
+  sensor=0xFFFBFFFB | zeros=5 | pressure=46.4 | temp=null |
+  alarm=true | battery=false | protocol=EezTire/Carchet/TST-507 |
+  rtl433=241 | class=Unknown | receiver=default
+```
+
+#### DEBUG — resolver decisions
+
+One `RESOLVE` line per packet showing which code path was taken:
+
+```
+2026-04-17 10:07:30.937 | RESOLVE | sensor=0xFFFBFFFB | zeros=5 | valid=true |
+  path=fingerprint_correlator | candidates=3 | matched=8294c101 |
+  match_reason=pressure_delta:0.0_kpa | protocol_filter=pass |
+  pressure_before=46.8 | pressure_after=46.4
+
+2026-04-17 10:35:39.495 | RESOLVE | sensor=0x7C410C2A | zeros=12 | valid=true |
+  path=fixed_id | key=(0x7C410C2A,241) | result=new |
+  pressure=51.1
+```
+
+| Field | Description |
+|---|---|
+| `zeros=N` | Bit count from `sensor_id.count_zeros()` |
+| `valid=bool` | Result of `is_valid_sensor_id()` |
+| `path=X` | Which resolution path ran (`fixed_id`, `fingerprint_correlator`, `fingerprint_store`, `rolling_id`) |
+| `candidates=N` | Number of active vehicles considered by the correlator |
+| `matched=uuid` | Vehicle matched, or `none` if new vehicle created |
+| `match_reason=X` | Primary reason for the match |
+| `pressure_before=N` | Vehicle's pressure average before this sighting |
+| `pressure_after=N` | Vehicle's pressure average after update |
+
+#### TRACE — tracker events
+
+State change events emitted when the tracker takes a significant action:
+
+```
+EVENT | type=vehicle_created | vehicle=new-uuid | protocol=EezTire | rtl433=241 |
+  pressure=46.4 | path=fingerprint_correlator
+
+EVENT | type=vehicle_expired | vehicle=8294c101 | fp=fp-8294c101 | car=3c14b2d0 |
+  age_secs=2490 | sightings=9 | last_pressure=46.4 | last_seen=10:07:30
+
+EVENT | type=jaccard_merge | keep=192e01cb | discard=959c175f | score=0.750 |
+  keep_size=2 | discard_size=1 | members=[0ddfed40,5651851f]
+
+EVENT | type=fingerprint_created | fp=fp-new | vehicle=new-uuid | protocol=TRW-OOK |
+  pressure=63.75 | class=Unknown
+
+EVENT | type=fingerprint_match | vehicle=new-uuid | fp=fp-8294c101
+
+EVENT | type=car_group_created | car=new-car-uuid | vehicle=new-uuid | protocol=EezTire
+```
+
+| Event type | Trigger |
+|---|---|
+| `vehicle_created` | New vehicle UUID assigned |
+| `vehicle_expired` | Vehicle removed from active set after `VEHICLE_EXPIRY` |
+| `car_group_created` | New CarGroup instantiated |
+| `jaccard_merge` | Jaccard merge fires between two car groups |
+| `fingerprint_created` | New fingerprint written to DB |
+| `fingerprint_match` | Returning vehicle matched to existing fingerprint |
+
+### Useful grep recipes
+
+```bash
+# Quick grep for sentinel failures (should be zero in production)
+grep 'zeros=[12] ' replay_debug.log | grep 'valid=true'
+
+# Find all new vehicle creations
+grep 'result=new_vehicle' replay_debug.log
+
+# Find all Jaccard merges
+grep 'type=jaccard_merge' replay_trace.log
+
+# Find all fingerprint matches (returning vehicles)
+grep 'type=fingerprint_match' replay_trace.log
+
+# Find all expired vehicles
+grep 'type=vehicle_expired' replay_trace.log
+
+# Find all packets for a specific sensor
+grep 'sensor=0xFFDFBFFF' replay_debug.log
+```
+
+### Capture workflow
+
+```bash
+# Live capture — sightings to terminal, debug log to file
+./tpms-sniffer --json 2>/dev/null \
+  | ./tpms-tracker --db tpms.db --log-level debug 2>session_debug.log
+
+# Replay with debug log for analysis
+./tpms-tracker \
+  --replay tests/fixtures/wild/session_20260415_1000.jsonl.gz \
+  --db :memory: \
+  --log-level debug \
+  --assert-consistency \
+  2>replay_debug.log
+```
