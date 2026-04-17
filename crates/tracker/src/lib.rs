@@ -39,6 +39,20 @@ pub const TX_INTERVAL_MAX_MS: u32 = 120_000;
 pub const TX_INTERVAL_TOLERANCE_MS: u32 = 8_000;
 
 // ---------------------------------------------------------------------------
+// Pressure plausibility constants
+// ---------------------------------------------------------------------------
+
+/// Minimum physically plausible tyre pressure (kPa).  Any reading below this
+/// threshold is a decode artifact (garbled packet, all-zero field, sign-bit
+/// error) and must be discarded before it reaches the resolver.
+pub const MIN_PLAUSIBLE_PRESSURE_KPA: f32 = 1.5;
+
+/// Maximum physically plausible tyre pressure (kPa).  Covers the heaviest
+/// truck tyres with margin; readings above this are overflow / bit-inversion
+/// artifacts.
+pub const MAX_PLAUSIBLE_PRESSURE_KPA: f32 = 900.0;
+
+// ---------------------------------------------------------------------------
 // Fingerprint store tuning constants
 // ---------------------------------------------------------------------------
 
