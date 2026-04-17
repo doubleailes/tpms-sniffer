@@ -3504,7 +3504,10 @@ mod tests {
         // Verify fingerprint is in the DB.
         let fps = resolver.db.api_fingerprints().unwrap();
         assert_eq!(fps.len(), 1);
-        assert_eq!(fps[0].fingerprint_id, vehicle.fingerprint_id.as_ref().unwrap().clone());
+        assert_eq!(
+            fps[0].fingerprint_id,
+            vehicle.fingerprint_id.as_ref().unwrap().clone()
+        );
         assert_eq!(fps[0].rtl433_id, 241);
     }
 
@@ -3696,9 +3699,7 @@ mod tests {
         let vid3_candidates: Vec<Uuid> = resolver
             .vehicles
             .values()
-            .filter(|v| {
-                v.protocol == "EezTire" && v.vehicle_id != vid1 && v.vehicle_id != vid2
-            })
+            .filter(|v| v.protocol == "EezTire" && v.vehicle_id != vid1 && v.vehicle_id != vid2)
             .map(|v| v.vehicle_id)
             .collect();
         assert_eq!(vid3_candidates.len(), 1);
@@ -3810,9 +3811,6 @@ mod tests {
         // first had too few sightings to be a match candidate.
         let fp1 = resolver.vehicles[&vid1].fingerprint_id.clone().unwrap();
         let fp2 = resolver.vehicles[&vid2].fingerprint_id.clone().unwrap();
-        assert_ne!(
-            fp1, fp2,
-            "immature fingerprint must not be matched"
-        );
+        assert_ne!(fp1, fp2, "immature fingerprint must not be matched");
     }
 }
