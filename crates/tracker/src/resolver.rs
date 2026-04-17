@@ -579,40 +579,68 @@ impl Resolver {
         // a near-sentinel packet from one protocol to match a vehicle from
         // another protocol if their pressures happen to overlap.
         //
-        // The interval check is applied only when both the candidate vehicle
-        // and the sighting carry enough samples.  When either side lacks data,
-        // pressure match alone is sufficient.
-        let matched_vid: Option<Uuid> = self
+        // The TX interval is a soft tiebreaker: it can narrow the set of
+        // pressure matches but must never eliminate all of them.
+        //
+        // Step 1: find all candidates matching on protocol + pressure (hard
+        // constraints).
+        let mut pressure_matches: Vec<&VehicleTrack> = self
             .vehicles
             .values()
             .filter(|v| v.rtl433_id == rtl433_id && v.fixed_sensor_id.is_none())
             .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
-            .find(|v| {
+            .filter(|v| {
                 let tolerance = v.vehicle_class.pressure_tolerance_kpa();
-                let pressure_ok = (v.pressure_signature[0] - pressure).abs() <= tolerance;
-                if !pressure_ok {
-                    return false;
-                }
-                // Interval guard: reject if both sides have data and intervals differ.
-                if let (Some(v_interval), Some(s_interval)) = (v.tx_interval_median_ms, hint) {
-                    let delta = (v_interval as i64 - s_interval as i64).unsigned_abs() as u32;
-                    if delta > TX_INTERVAL_TOLERANCE_MS {
-                        return false;
-                    }
-                }
-                true
+                (v.pressure_signature[0] - pressure).abs() <= tolerance
             })
+            .collect();
+
+        // Step 2: if multiple pressure matches, use TX interval as tiebreaker
+        // (soft constraint).  The interval check can only *narrow* the set —
+        // it must never eliminate all pressure matches.
+        let mut interval_filter_log: Option<String> = None;
+        if pressure_matches.len() > 1 {
+            if let Some(s_interval) = hint {
+                let before_count = pressure_matches.len();
+                let interval_matches: Vec<&VehicleTrack> = pressure_matches
+                    .iter()
+                    .filter(|v| {
+                        v.tx_interval_median_ms.map_or(true, |vi| {
+                            (vi as i64 - s_interval as i64).unsigned_abs() as u32
+                                <= TX_INTERVAL_TOLERANCE_MS
+                        })
+                    })
+                    .copied()
+                    .collect();
+
+                // Only use interval filtering if it leaves at least one
+                // candidate — never use it to reject all matches.
+                if !interval_matches.is_empty() && interval_matches.len() < before_count {
+                    interval_filter_log =
+                        Some(format!("narrowed:{}_to_{}", before_count, interval_matches.len()));
+                    pressure_matches = interval_matches;
+                }
+            }
+        }
+
+        // Step 3: among remaining candidates, prefer most recently seen.
+        let matched_vid: Option<Uuid> = pressure_matches
+            .into_iter()
+            .max_by_key(|v| v.last_seen)
             .map(|v| v.vehicle_id);
 
         let vehicle_id = if let Some(vid) = matched_vid {
             // RESOLVE: matched an existing fingerprint-correlator vehicle.
             let vehicle = &self.vehicles[&vid];
             let pressure_before = vehicle.pressure_signature[0];
+            let interval_field = interval_filter_log
+                .as_deref()
+                .map_or(String::new(), |f| format!(" | interval_filter={}", f));
             debug!(
                 "{} | RESOLVE | sensor={:#010X} | zeros={} | valid={} | \
                  path=fingerprint_correlator | candidates={} | matched={} | \
                  match_reason=pressure_delta:{:.1}_kpa | protocol_filter=pass | \
-                 pressure_before={:.1} | pressure_after={:.1}",
+                 pressure_before={:.1} | pressure_after={:.1}{}",
                 now.format("%Y-%m-%d %H:%M:%S%.3f"),
                 sensor_id,
                 zeros,
@@ -622,6 +650,7 @@ impl Resolver {
                 (pressure_before - pressure).abs(),
                 pressure_before,
                 pressure,
+                interval_field,
             );
             vid
         } else {
@@ -4175,6 +4204,176 @@ mod tests {
         assert!(
             resolver.vehicles.is_empty(),
             "no vehicle must be created for pressure=901.0"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #29 — TX interval as tiebreaker, not hard gate
+    // -------------------------------------------------------------------
+
+    /// Helper: inject a fingerprint-path VehicleTrack directly into the
+    /// resolver with the given pressure, tx_interval_median, and last_seen
+    /// offset (seconds before `base`).
+    fn inject_fingerprint_vehicle(
+        resolver: &mut Resolver,
+        pressure_kpa: f32,
+        tx_interval_median_ms: Option<u32>,
+        last_seen: DateTime<Utc>,
+    ) -> Uuid {
+        let vid = Uuid::new_v4();
+        let vehicle_class = infer_vehicle_class(pressure_kpa, None);
+        let mut intervals = VecDeque::new();
+        // If a median is provided, fill the ring buffer with enough samples
+        // so that compute_median returns the same value.
+        if let Some(median) = tx_interval_median_ms {
+            for _ in 0..TX_INTERVAL_MIN_SAMPLES {
+                intervals.push_back(median);
+            }
+        }
+        let vehicle = VehicleTrack {
+            vehicle_id: vid,
+            first_seen: last_seen,
+            last_seen,
+            sighting_count: 10,
+            protocol: "EezTire".to_string(),
+            rtl433_id: 241,
+            fixed_sensor_id: None,
+            pressure_signature: [pressure_kpa, 0.0, 0.0, 0.0],
+            make_model_hint: make_model_hint(241).map(str::to_owned),
+            battery_ok: true,
+            tx_intervals_ms: intervals,
+            tx_interval_median_ms,
+            car_id: None,
+            receiver_sightings: HashMap::new(),
+            wheel_position: None,
+            vehicle_class,
+            fingerprint_id: None,
+        };
+        // Persist to DB so that subsequent process() calls don't hit FK errors.
+        resolver.db.upsert_vehicle(&vehicle).unwrap();
+        resolver.vehicles.insert(vid, vehicle);
+        vid
+    }
+
+    #[test]
+    fn four_vehicles_same_pressure_no_hint_matches_most_recent() {
+        // AC: 4 active vehicles at 51.1 kPa with established intervals,
+        // incoming packet at 51.1 kPa with no interval hint → matched to
+        // most recently seen, not new vehicle.
+        let mut resolver = in_memory_resolver();
+        let base = chrono::Utc::now();
+
+        // Inject 4 vehicles at the same compensated pressure with different
+        // intervals and staggered last_seen times.
+        let compensated = compensate_pressure(51.1, Some(25.0));
+        let _v1 = inject_fingerprint_vehicle(
+            &mut resolver,
+            compensated,
+            Some(30_000),
+            base - Duration::seconds(120),
+        );
+        let _v2 = inject_fingerprint_vehicle(
+            &mut resolver,
+            compensated,
+            Some(45_000),
+            base - Duration::seconds(90),
+        );
+        let _v3 = inject_fingerprint_vehicle(
+            &mut resolver,
+            compensated,
+            Some(60_000),
+            base - Duration::seconds(60),
+        );
+        let v4 = inject_fingerprint_vehicle(
+            &mut resolver,
+            compensated,
+            Some(71_000),
+            base - Duration::seconds(30),
+        );
+
+        assert_eq!(
+            resolver.vehicles.len(),
+            4,
+            "setup: 4 vehicles must exist"
+        );
+
+        // Feed a new EezTire packet at 51.1 kPa.  The timestamp must be
+        // formatted in local time because TpmsPacket::parsed_ts interprets it
+        // as local.
+        let now_local = base.with_timezone(&chrono::Local);
+        let ts_str = now_local.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        let p = make_packet_at(&ts_str, "0xFDFFFFFF", "EezTire", 241, 51.1);
+        let result = resolver.process(&p).unwrap();
+
+        assert!(
+            result.is_some(),
+            "must match an existing vehicle, not return None"
+        );
+        let matched = result.unwrap();
+
+        // Should match v4 — the most recently seen.
+        assert_eq!(
+            matched, v4,
+            "must match the most recently seen vehicle (v4), not create a new one"
+        );
+
+        // No new vehicle should have been created.
+        assert_eq!(
+            resolver.vehicles.len(),
+            4,
+            "no new vehicle should be created when pressure matches exist"
+        );
+    }
+
+    #[test]
+    fn two_vehicles_same_pressure_hint_selects_closer_interval() {
+        // AC: 2 active vehicles at 51.1 kPa with intervals 45s and 71s,
+        // incoming packet at 51.1 kPa with hint 44s → matched to the 45s
+        // vehicle.
+        let mut resolver = in_memory_resolver();
+        let base = chrono::Utc::now();
+
+        let compensated = compensate_pressure(51.1, Some(25.0));
+        let v_45 = inject_fingerprint_vehicle(
+            &mut resolver,
+            compensated,
+            Some(45_000),
+            base - Duration::seconds(60),
+        );
+        let _v_71 = inject_fingerprint_vehicle(
+            &mut resolver,
+            compensated,
+            Some(71_000),
+            base - Duration::seconds(30),
+        );
+
+        assert_eq!(resolver.vehicles.len(), 2);
+
+        // Craft a sighting with tx_interval_hint_ms = 44_000.
+        // To get this hint, we set last_seen_by_protocol for rtl433_id=241
+        // to 44 seconds before the sighting.
+        let sighting_ts = base;
+        let hint_origin = sighting_ts - Duration::milliseconds(44_000);
+        resolver.last_seen_by_protocol.insert(241, hint_origin);
+
+        let now_local = sighting_ts.with_timezone(&chrono::Local);
+        let ts_str = now_local.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        let p = make_packet_at(&ts_str, "0xFDFFFFFF", "EezTire", 241, 51.1);
+        let result = resolver.process(&p).unwrap();
+
+        assert!(result.is_some(), "must match an existing vehicle");
+        let matched = result.unwrap();
+        assert_eq!(
+            matched, v_45,
+            "hint=44s is within tolerance of the 45s vehicle but not the 71s vehicle; \
+             must match the 45s vehicle"
+        );
+
+        // No new vehicle created.
+        assert_eq!(
+            resolver.vehicles.len(),
+            2,
+            "no new vehicle should be created"
         );
     }
 }
