@@ -965,11 +965,7 @@ impl Database {
     }
 
     /// Set the fingerprint_id column on a vehicle.
-    pub fn set_vehicle_fingerprint_id(
-        &self,
-        vehicle_id: Uuid,
-        fingerprint_id: &str,
-    ) -> Result<()> {
+    pub fn set_vehicle_fingerprint_id(&self, vehicle_id: Uuid, fingerprint_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE vehicles SET fingerprint_id = ?1 WHERE vehicle_id = ?2",
             params![fingerprint_id, vehicle_id.to_string()],
@@ -1581,8 +1577,14 @@ mod tests {
         assert_eq!(fps[0].total_sighting_count, 1);
         assert_eq!(fps[0].session_count, 1);
 
-        db.update_fingerprint("fp-test1234", 51.3, None, "2025-06-01T12:01:00+00:00", false)
-            .unwrap();
+        db.update_fingerprint(
+            "fp-test1234",
+            51.3,
+            None,
+            "2025-06-01T12:01:00+00:00",
+            false,
+        )
+        .unwrap();
         let fps = db.api_fingerprints().unwrap();
         assert_eq!(fps[0].total_sighting_count, 2);
 
