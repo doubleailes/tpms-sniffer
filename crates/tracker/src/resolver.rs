@@ -42,15 +42,13 @@ const BIT_FLIP_ID_PROTOCOLS: &[u16] = &[
 /// as legitimate fixed IDs, cause cross-protocol vehicle merging in the
 /// fixed-ID map.
 ///
-/// The check rejects all-zeros and any ID with fewer than 2 bits cleared from
-/// the all-ones state. A `>= 2` threshold (rather than the `>= 3` originally
-/// proposed) preserves the confirmed real TRW sensor `0xFEFFFFFD`, which has
-/// exactly 2 bits cleared. Raising the threshold further would regress that
-/// known-good fixed-ID track.
+/// The check rejects all-zeros and any ID with fewer than 3 bits cleared from
+/// the all-ones state. IDs with 0–2 bits cleared are near-sentinel decode
+/// artifacts.
 fn is_valid_sensor_id(id: u32) -> bool {
-    // Reject 0x00000000 and any ID with ≤ 1 bit cleared from 0xFFFFFFFF.
-    // IDs with 0–1 bits cleared are decode artifacts (unresolved bit fields).
-    id != 0x00000000 && id.count_zeros() >= 2
+    // Reject 0x00000000 and any ID with ≤ 2 bits cleared from 0xFFFFFFFF.
+    // IDs with 0–2 bits cleared are decode artifacts (unresolved bit fields).
+    id != 0x00000000 && id.count_zeros() >= 3
 }
 
 /// Maximum gap (ms) between consecutive packets belonging to the same burst.
@@ -1573,21 +1571,21 @@ mod tests {
     fn valid_fixed_id_still_works() {
         let mut resolver = in_memory_resolver();
 
-        // TRW sensor 0xFEFFFFFD — a valid fixed ID.
+        // TRW sensor 0xDFEFDFFF — a valid fixed ID (3 bits cleared).
         for _ in 0..5 {
-            let p = make_packet("0xFEFFFFFD", "TRW-OOK", 298, 63.8);
+            let p = make_packet("0xDFEFDFFF", "TRW-OOK", 298, 63.8);
             resolver.process(&p).unwrap();
         }
 
         // All 5 sightings should map to the same vehicle via the fixed-ID path.
         assert!(
-            resolver.fixed_map.contains_key(&(0xFEFFFFFD, 298)),
-            "valid ID 0xFEFFFFFD must be in the fixed_map"
+            resolver.fixed_map.contains_key(&(0xDFEFDFFF, 298)),
+            "valid ID 0xDFEFDFFF must be in the fixed_map"
         );
-        let vid = resolver.fixed_map[&(0xFEFFFFFD, 298)];
+        let vid = resolver.fixed_map[&(0xDFEFDFFF, 298)];
         let vehicle = &resolver.vehicles[&vid];
         assert_eq!(vehicle.sighting_count, 5);
-        assert_eq!(vehicle.fixed_sensor_id, Some(0xFEFFFFFD));
+        assert_eq!(vehicle.fixed_sensor_id, Some(0xDFEFDFFF));
     }
 
     #[test]
@@ -2067,9 +2065,8 @@ mod tests {
         assert!(!is_valid_sensor_id(0xFFFFFFFB));
         assert!(!is_valid_sensor_id(0xFFFFFFBF));
 
-        // Confirmed real TRW sensor with exactly 2 bits cleared — must not
-        // regress.
-        assert!(is_valid_sensor_id(0xFEFFFFFD));
+        // Near-sentinel with exactly 2 bits cleared (decode artifact).
+        assert!(!is_valid_sensor_id(0xFEFFFFFD));
 
         // Arbitrary real IDs.
         assert!(is_valid_sensor_id(0x1A2B3C4D));
@@ -2078,7 +2075,7 @@ mod tests {
 
     /// Popcount boundary coverage required by the acceptance criteria:
     /// IDs with 0, 1, 2, 3, and 4 bits cleared must return the correct
-    /// valid/invalid result. The boundary sits between 1 and 2 bits cleared.
+    /// valid/invalid result. The boundary sits between 2 and 3 bits cleared.
     #[test]
     fn is_valid_sensor_id_popcount_boundary() {
         // 0 bits cleared → invalid.
@@ -2089,9 +2086,9 @@ mod tests {
         assert_eq!(0xFFFFFFFEu32.count_zeros(), 1);
         assert!(!is_valid_sensor_id(0xFFFFFFFE));
 
-        // 2 bits cleared → valid.
+        // 2 bits cleared → invalid.
         assert_eq!(0xFFFFFFFCu32.count_zeros(), 2);
-        assert!(is_valid_sensor_id(0xFFFFFFFC));
+        assert!(!is_valid_sensor_id(0xFFFFFFFC));
 
         // 3 bits cleared → valid.
         assert_eq!(0xFFFFFFF8u32.count_zeros(), 3);
@@ -2100,6 +2097,28 @@ mod tests {
         // 4 bits cleared → valid.
         assert_eq!(0xFFFFFFF0u32.count_zeros(), 4);
         assert!(is_valid_sensor_id(0xFFFFFFF0));
+    }
+
+    /// Boundary values from issue #27 — verify every row of the acceptance
+    /// table.
+    #[test]
+    fn is_valid_sensor_id_issue27_boundary_values() {
+        // 0xFFFFFFFF → 0 zeros → false
+        assert!(!is_valid_sensor_id(0xFFFFFFFF));
+        // 0xFFFFFFFE → 1 zero → false
+        assert!(!is_valid_sensor_id(0xFFFFFFFE));
+        // 0x5FFFFFFF → 2 zeros → false
+        assert_eq!(0x5FFFFFFFu32.count_zeros(), 2);
+        assert!(!is_valid_sensor_id(0x5FFFFFFF));
+        // 0xDFEFDFFF → 3 zeros → true (no regression)
+        assert_eq!(0xDFEFDFFFu32.count_zeros(), 3);
+        assert!(is_valid_sensor_id(0xDFEFDFFF));
+        // 0xF77FEFFF → 3 zeros → true (no regression)
+        assert_eq!(0xF77FEFFFu32.count_zeros(), 3);
+        assert!(is_valid_sensor_id(0xF77FEFFF));
+        // 0xFEFFFFFD → 2 zeros → false
+        assert_eq!(0xFEFFFFFDu32.count_zeros(), 2);
+        assert!(!is_valid_sensor_id(0xFEFFFFFD));
     }
 
     #[test]
@@ -2204,10 +2223,10 @@ mod tests {
             .map(|v| v.vehicle_id)
             .expect("AVE vehicle must exist");
 
-        // Packet 1: TRW-OOK, valid fixed ID 0xFEFFFFFD.
+        // Packet 1: TRW-OOK, valid fixed ID 0xDFEFDFFF (3 bits cleared).
         let p1 = make_packet_at(
             "2025-06-01 21:58:42.000",
-            "0xFEFFFFFD",
+            "0xDFEFDFFF",
             "TRW-OOK",
             298,
             63.8,
@@ -2234,10 +2253,10 @@ mod tests {
             );
         }
 
-        // Packet 3: TRW-OOK, valid fixed ID 0xFEFFFFFD (same as packet 1).
+        // Packet 3: TRW-OOK, valid fixed ID 0xDFEFDFFF (same as packet 1).
         let p3 = make_packet_at(
             "2025-06-01 21:58:45.000",
-            "0xFEFFFFFD",
+            "0xDFEFDFFF",
             "TRW-OOK",
             298,
             63.8,
