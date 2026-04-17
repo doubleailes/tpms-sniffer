@@ -170,3 +170,48 @@ ALTER TABLE vehicles ADD COLUMN vehicle_class TEXT NOT NULL DEFAULT 'Unknown';
 ```
 
 `vehicle_class` is also included in JSON report output via `VehicleSummary`.
+
+## Persistent fingerprint store
+
+The fingerprint store links vehicle UUIDs across sessions via a stable
+`fingerprint_id`.  When a sensor's track expires (`VEHICLE_EXPIRY`) and a new
+UUID is created, the tracker queries the `fingerprints` table to determine
+whether the sensor has been seen before.  If a match is found, the new vehicle
+is linked to the same `fingerprint_id`, avoiding fragmentation of the tracking
+history.
+
+### Tuning constants
+
+| Constant | Value | Rationale |
+|---|---:|---|
+| `FINGERPRINT_MIN_SIGHTINGS` | 5 | Minimum sightings before a stored fingerprint is used as a match candidate. A fingerprint with fewer sightings may represent a noise event. |
+| `FINGERPRINT_MAX_GAP_DAYS` | 30 | Maximum days since `last_seen` before a fingerprint is considered stale and excluded from matching. Stale fingerprints are ignored; a new one is created. |
+
+### Database schema
+
+The fingerprint store adds a `fingerprints` table and a `fingerprint_id` FK
+column on the `vehicles` table.  Both are created via automatic migrations.
+
+```sql
+CREATE TABLE IF NOT EXISTS fingerprints (
+    fingerprint_id        TEXT PRIMARY KEY,
+    rtl433_id             INTEGER NOT NULL,
+    vehicle_class         TEXT NOT NULL,
+    pressure_median_kpa   REAL NOT NULL,
+    tx_interval_median_ms INTEGER,
+    first_seen            TEXT NOT NULL,
+    last_seen             TEXT NOT NULL,
+    total_sighting_count  INTEGER NOT NULL DEFAULT 0,
+    session_count         INTEGER NOT NULL DEFAULT 1,
+    alarm_rate            REAL,
+    notes                 TEXT
+);
+
+ALTER TABLE vehicles ADD COLUMN fingerprint_id TEXT REFERENCES fingerprints(fingerprint_id);
+```
+
+### API
+
+- `GET /api/fingerprints` — returns all stored fingerprints ordered by
+  `last_seen DESC`, including linked `vehicle_ids`.
+- `GET /api/cars` — vehicle rows now include `fingerprint_id`.
