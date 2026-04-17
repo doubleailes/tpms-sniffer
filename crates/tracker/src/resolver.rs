@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
+use log::{debug, trace};
 use std::collections::VecDeque;
 use uuid::Uuid;
 
@@ -141,6 +142,9 @@ pub struct Resolver {
     vehicle_to_car: HashMap<Uuid, Uuid>,
     /// Mapping from `vehicle_id` to its persistent fingerprint_id.
     vehicle_to_fingerprint: HashMap<Uuid, String>,
+    /// Car-IDs that have already been merged (absorbed) into another car.
+    /// Prevents duplicate merge log events across grouping passes.
+    merged_car_ids: HashSet<(Uuid, Uuid)>,
 }
 
 impl Resolver {
@@ -162,6 +166,7 @@ impl Resolver {
             receiver_id,
             vehicle_to_car: HashMap::new(),
             vehicle_to_fingerprint: HashMap::new(),
+            merged_car_ids: HashSet::new(),
         };
         r.load_from_db()?;
         Ok(r)
@@ -294,12 +299,19 @@ impl Resolver {
 
     fn process_fixed(&mut self, sighting: Sighting, rtl433_id: u16) -> Result<Option<Uuid>> {
         let sensor_id = sighting.sensor_id;
+        let zeros = sensor_id.count_zeros();
 
         // Defense-in-depth: reject near-sentinel IDs at the insertion point,
         // not just at the routing level in `process()`.  Without this guard a
         // future refactor that changes the routing logic could silently allow
         // near-sentinel IDs to create fixed-ID vehicles.
         if !is_valid_sensor_id(sensor_id) {
+            debug!(
+                "{} | RESOLVE | sensor={:#010X} | zeros={} | valid=false | \
+                 path=fixed_id | result=rejected_sentinel",
+                sighting.ts.format("%Y-%m-%d %H:%M:%S%.3f"),
+                sensor_id, zeros,
+            );
             return self.process_rolling(sighting);
         }
 
@@ -309,6 +321,7 @@ impl Resolver {
         let key = (sensor_id, rtl433_id);
 
         // Look up or create the vehicle.
+        let mut is_new_vehicle = false;
         let vehicle_id = if let Some(&vid) = self.fixed_map.get(&key) {
             vid
         } else if rtl433_id != 0 {
@@ -357,6 +370,7 @@ impl Resolver {
                     };
                     self.fixed_map.insert(key, vid);
                     self.vehicles.insert(vid, vehicle);
+                    is_new_vehicle = true;
                     vid
                 }
             } else {
@@ -382,6 +396,7 @@ impl Resolver {
                 };
                 self.fixed_map.insert(key, vid);
                 self.vehicles.insert(vid, vehicle);
+                is_new_vehicle = true;
                 vid
             }
         } else {
@@ -407,8 +422,34 @@ impl Resolver {
             };
             self.fixed_map.insert(key, vid);
             self.vehicles.insert(vid, vehicle);
+            is_new_vehicle = true;
             vid
         };
+
+        // RESOLVE debug log for fixed-ID path.
+        let result_str = if is_new_vehicle { "new" } else { "existing" };
+        debug!(
+            "{} | RESOLVE | sensor={:#010X} | zeros={} | valid=true | \
+             path=fixed_id | key=({:#010X},{}) | result={} | pressure={:.1}",
+            sighting.ts.format("%Y-%m-%d %H:%M:%S%.3f"),
+            sensor_id, zeros,
+            sensor_id, rtl433_id,
+            result_str,
+            sighting.pressure_kpa,
+        );
+
+        // TRACE event for vehicle creation.
+        if is_new_vehicle {
+            trace!(
+                "{} | EVENT | type=vehicle_created | vehicle={} | protocol={} | \
+                 rtl433={} | pressure={:.1} | path=fixed_id",
+                sighting.ts.format("%Y-%m-%d %H:%M:%S%.3f"),
+                &vehicle_id.to_string()[..8],
+                sighting.protocol,
+                rtl433_id,
+                sighting.pressure_kpa,
+            );
+        }
 
         // Cross-receiver dedup check + update in-memory state.
         let is_dup = {
@@ -493,6 +534,17 @@ impl Resolver {
         let protocol = sighting.protocol.clone();
         let rtl433_id = sighting.rtl433_id;
         let hint = sighting.tx_interval_hint_ms;
+        let sensor_id = sighting.sensor_id;
+        let zeros = sensor_id.count_zeros();
+        let valid = is_valid_sensor_id(sensor_id);
+
+        // Count candidates for RESOLVE logging.
+        let candidates = self
+            .vehicles
+            .values()
+            .filter(|v| v.rtl433_id == rtl433_id && v.fixed_sensor_id.is_none())
+            .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
+            .count();
 
         // Find an active vehicle of the same protocol whose pressure
         // signature is within tolerance.  Use `rtl433_id` (not the display
@@ -533,9 +585,24 @@ impl Resolver {
             .map(|v| v.vehicle_id);
 
         let vehicle_id = if let Some(vid) = matched_vid {
+            // RESOLVE: matched an existing fingerprint-correlator vehicle.
+            let vehicle = &self.vehicles[&vid];
+            let pressure_before = vehicle.pressure_signature[0];
+            debug!(
+                "{} | RESOLVE | sensor={:#010X} | zeros={} | valid={} | \
+                 path=fingerprint_correlator | candidates={} | matched={} | \
+                 match_reason=pressure_delta:{:.1}_kpa | protocol_filter=pass | \
+                 pressure_before={:.1} | pressure_after={:.1}",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                sensor_id, zeros, valid,
+                candidates,
+                &vid.to_string()[..8],
+                (pressure_before - pressure).abs(),
+                pressure_before,
+                pressure,
+            );
             vid
         } else {
-            // Try the persistent fingerprint store before creating a genuinely new vehicle.
             let fp_class = infer_vehicle_class(pressure, None);
             let fp_match = self.db.find_fingerprint(
                 rtl433_id,
@@ -568,11 +635,23 @@ impl Resolver {
             };
             self.vehicles.insert(vid, vehicle);
 
+            let fp_path = if fp_match.is_some() {
+                "fingerprint_store"
+            } else {
+                "fingerprint_correlator"
+            };
             if let Some(ref fp_id) = fp_match {
                 // Known sensor returning after a gap.
                 self.vehicle_to_fingerprint.insert(vid, fp_id.clone());
                 self.db.set_vehicle_fingerprint_id(vid, fp_id)?;
                 self.db.increment_fingerprint_session(fp_id)?;
+                // TRACE: fingerprint match event.
+                trace!(
+                    "{} | EVENT | type=fingerprint_match | vehicle={} | fp={}",
+                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                    &vid.to_string()[..8],
+                    fp_id,
+                );
             } else {
                 // Genuinely new sensor — create a new fingerprint.
                 let fp_id = format!("fp-{}", &vid.to_string()[..8]);
@@ -590,7 +669,42 @@ impl Resolver {
                     sighting.alarm,
                 )?;
                 self.db.set_vehicle_fingerprint_id(vid, &fp_id)?;
+                // TRACE: fingerprint created event.
+                trace!(
+                    "{} | EVENT | type=fingerprint_created | fp={} | vehicle={} | \
+                     protocol={} | pressure={:.1} | class={}",
+                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                    fp_id,
+                    &vid.to_string()[..8],
+                    protocol,
+                    pressure,
+                    fp_class,
+                );
             }
+
+            // RESOLVE: new vehicle created via fingerprint path.
+            debug!(
+                "{} | RESOLVE | sensor={:#010X} | zeros={} | valid={} | \
+                 path={} | candidates={} | matched=none | \
+                 result=new_vehicle | pressure={:.1}",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                sensor_id, zeros, valid,
+                fp_path,
+                candidates,
+                pressure,
+            );
+
+            // TRACE: vehicle created event.
+            trace!(
+                "{} | EVENT | type=vehicle_created | vehicle={} | protocol={} | \
+                 rtl433={} | pressure={:.1} | path={}",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                &vid.to_string()[..8],
+                protocol,
+                rtl433_id,
+                pressure,
+                fp_path,
+            );
             vid
         };
 
@@ -736,6 +850,14 @@ impl Resolver {
         let now = burst.last_ts;
         let sig = burst_to_signature(&burst.pressures);
 
+        // Count candidates for RESOLVE logging.
+        let candidates = self
+            .vehicles
+            .values()
+            .filter(|v| v.fixed_sensor_id.is_none() && v.rtl433_id == burst.rtl433_id)
+            .filter(|v| now.signed_duration_since(v.last_seen) < effective_expiry(v))
+            .count();
+
         // Find an existing rolling-ID vehicle whose pressure signature is close
         // enough and that was seen recently enough to still be active.  We copy
         // the Uuid (it's Copy) so we drop the shared borrow before taking the
@@ -778,9 +900,28 @@ impl Resolver {
             .map(|v| v.vehicle_id);
 
         let vehicle_id = if let Some(vid) = matched_vid {
+            // RESOLVE: matched an existing rolling-ID vehicle.
+            let vehicle = &self.vehicles[&vid];
+            let pressure_before = vehicle
+                .pressure_signature
+                .iter()
+                .find(|&&p| p > 0.0)
+                .copied()
+                .unwrap_or(0.0);
+            let class_pressure = sig.iter().find(|&&p| p > 0.0).copied().unwrap_or(0.0);
+            debug!(
+                "{} | RESOLVE | path=rolling_id | candidates={} | matched={} | \
+                 match_reason=pressure_delta:{:.1}_kpa | protocol_filter=pass | \
+                 pressure_before={:.1} | pressure_after={:.1}",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                candidates,
+                &vid.to_string()[..8],
+                (pressure_before - class_pressure).abs(),
+                pressure_before,
+                class_pressure,
+            );
             vid
         } else {
-            // First sighting of this vehicle — try the persistent fingerprint store.
             let vid = Uuid::new_v4();
             let class_pressure = sig.iter().find(|&&p| p > 0.0).copied().unwrap_or(0.0);
             let fp_class = infer_vehicle_class(class_pressure, None);
@@ -818,6 +959,12 @@ impl Resolver {
                 self.vehicle_to_fingerprint.insert(vid, fp_id.clone());
                 self.db.set_vehicle_fingerprint_id(vid, fp_id)?;
                 self.db.increment_fingerprint_session(fp_id)?;
+                trace!(
+                    "{} | EVENT | type=fingerprint_match | vehicle={} | fp={}",
+                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                    &vid.to_string()[..8],
+                    fp_id,
+                );
             } else {
                 let fp_id = format!("fp-{}", &vid.to_string()[..8]);
                 if let Some(v) = self.vehicles.get_mut(&vid) {
@@ -834,7 +981,38 @@ impl Resolver {
                     false,
                 )?;
                 self.db.set_vehicle_fingerprint_id(vid, &fp_id)?;
+                trace!(
+                    "{} | EVENT | type=fingerprint_created | fp={} | vehicle={} | \
+                     protocol={} | pressure={:.1} | class={}",
+                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                    fp_id,
+                    &vid.to_string()[..8],
+                    burst.protocol,
+                    class_pressure,
+                    fp_class,
+                );
             }
+
+            // RESOLVE: new vehicle created via rolling-ID burst.
+            debug!(
+                "{} | RESOLVE | path=rolling_id | candidates={} | matched=none | \
+                 result=new_vehicle | pressure={:.1}",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                candidates,
+                class_pressure,
+            );
+
+            // TRACE: vehicle created event.
+            trace!(
+                "{} | EVENT | type=vehicle_created | vehicle={} | protocol={} | \
+                 rtl433={} | pressure={:.1} | path=rolling_id",
+                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                &vid.to_string()[..8],
+                burst.protocol,
+                burst.rtl433_id,
+                class_pressure,
+            );
+
             vid
         };
 
@@ -938,6 +1116,37 @@ impl Resolver {
         if should_advance {
             self.last_window_advance = Some(now);
             self.cooccurrence.advance_window();
+
+            // Emit TRACE events for vehicles that have just expired.
+            for v in self.vehicles.values() {
+                let age = now.signed_duration_since(v.last_seen);
+                let expiry = effective_expiry(v);
+                // Emit once: expired this window but not in the previous one.
+                if age >= expiry && age < expiry + Duration::seconds(WINDOW_SIZE_S as i64) {
+                    let fp = v
+                        .fingerprint_id
+                        .as_deref()
+                        .unwrap_or("none");
+                    let car_id = v
+                        .car_id
+                        .map(|c| c.to_string()[..8].to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    trace!(
+                        "{} | EVENT | type=vehicle_expired | vehicle={} | fp={} | \
+                         car={} | age_secs={} | sightings={} | last_pressure={:.1} | \
+                         last_seen={}",
+                        now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                        &v.vehicle_id.to_string()[..8],
+                        fp,
+                        car_id,
+                        age.num_seconds(),
+                        v.sighting_count,
+                        v.pressure_signature[0],
+                        v.last_seen.format("%H:%M:%S"),
+                    );
+                }
+            }
+
             // Best-effort grouping; errors are non-fatal.
             let _ = self.run_grouping();
         }
@@ -984,6 +1193,24 @@ impl Resolver {
 
             // Reuse the first previously-assigned car_id, or mint a new one.
             let stable_car_id = previous_car_ids.first().copied().unwrap_or(group.car_id);
+            let is_new_car = previous_car_ids.is_empty();
+
+            // TRACE: car_group_created event.
+            if is_new_car && !group.members.is_empty() {
+                let first_vid = group.members.iter().next();
+                let first_vehicle = first_vid.and_then(|vid| self.vehicles.get(vid));
+                let protocol = first_vehicle
+                    .map(|v| v.protocol.as_str())
+                    .unwrap_or("unknown");
+                trace!(
+                    "EVENT | type=car_group_created | car={} | vehicle={} | protocol={}",
+                    &stable_car_id.to_string()[..8],
+                    first_vid
+                        .map(|v| v.to_string()[..8].to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    protocol,
+                );
+            }
 
             // Detect and handle merge events: when the fresh grouping
             // consolidates vehicles from multiple old car_ids.
@@ -1007,10 +1234,26 @@ impl Resolver {
                         .cooccurrence
                         .inter_group_jaccard(&kept_members, &discarded_members);
 
-                    eprintln!(
-                        "info: CarGroup merge: car {} absorbed car {} (Jaccard score: {:.3})",
-                        stable_car_id, discarded, score
-                    );
+                    let merge_key = (stable_car_id, discarded);
+                    if !self.merged_car_ids.contains(&merge_key) {
+                        trace!(
+                            "EVENT | type=jaccard_merge | keep={} | discard={} | \
+                             score={:.3} | keep_size={} | discard_size={} | \
+                             members=[{}]",
+                            &stable_car_id.to_string()[..8],
+                            &discarded.to_string()[..8],
+                            score,
+                            kept_members.len(),
+                            discarded_members.len(),
+                            group
+                                .members
+                                .iter()
+                                .map(|m| m.to_string()[..8].to_string())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                    }
+                    self.merged_car_ids.insert(merge_key);
 
                     // Reassign all vehicles in the database from discarded → kept.
                     self.db.reassign_vehicles_car_id(discarded, stable_car_id)?;

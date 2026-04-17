@@ -13,7 +13,9 @@ anyhow     = { workspace = true }
 axum       = { version = "0.8", features = ["json"] }
 chrono     = { workspace = true }
 clap       = { workspace = true }
+env_logger = "0.11"
 flate2     = "1"
+log        = "0.4"
 rusqlite   = { version = "0.31", features = ["bundled"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }

@@ -4,6 +4,7 @@ use std::process;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use log::info;
 use tpms_tracker::{TpmsPacket, analytics, db::Database, replay, resolver::Resolver, server};
 
 #[derive(Parser)]
@@ -21,6 +22,11 @@ struct Args {
     /// Print a line for every resolved packet.
     #[arg(long, short)]
     verbose: bool,
+
+    /// Log level: info (sightings only), debug (+resolver decisions),
+    /// trace (+tracker events).  Overridden by the RUST_LOG env var.
+    #[arg(long, default_value = "info")]
+    log_level: String,
 
     /// Minimum confidence score (0–100) to process.
     #[arg(long, default_value_t = 65)]
@@ -88,8 +94,22 @@ enum Command {
     },
 }
 
+fn init_logging(level: &str) {
+    let env = env_logger::Env::default()
+        .filter_or("RUST_LOG", format!("tpms_tracker={level}"));
+    env_logger::Builder::from_env(env)
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(buf, "{}", record.args())
+        })
+        .target(env_logger::Target::Stderr)
+        .init();
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    init_logging(&args.log_level);
 
     match &args.command {
         Some(Command::Report {
@@ -218,18 +238,39 @@ fn run_stdin_inner(
 
         match resolver.process(&packet) {
             Ok(Some(vid)) if verbose => {
-                let car_id = resolver
-                    .vehicles()
-                    .get(&vid)
+                let vehicle = resolver.vehicles().get(&vid);
+                let car_id = vehicle
                     .and_then(|v| v.car_id)
-                    .map(|c| c.to_string())
+                    .map(|c| c.to_string()[..8].to_string())
                     .unwrap_or_else(|| "none".to_string());
-                println!(
-                    "{} | vehicle={vid} | car={car_id} | sensor={} | {:.1} kPa | {} | receiver={}",
+                let fp = vehicle
+                    .and_then(|v| v.fingerprint_id.as_deref())
+                    .unwrap_or("none");
+                let class = vehicle
+                    .map(|v| v.vehicle_class.as_str())
+                    .unwrap_or("Unknown");
+                let zeros = packet
+                    .sensor_id_u32()
+                    .map(|sid| sid.count_zeros())
+                    .unwrap_or(0);
+                let temp_str = packet
+                    .temp_c
+                    .filter(|&t| t < 200.0)
+                    .map(|t| format!("{t:.1}"))
+                    .unwrap_or_else(|| "null".to_string());
+                let alarm = packet.alarm.unwrap_or(false);
+                let battery = !packet.battery_ok.unwrap_or(true);
+                info!(
+                    "{} | SIGHT | vehicle={} | car={car_id} | fp={fp} | \
+                     sensor={} | zeros={zeros} | pressure={:.1} | temp={temp_str} | \
+                     alarm={alarm} | battery={battery} | protocol={} | \
+                     rtl433={} | class={class} | receiver={}",
                     packet.timestamp,
+                    &vid.to_string()[..8],
                     packet.sensor_id,
                     packet.pressure_kpa,
                     packet.protocol,
+                    packet.rtl433_id,
                     packet.receiver_id,
                 );
             }
