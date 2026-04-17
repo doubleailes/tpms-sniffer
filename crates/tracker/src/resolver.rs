@@ -103,6 +103,7 @@ const EMA_ALPHA: f32 = 0.2;
 struct BurstAccumulator {
     protocol: String,
     rtl433_id: u16,
+    sensor_id: u32,
     pressures: Vec<f32>,
     last_ts: DateTime<Utc>,
 }
@@ -834,6 +835,7 @@ impl Resolver {
             self.pending_burst = Some(BurstAccumulator {
                 protocol,
                 rtl433_id: sighting.rtl433_id,
+                sensor_id: sighting.sensor_id,
                 pressures: vec![sighting.pressure_kpa],
                 last_ts: ts,
             });
@@ -843,6 +845,7 @@ impl Resolver {
             // Extend the current burst.
             if let Some(burst) = &mut self.pending_burst {
                 burst.pressures.push(sighting.pressure_kpa);
+                burst.sensor_id = sighting.sensor_id;
                 burst.last_ts = ts;
             }
             None
@@ -915,10 +918,14 @@ impl Resolver {
                 .unwrap_or(0.0);
             let class_pressure = sig.iter().find(|&&p| p > 0.0).copied().unwrap_or(0.0);
             debug!(
-                "{} | RESOLVE | path=rolling_id | candidates={} | matched={} | \
+                "{} | RESOLVE | sensor={:#010x} | zeros={} | valid={} | \
+                 path=rolling_id | candidates={} | matched={} | \
                  match_reason=pressure_delta:{:.1}_kpa | protocol_filter=pass | \
                  pressure_before={:.1} | pressure_after={:.1}",
                 now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                burst.sensor_id,
+                burst.sensor_id.count_zeros(),
+                is_valid_sensor_id(burst.sensor_id),
                 candidates,
                 &vid.to_string()[..8],
                 (pressure_before - class_pressure).abs(),
@@ -1000,9 +1007,13 @@ impl Resolver {
 
             // RESOLVE: new vehicle created via rolling-ID burst.
             debug!(
-                "{} | RESOLVE | path=rolling_id | candidates={} | matched=none | \
+                "{} | RESOLVE | sensor={:#010x} | zeros={} | valid={} | \
+                 path=rolling_id | candidates={} | matched=none | \
                  result=new_vehicle | pressure={:.1}",
                 now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                burst.sensor_id,
+                burst.sensor_id.count_zeros(),
+                is_valid_sensor_id(burst.sensor_id),
                 candidates,
                 class_pressure,
             );
