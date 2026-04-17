@@ -8,7 +8,7 @@ use anyhow::Result;
 use flate2::read::GzDecoder;
 use uuid::Uuid;
 
-use crate::TpmsPacket;
+use crate::{MAX_PLAUSIBLE_PRESSURE_KPA, MIN_PLAUSIBLE_PRESSURE_KPA, TpmsPacket};
 use crate::db::Database;
 use crate::resolver::Resolver;
 
@@ -205,7 +205,7 @@ pub fn assert_consistency(result: &ReplayResult) -> Vec<ConsistencyError> {
 
         // Pressure is physically plausible (per-vehicle average pressures).
         for &p in &vehicle.pressures_kpa {
-            if p < 1.5 || p > 900.0 {
+            if p < MIN_PLAUSIBLE_PRESSURE_KPA || p > MAX_PLAUSIBLE_PRESSURE_KPA {
                 errors.push(ConsistencyError::ImplausiblePressure {
                     vehicle_id: vehicle.vehicle_id,
                     pressure_kpa: p,
@@ -279,7 +279,7 @@ pub fn print_summary(result: &ReplayResult, errors: &[ConsistencyError]) {
         .filter(|e| matches!(e, ConsistencyError::ImplausiblePressure { .. }))
         .collect();
     if implausible.is_empty() {
-        eprintln!("PASS  all pressures in plausible range (1.5-900 kPa)");
+        eprintln!("PASS  all pressures in plausible range ({MIN_PLAUSIBLE_PRESSURE_KPA}-{MAX_PLAUSIBLE_PRESSURE_KPA} kPa)");
     } else {
         for e in &implausible {
             eprintln!("FAIL  {e}");

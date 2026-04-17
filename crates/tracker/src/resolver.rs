@@ -13,9 +13,10 @@ use crate::jaccard::{
     infer_wheel_positions,
 };
 use crate::{
-    CROSS_RECEIVER_WINDOW_MS, FINGERPRINT_MAX_GAP_DAYS, Sighting, TX_INTERVAL_MAX_MS,
-    TX_INTERVAL_MIN_SAMPLES, TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW, TpmsPacket,
-    VehicleTrack, compute_median, make_model_hint,
+    CROSS_RECEIVER_WINDOW_MS, FINGERPRINT_MAX_GAP_DAYS, MAX_PLAUSIBLE_PRESSURE_KPA,
+    MIN_PLAUSIBLE_PRESSURE_KPA, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_MIN_SAMPLES,
+    TX_INTERVAL_TOLERANCE_MS, TX_INTERVAL_WINDOW, TpmsPacket, VehicleTrack, compute_median,
+    make_model_hint,
 };
 
 /// rtl_433 protocol IDs that transmit rolling (non-stable) sensor IDs.
@@ -204,6 +205,23 @@ impl Resolver {
     /// rolling-ID protocols the UUID is returned only when a complete burst
     /// has been correlated; returns `None` while the burst is still building.
     pub fn process(&mut self, packet: &TpmsPacket) -> Result<Option<Uuid>> {
+        // Guard: discard physically impossible pressure readings before they
+        // reach the resolver and corrupt vehicle state.
+        if packet.pressure_kpa < MIN_PLAUSIBLE_PRESSURE_KPA
+            || packet.pressure_kpa > MAX_PLAUSIBLE_PRESSURE_KPA
+        {
+            debug!(
+                "{} | DISCARD | sensor={:#010x} | reason=implausible_pressure \
+                 | pressure={:.1} | protocol={} | rtl433={}",
+                packet.timestamp,
+                packet.sensor_id_u32().unwrap_or(0),
+                packet.pressure_kpa,
+                packet.protocol,
+                packet.rtl433_id,
+            );
+            return Ok(None);
+        }
+
         let ts = packet.parsed_ts().unwrap_or_else(Utc::now);
         let Some(sensor_id) = packet.sensor_id_u32() else {
             return Ok(None);
@@ -4089,5 +4107,74 @@ mod tests {
         let fp1 = resolver.vehicles[&vid1].fingerprint_id.clone().unwrap();
         let fp2 = resolver.vehicles[&vid2].fingerprint_id.clone().unwrap();
         assert_ne!(fp1, fp2, "immature fingerprint must not be matched");
+    }
+
+    // -------------------------------------------------------------------
+    // Pressure plausibility guard
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn implausible_negative_pressure_discarded() {
+        // A packet with pressure=-0.2 kPa must be discarded: no vehicle
+        // created, no error returned.
+        let mut resolver = in_memory_resolver();
+        let p = make_packet("0x12345678", "TRW-OOK", 298, -0.2);
+        let result = resolver.process(&p).unwrap();
+        assert_eq!(result, None, "implausible packet must return Ok(None)");
+        assert!(
+            resolver.vehicles.is_empty(),
+            "no vehicle must be created for pressure=-0.2"
+        );
+    }
+
+    #[test]
+    fn implausible_boundary_pressure_discarded_and_accepted() {
+        // pressure=1.4 must be discarded; pressure=1.5 must be processed.
+        let mut resolver = in_memory_resolver();
+
+        let p_low = make_packet("0xAABBCCDD", "TRW-OOK", 298, 1.4);
+        let result = resolver.process(&p_low).unwrap();
+        assert_eq!(result, None, "pressure=1.4 must be discarded");
+        assert!(
+            resolver.vehicles.is_empty(),
+            "no vehicle must be created for pressure=1.4"
+        );
+
+        let p_ok = make_packet("0xAABBCCDD", "TRW-OOK", 298, 1.5);
+        let result = resolver.process(&p_ok).unwrap();
+        // Fixed-ID path creates a vehicle on first valid sighting.
+        assert!(
+            result.is_some(),
+            "pressure=1.5 must be processed (not discarded)"
+        );
+        assert_eq!(
+            resolver.vehicles.len(),
+            1,
+            "exactly one vehicle for the accepted packet"
+        );
+    }
+
+    #[test]
+    fn implausible_zero_pressure_discarded() {
+        let mut resolver = in_memory_resolver();
+        let p = make_packet("0x11111111", "TRW-OOK", 298, 0.0);
+        let result = resolver.process(&p).unwrap();
+        assert_eq!(result, None);
+        assert!(
+            resolver.vehicles.is_empty(),
+            "no vehicle must be created for pressure=0.0"
+        );
+    }
+
+    #[test]
+    fn implausible_high_pressure_discarded() {
+        let mut resolver = in_memory_resolver();
+        let p = make_packet("0x22222222", "TRW-OOK", 298, 901.0);
+        let result = resolver.process(&p).unwrap();
+        assert_eq!(result, None);
+        assert!(
+            resolver.vehicles.is_empty(),
+            "no vehicle must be created for pressure=901.0"
+        );
     }
 }
