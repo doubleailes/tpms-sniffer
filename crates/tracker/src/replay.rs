@@ -8,9 +8,9 @@ use anyhow::Result;
 use flate2::read::GzDecoder;
 use uuid::Uuid;
 
-use crate::{MAX_PLAUSIBLE_PRESSURE_KPA, MIN_PLAUSIBLE_PRESSURE_KPA, TpmsPacket};
 use crate::db::Database;
 use crate::resolver::Resolver;
+use crate::{MAX_PLAUSIBLE_PRESSURE_KPA, MIN_PLAUSIBLE_PRESSURE_KPA, TpmsPacket};
 
 /// Summary produced after replaying a fixture file through the tracker.
 #[derive(Debug)]
@@ -279,7 +279,9 @@ pub fn print_summary(result: &ReplayResult, errors: &[ConsistencyError]) {
         .filter(|e| matches!(e, ConsistencyError::ImplausiblePressure { .. }))
         .collect();
     if implausible.is_empty() {
-        eprintln!("PASS  all pressures in plausible range ({MIN_PLAUSIBLE_PRESSURE_KPA}-{MAX_PLAUSIBLE_PRESSURE_KPA} kPa)");
+        eprintln!(
+            "PASS  all pressures in plausible range ({MIN_PLAUSIBLE_PRESSURE_KPA}-{MAX_PLAUSIBLE_PRESSURE_KPA} kPa)"
+        );
     } else {
         for e in &implausible {
             eprintln!("FAIL  {e}");
