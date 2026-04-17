@@ -80,6 +80,10 @@ tbody tr:last-child td{border-bottom:none}
 .empty-state{text-align:center;padding:48px 24px;color:var(--text2)}
 .empty-state p{font-size:1rem}
 
+/* Monospace / dimmed utility */
+.mono{font-family:'Consolas','SFMono-Regular',monospace;font-size:.82rem}
+.dimmed{color:var(--text2)}
+
 /* Scrollbar */
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:var(--bg)}
@@ -125,6 +129,8 @@ tbody tr:last-child td{border-bottom:none}
         <th style="width:36px"></th>
         <th data-sort="vehicle_id">Vehicle <span class="sort-arrow">▲</span></th>
         <th data-sort="protocol">Protocol <span class="sort-arrow">▲</span></th>
+        <th data-sort="vehicle_class">Class <span class="sort-arrow">▲</span></th>
+        <th data-sort="car_id">Car <span class="sort-arrow">▲</span></th>
         <th data-sort="pressure_kpa">kPa <span class="sort-arrow">▲</span></th>
         <th data-sort="first_seen">First seen <span class="sort-arrow">▲</span></th>
         <th data-sort="last_seen" class="sorted">Last seen <span class="sort-arrow">▼</span></th>
@@ -184,6 +190,17 @@ function isActive(iso){
 }
 function isVehicleActive(v){ return v.active || isActive(v.last_seen); }
 function esc(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
+function classbadge(c){
+  const map={
+    PassengerCar:       ['Car',  '#2563eb'],
+    SuvLightTruck:      ['SUV',  '#7c3aed'],
+    LightCommercialVan: ['Van',  '#0891b2'],
+    HeavyTruck:         ['Truck','#b45309'],
+    Motorcycle:         ['Moto', '#059669'],
+  };
+  const [label,color]=map[c]||['?','#6b7280'];
+  return '<span style="font-size:11px;font-weight:500;padding:2px 7px;border-radius:4px;background:'+color+'22;color:'+color+'">'+label+'</span>';
+}
 
 /* ---- Fetch ---- */
 async function fetchJSON(url){
@@ -324,8 +341,10 @@ function updateRow(tr, v){
     : '';
   tr.innerHTML =
     '<td><span class="status-dot '+(act?"active":"inactive")+'" title="'+(act?"Active":"Inactive")+'"></span></td>'+
-    '<td>'+esc(v.vehicle_id||"—")+battHtml+'</td>'+
+    '<td title="'+esc(v.vehicle_id||'')+'"><span class="mono">'+esc((v.vehicle_id||"—").slice(0,8))+'</span>'+battHtml+'</td>'+
     '<td>'+esc(v.protocol||"—")+'</td>'+
+    '<td>'+classbadge(v.vehicle_class)+'</td>'+
+    '<td class="mono dimmed">'+(v.car_id ? esc(v.car_id.slice(0,8)) : "—")+'</td>'+
     '<td>'+(v.pressure_kpa != null ? v.pressure_kpa.toFixed(1) : "—")+'</td>'+
     '<td title="'+absTime(v.first_seen)+'">'+relTime(v.first_seen)+'</td>'+
     '<td title="'+absTime(v.last_seen)+'">'+relTime(v.last_seen)+'</td>';
