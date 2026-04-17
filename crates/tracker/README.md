@@ -102,11 +102,14 @@ ring-buffer depth (0–8).
 
 ### Matching behaviour
 
-- **Fingerprint path** (EezTire, sentinel-rejected IDs): the interval check
-  compares the vehicle's stored median against the sighting's
-  `tx_interval_hint_ms` (gap since the last packet of the same protocol).
-  If both sides have data and the intervals differ by more than the tolerance,
-  the candidate is rejected even if pressure matches.
+- **Fingerprint path** (EezTire, sentinel-rejected IDs): the correlator first
+  collects all candidates matching on protocol + pressure (hard constraints),
+  then uses the TX interval as a **soft tiebreaker** to prefer among multiple
+  pressure matches.  The interval check compares the vehicle's stored median
+  against the sighting's `tx_interval_hint_ms` (gap since the last packet of
+  the same protocol).  If interval filtering would eliminate all pressure
+  matches, it is ignored — pressure match always takes precedence.  Among
+  remaining candidates, the most recently seen vehicle is preferred.
 
 - **Burst path** (AVE-TPMS rolling-ID): the interval check compares the
   vehicle's stored median against the actual gap between the new burst and
