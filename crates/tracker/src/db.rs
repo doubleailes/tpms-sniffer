@@ -244,6 +244,44 @@ impl Database {
             )?;
         }
 
+        // Migration: add temporal_fingerprints and session_log tables.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS temporal_fingerprints (
+                fingerprint_id       TEXT PRIMARY KEY REFERENCES fingerprints(fingerprint_id),
+                arrival_gmm_json     TEXT,
+                arrival_peak_hours   TEXT,
+                dwell_lognormal_mu   REAL,
+                dwell_lognormal_sigma REAL,
+                dwell_median_secs    INTEGER,
+                dwell_class          TEXT,
+                dominant_period_hrs  REAL,
+                periodicity_class    TEXT,
+                acf_peak_value       REAL,
+                presence_map_json    TEXT,
+                computed_at          TEXT NOT NULL,
+                observation_days     INTEGER NOT NULL,
+                min_sessions_met     INTEGER NOT NULL,
+                classification       TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS session_log (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint_id       TEXT NOT NULL REFERENCES fingerprints(fingerprint_id),
+                session_start        TEXT NOT NULL,
+                session_end          TEXT NOT NULL,
+                dwell_secs           INTEGER NOT NULL,
+                arrival_hour         REAL NOT NULL,
+                day_of_week          INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_log_fp
+                ON session_log(fingerprint_id);
+            CREATE INDEX IF NOT EXISTS idx_session_log_start
+                ON session_log(session_start);
+            "#,
+        )?;
+
         Ok(())
     }
 
@@ -971,6 +1009,359 @@ impl Database {
             params![fingerprint_id, vehicle_id.to_string()],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal fingerprint store
+    // -----------------------------------------------------------------------
+
+    /// Insert a session into the session_log.
+    pub fn insert_session_log(
+        &self,
+        fingerprint_id: &str,
+        session: &crate::temporal::Session,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_log (fingerprint_id, session_start, session_end, \
+             dwell_secs, arrival_hour, day_of_week) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                fingerprint_id,
+                session.start.to_rfc3339(),
+                session.end.to_rfc3339(),
+                session.dwell_secs(),
+                session.arrival_hour() as f64,
+                session.day_of_week() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all sessions for a fingerprint from session_log.
+    pub fn get_sessions(
+        &self,
+        fingerprint_id: &str,
+    ) -> Result<Vec<crate::temporal::Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_start, session_end FROM session_log \
+             WHERE fingerprint_id = ?1 ORDER BY session_start",
+        )?;
+        let sessions = stmt
+            .query_map(params![fingerprint_id], |row| {
+                let start_s: String = row.get(0)?;
+                let end_s: String = row.get(1)?;
+                let start = DateTime::parse_from_rfc3339(&start_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let end = DateTime::parse_from_rfc3339(&end_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok(crate::temporal::Session {
+                    fingerprint_id: fingerprint_id.to_string(),
+                    start,
+                    end,
+                    sighting_count: 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sessions)
+    }
+
+    /// Count sessions for a fingerprint.
+    pub fn session_log_count(&self, fingerprint_id: &str) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_log WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Upsert a temporal fingerprint.
+    pub fn upsert_temporal_fingerprint(
+        &self,
+        tbf: &crate::temporal::TemporalFingerprint,
+    ) -> Result<()> {
+        let arrival_gmm_json = serde_json::to_string(&tbf.arrival_gmm)?;
+        let arrival_peak_hours = serde_json::to_string(&tbf.arrival_peak_hours)?;
+        let presence_map_json = serde_json::to_string(&tbf.presence_map)?;
+
+        let (dominant_period, periodicity_class, acf_peak) = match &tbf.periodicity {
+            Some(p) => (
+                Some(p.dominant_period_hrs as f64),
+                Some(p.class.as_str().to_string()),
+                Some(p.strength as f64),
+            ),
+            None => (None, None, None),
+        };
+
+        self.conn.execute(
+            "INSERT INTO temporal_fingerprints \
+             (fingerprint_id, arrival_gmm_json, arrival_peak_hours, \
+              dwell_lognormal_mu, dwell_lognormal_sigma, dwell_median_secs, dwell_class, \
+              dominant_period_hrs, periodicity_class, acf_peak_value, \
+              presence_map_json, computed_at, observation_days, min_sessions_met, classification) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT(fingerprint_id) DO UPDATE SET \
+              arrival_gmm_json = excluded.arrival_gmm_json, \
+              arrival_peak_hours = excluded.arrival_peak_hours, \
+              dwell_lognormal_mu = excluded.dwell_lognormal_mu, \
+              dwell_lognormal_sigma = excluded.dwell_lognormal_sigma, \
+              dwell_median_secs = excluded.dwell_median_secs, \
+              dwell_class = excluded.dwell_class, \
+              dominant_period_hrs = excluded.dominant_period_hrs, \
+              periodicity_class = excluded.periodicity_class, \
+              acf_peak_value = excluded.acf_peak_value, \
+              presence_map_json = excluded.presence_map_json, \
+              computed_at = excluded.computed_at, \
+              observation_days = excluded.observation_days, \
+              min_sessions_met = excluded.min_sessions_met, \
+              classification = excluded.classification",
+            params![
+                tbf.fingerprint_id,
+                arrival_gmm_json,
+                arrival_peak_hours,
+                tbf.dwell_lognormal_mu,
+                tbf.dwell_lognormal_sigma,
+                tbf.dwell_median_secs,
+                tbf.dwell_class.as_str(),
+                dominant_period,
+                periodicity_class,
+                acf_peak,
+                presence_map_json,
+                tbf.computed_at,
+                tbf.observation_days,
+                if tbf.sessions_used >= crate::temporal::MIN_TBF_SESSIONS { 1i64 } else { 0 },
+                tbf.classification.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a temporal fingerprint for a fingerprint ID.
+    pub fn get_temporal_fingerprint(
+        &self,
+        fingerprint_id: &str,
+    ) -> Result<Option<crate::temporal::TemporalFingerprint>> {
+        use crate::temporal::*;
+
+        let result = self.conn.query_row(
+            "SELECT arrival_gmm_json, arrival_peak_hours, \
+                    dwell_lognormal_mu, dwell_lognormal_sigma, dwell_median_secs, dwell_class, \
+                    dominant_period_hrs, periodicity_class, acf_peak_value, \
+                    presence_map_json, computed_at, observation_days, min_sessions_met, \
+                    classification \
+             FROM temporal_fingerprints WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+            |row| {
+                let gmm_json: String = row.get(0)?;
+                let peak_hours_json: String = row.get(1)?;
+                let dwell_mu: f64 = row.get(2)?;
+                let dwell_sigma: f64 = row.get(3)?;
+                let dwell_median: i64 = row.get(4)?;
+                let dwell_class_s: String = row.get(5)?;
+                let dominant_period: Option<f64> = row.get(6)?;
+                let period_class_s: Option<String> = row.get(7)?;
+                let acf_peak: Option<f64> = row.get(8)?;
+                let presence_json: String = row.get(9)?;
+                let computed_at: String = row.get(10)?;
+                let observation_days: i64 = row.get(11)?;
+                let _min_sessions_met: i64 = row.get(12)?;
+                let classification_s: Option<String> = row.get(13)?;
+
+                let arrival_gmm: Vec<GaussianComponent> =
+                    serde_json::from_str(&gmm_json).unwrap_or_default();
+                let arrival_peak_hours: Vec<u32> =
+                    serde_json::from_str(&peak_hours_json).unwrap_or_default();
+                let presence_map: [[f32; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS] =
+                    serde_json::from_str(&presence_json).unwrap_or([[0.0; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS]);
+
+                let dwell_class = match dwell_class_s.as_str() {
+                    "drive_by" => DwellClass::DriveBy,
+                    "brief_stop" => DwellClass::BriefStop,
+                    "long_term_parked" => DwellClass::LongTermParked,
+                    _ => DwellClass::DriveBy,
+                };
+
+                let periodicity = match (dominant_period, period_class_s, acf_peak) {
+                    (Some(p), Some(c), Some(s)) => {
+                        let class = match c.as_str() {
+                            "twice_daily" => PeriodClass::TwiceDaily,
+                            "daily" => PeriodClass::Daily,
+                            "weekly" => PeriodClass::Weekly,
+                            "stationary" => PeriodClass::Stationary,
+                            _ => PeriodClass::Irregular,
+                        };
+                        Some(PeriodResult {
+                            dominant_period_hrs: p as f32,
+                            strength: s as f32,
+                            class,
+                        })
+                    }
+                    _ => None,
+                };
+
+                let classification = match classification_s.as_deref() {
+                    Some("stationary") => VehicleClassification::Stationary,
+                    Some("daily_commuter") => VehicleClassification::DailyCommuter,
+                    Some("twice_daily_commuter") => VehicleClassification::TwiceDailyCommuter,
+                    Some("weekly_visitor") => VehicleClassification::WeeklyVisitor,
+                    Some("regular_visitor") => VehicleClassification::RegularVisitor,
+                    _ => VehicleClassification::Transient,
+                };
+
+                let session_count = 0u32; // will be overwritten from session_log if needed
+
+                Ok(TemporalFingerprint {
+                    fingerprint_id: fingerprint_id.to_string(),
+                    arrival_gmm,
+                    arrival_peak_hours,
+                    dwell_lognormal_mu: dwell_mu,
+                    dwell_lognormal_sigma: dwell_sigma,
+                    dwell_median_secs: dwell_median,
+                    dwell_class,
+                    periodicity,
+                    presence_map,
+                    observation_days,
+                    sessions_used: session_count,
+                    classification,
+                    computed_at,
+                })
+            },
+        );
+
+        match result {
+            Ok(tbf) => Ok(Some(tbf)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get sighting timestamps for a fingerprint (ordered by time).
+    pub fn get_fingerprint_sighting_timestamps(
+        &self,
+        fingerprint_id: &str,
+    ) -> Result<Vec<DateTime<Utc>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.ts FROM sightings s \
+             JOIN vehicles v ON s.vehicle_id = v.vehicle_id \
+             WHERE v.fingerprint_id = ?1 \
+             ORDER BY s.ts",
+        )?;
+        let timestamps = stmt
+            .query_map(params![fingerprint_id], |row| {
+                let ts_s: String = row.get(0)?;
+                let ts = DateTime::parse_from_rfc3339(&ts_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok(ts)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(timestamps)
+    }
+
+    /// Get all fingerprint IDs that have enough sightings for TBF computation.
+    pub fn fingerprints_eligible_for_tbf(&self) -> Result<Vec<String>> {
+        let min_sightings = crate::temporal::MIN_TBF_SESSIONS as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT fingerprint_id FROM fingerprints \
+             WHERE session_count >= ?1 \
+             ORDER BY fingerprint_id",
+        )?;
+        let ids = stmt
+            .query_map(params![min_sightings], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// Compute and store temporal fingerprints for all eligible fingerprints.
+    pub fn compute_all_temporal_fingerprints(&self) -> Result<u32> {
+        let fp_ids = self.fingerprints_eligible_for_tbf()?;
+        let mut count = 0u32;
+
+        for fp_id in &fp_ids {
+            let timestamps = self.get_fingerprint_sighting_timestamps(fp_id)?;
+            if timestamps.is_empty() {
+                continue;
+            }
+
+            let sessions = crate::temporal::extract_sessions(
+                fp_id,
+                &timestamps,
+                crate::temporal::SESSION_GAP_THRESHOLD_SECS,
+            );
+
+            // Store sessions in session_log.
+            // Clear existing sessions for this fingerprint first.
+            self.conn.execute(
+                "DELETE FROM session_log WHERE fingerprint_id = ?1",
+                params![fp_id],
+            )?;
+            for session in &sessions {
+                self.insert_session_log(fp_id, session)?;
+            }
+
+            // Compute and store TBF.
+            if let Some(tbf) = crate::temporal::compute_tbf(fp_id, &sessions) {
+                self.upsert_temporal_fingerprint(&tbf)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Get all temporal fingerprints (for the report).
+    pub fn all_temporal_fingerprints(
+        &self,
+    ) -> Result<Vec<crate::server::TemporalFingerprintRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.fingerprint_id, f.vehicle_class, f.pressure_median_kpa, \
+                    f.session_count, t.observation_days, \
+                    t.arrival_gmm_json, t.arrival_peak_hours, \
+                    t.dwell_median_secs, t.dwell_class, \
+                    t.dominant_period_hrs, t.periodicity_class, t.acf_peak_value, \
+                    t.presence_map_json, t.classification \
+             FROM temporal_fingerprints t \
+             JOIN fingerprints f ON t.fingerprint_id = f.fingerprint_id \
+             ORDER BY f.session_count DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let fingerprint_id: String = row.get(0)?;
+                let vehicle_class: String = row.get(1)?;
+                let pressure_kpa: f64 = row.get(2)?;
+                let session_count: i64 = row.get(3)?;
+                let observation_days: i64 = row.get(4)?;
+                let arrival_gmm_json: String = row.get(5)?;
+                let arrival_peak_hours_json: String = row.get(6)?;
+                let dwell_median_secs: i64 = row.get(7)?;
+                let dwell_class: String = row.get(8)?;
+                let dominant_period_hrs: Option<f64> = row.get(9)?;
+                let periodicity_class: Option<String> = row.get(10)?;
+                let acf_peak_value: Option<f64> = row.get(11)?;
+                let presence_map_json: String = row.get(12)?;
+                let classification: Option<String> = row.get(13)?;
+
+                Ok(crate::server::TemporalFingerprintRow {
+                    fingerprint_id,
+                    vehicle_class,
+                    pressure_kpa,
+                    session_count,
+                    observation_days,
+                    arrival_gmm_json,
+                    arrival_peak_hours_json,
+                    dwell_median_secs,
+                    dwell_class,
+                    dominant_period_hrs,
+                    periodicity_class,
+                    acf_peak_value,
+                    presence_map_json,
+                    classification: classification.unwrap_or_else(|| "transient".to_string()),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // -----------------------------------------------------------------------
