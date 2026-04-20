@@ -77,6 +77,10 @@ enum Command {
         /// Output as JSON instead of plain text.
         #[arg(long)]
         json: bool,
+
+        /// Show temporal behavioural fingerprints instead of car reports.
+        #[arg(long)]
+        temporal: bool,
     },
 
     /// Backfill presence_slots from existing sighting data.
@@ -116,7 +120,11 @@ fn main() -> Result<()> {
             from,
             to,
             json,
+            temporal,
         }) => {
+            if *temporal {
+                return run_temporal_report(&args.db, *json);
+            }
             return run_report(
                 &args.db,
                 car.as_deref(),
@@ -425,5 +433,75 @@ fn run_geojson(db_path: &str, car: Option<&str>, output: Option<&str>) -> Result
     } else {
         println!("{json}");
     }
+    Ok(())
+}
+
+fn run_temporal_report(db_path: &str, json_output: bool) -> Result<()> {
+    use tpms_tracker::temporal;
+
+    let db = Database::open(db_path)?;
+
+    // Compute TBFs for all eligible fingerprints.
+    let count = db.compute_all_temporal_fingerprints()?;
+    eprintln!("Computed {count} temporal fingerprint(s).");
+
+    let rows = db.all_temporal_fingerprints()?;
+
+    if rows.is_empty() {
+        eprintln!("No fingerprints with enough sessions for temporal analysis.");
+        return Ok(());
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&rows)?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    println!("Temporal Behavioural Fingerprints");
+    println!("==================================");
+    println!();
+
+    for row in &rows {
+        let gmm: Vec<temporal::GaussianComponent> =
+            serde_json::from_str(&row.arrival_gmm_json).unwrap_or_default();
+        let arrival_str = temporal::format_arrival(&gmm);
+        let dwell_str = temporal::format_dwell(row.dwell_median_secs);
+
+        let period_str = match (&row.periodicity_class, row.dominant_period_hrs, row.acf_peak_value)
+        {
+            (Some(cls), Some(period), Some(strength)) => {
+                format!("{cls} (period {period:.1}h, strength {strength:.2})")
+            }
+            _ => "stationary (no dominant period)".to_string(),
+        };
+
+        let classification = row.classification.replace('_', " ").to_uppercase();
+
+        println!(
+            "{} | {} {:.0} kPa | {} sessions | {} day(s)",
+            row.fingerprint_id,
+            row.vehicle_class,
+            row.pressure_kpa,
+            row.session_count,
+            row.observation_days,
+        );
+        println!("  Arrival:      {arrival_str}");
+        println!(
+            "  Dwell:        {} (median {dwell_str})",
+            row.dwell_class.replace('_', " ")
+        );
+        println!("  Periodicity:  {period_str}");
+        println!("  Classification: {classification}");
+
+        // ASCII presence map.
+        let presence_map: [[f32; temporal::PRESENCE_MAP_DAYS]; temporal::PRESENCE_MAP_HOURS] =
+            serde_json::from_str(&row.presence_map_json)
+                .unwrap_or([[0.0; temporal::PRESENCE_MAP_DAYS]; temporal::PRESENCE_MAP_HOURS]);
+        println!();
+        print!("{}", temporal::ascii_presence_map(&presence_map));
+        println!();
+    }
+
     Ok(())
 }

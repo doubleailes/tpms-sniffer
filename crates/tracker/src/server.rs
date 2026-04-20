@@ -81,6 +81,40 @@ pub struct SightingRow {
     pub receiver_id: String,
 }
 
+/// Temporal fingerprint row for the API and report.
+#[derive(Serialize)]
+pub struct TemporalFingerprintRow {
+    pub fingerprint_id: String,
+    pub vehicle_class: String,
+    pub pressure_kpa: f64,
+    pub session_count: i64,
+    pub observation_days: i64,
+    pub arrival_gmm_json: String,
+    pub arrival_peak_hours_json: String,
+    pub dwell_median_secs: i64,
+    pub dwell_class: String,
+    pub dominant_period_hrs: Option<f64>,
+    pub periodicity_class: Option<String>,
+    pub acf_peak_value: Option<f64>,
+    pub presence_map_json: String,
+    pub classification: String,
+}
+
+/// Temporal fingerprint API response for a single fingerprint.
+#[derive(Serialize)]
+pub struct TemporalApiResponse {
+    pub fingerprint_id: String,
+    pub classification: String,
+    pub arrival_peaks: Vec<f32>,
+    pub dwell_class: String,
+    pub dwell_median_secs: i64,
+    pub dominant_period_hrs: Option<f64>,
+    pub periodicity_strength: Option<f64>,
+    pub observation_days: i64,
+    pub sessions_used: u32,
+    pub presence_map: Vec<Vec<f32>>,
+}
+
 /// Start the HTTP dashboard server.
 ///
 /// Opens its own read-only database connection so the ingestion loop and the
@@ -99,6 +133,10 @@ pub async fn serve(db_path: &str, addr: &str) -> anyhow::Result<()> {
         .route("/api/cars", get(handle_cars))
         .route("/api/cars/{car_id}", get(handle_car_detail))
         .route("/api/fingerprints", get(handle_fingerprints))
+        .route(
+            "/api/fingerprints/{fp_id}/temporal",
+            get(handle_temporal_fingerprint),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -209,4 +247,47 @@ async fn handle_fingerprints(
         .api_fingerprints()
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(rows))
+}
+
+async fn handle_temporal_fingerprint(
+    State(state): State<Arc<AppState>>,
+    Path(fp_id): Path<String>,
+) -> Result<Json<TemporalApiResponse>, axum::http::StatusCode> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let tbf = db
+        .get_temporal_fingerprint(&fp_id)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match tbf {
+        Some(t) => {
+            let arrival_peaks: Vec<f32> = t.arrival_gmm.iter().map(|c| c.mean_hour).collect();
+            let presence_map: Vec<Vec<f32>> = t
+                .presence_map
+                .iter()
+                .map(|row| row.to_vec())
+                .collect();
+            let (dominant_period_hrs, periodicity_strength) = match &t.periodicity {
+                Some(p) => (Some(p.dominant_period_hrs as f64), Some(p.strength as f64)),
+                None => (None, None),
+            };
+
+            Ok(Json(TemporalApiResponse {
+                fingerprint_id: t.fingerprint_id,
+                classification: t.classification.as_str().to_string(),
+                arrival_peaks,
+                dwell_class: t.dwell_class.as_str().to_string(),
+                dwell_median_secs: t.dwell_median_secs,
+                dominant_period_hrs,
+                periodicity_strength,
+                observation_days: t.observation_days,
+                sessions_used: t.sessions_used,
+                presence_map,
+            }))
+        }
+        None => Err(axum::http::StatusCode::NOT_FOUND),
+    }
 }

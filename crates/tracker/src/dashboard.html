@@ -116,6 +116,7 @@ tbody tr:last-child td{border-bottom:none}
   <button class="filter-btn" data-filter="alarm">Alarm</button>
   <button class="filter-btn" data-filter="grouped">Grouped</button>
   <button class="filter-btn" data-filter="fingerprints">Fingerprints</button>
+  <button class="filter-btn" data-filter="behaviour">Behaviour</button>
   <div class="search-box">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
     <input id="searchInput" type="text" placeholder="Search vehicles…">
@@ -238,6 +239,7 @@ function filtered(){
   else if(currentFilter === "alarm") list = list.filter(v => v.alarm);
   else if(currentFilter === "grouped") list = list.filter(v => v.car_id);
   else if(currentFilter === "fingerprints") return []; // handled separately
+  else if(currentFilter === "behaviour") return []; // handled separately
   if(searchText){
     const q = searchText.toLowerCase();
     list = list.filter(v =>
@@ -267,6 +269,10 @@ function filtered(){
 function renderTable(){
   if(currentFilter === "fingerprints"){
     renderFingerprints();
+    return;
+  }
+  if(currentFilter === "behaviour"){
+    renderBehaviour();
     return;
   }
   const list = filtered();
@@ -473,6 +479,96 @@ async function renderFingerprints(){
   $body.innerHTML = html;
 }
 
+/* ---- Behaviour tab ---- */
+function buildPresenceHeatmapSvg(presenceMap){
+  const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  const CW = 28, CH = 14, PAD_L = 50, PAD_T = 24;
+  const W = PAD_L + 7 * CW + 4;
+  const H = PAD_T + 24 * CH + 4;
+  let svg = '<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg">';
+  // Day headers
+  for(let d = 0; d < 7; d++){
+    svg += '<text x="'+(PAD_L + d*CW + CW/2)+'" y="'+(PAD_T-6)+'" text-anchor="middle" fill="#8b8fa3" font-size="9" font-family="monospace">'+DAYS[d]+'</text>';
+  }
+  // Hour labels and cells
+  for(let h = 0; h < 24; h++){
+    svg += '<text x="'+(PAD_L-6)+'" y="'+(PAD_T + h*CH + CH/2 + 3)+'" text-anchor="end" fill="#8b8fa3" font-size="8" font-family="monospace">'+String(h).padStart(2,'0')+':00</text>';
+    for(let d = 0; d < 7; d++){
+      const row = (presenceMap && presenceMap[h]) ? presenceMap[h] : [];
+      const val = row[d] || 0;
+      const r = Math.round(59 + val * 196);
+      const g = Math.round(130 + val * (-50));
+      const b = Math.round(246 + val * (-200));
+      const opacity = val > 0.01 ? (0.2 + val * 0.8).toFixed(2) : "0.05";
+      svg += '<rect x="'+(PAD_L + d*CW)+'" y="'+(PAD_T + h*CH)+'" width="'+(CW-1)+'" height="'+(CH-1)+'" rx="2" fill="rgb('+r+','+g+','+b+')" opacity="'+opacity+'"/>';
+    }
+  }
+  svg += '</svg>';
+  return svg;
+}
+
+function classificationBadge(cls){
+  const map = {
+    stationary:           ['STATIONARY', '#6b7280'],
+    daily_commuter:       ['COMMUTER',   '#3b82f6'],
+    twice_daily_commuter: ['2×/DAY',     '#8b5cf6'],
+    weekly_visitor:       ['WEEKLY',     '#06b6d4'],
+    regular_visitor:      ['REGULAR',    '#22c55e'],
+    transient:            ['TRANSIENT',  '#f59e0b'],
+  };
+  const [label, color] = map[cls] || ['?', '#6b7280'];
+  return '<span style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;background:'+color+'22;color:'+color+'">'+label+'</span>';
+}
+
+async function renderBehaviour(){
+  const fps = await fetchJSON("/api/fingerprints");
+  if(!fps || fps.length === 0){
+    $body.innerHTML = "";
+    $empty.style.display = "block";
+    return;
+  }
+  $empty.style.display = "none";
+  let html = '';
+  for(const fp of fps){
+    const tbf = await fetchJSON("/api/fingerprints/" + encodeURIComponent(fp.fingerprint_id) + "/temporal");
+    if(!tbf) continue;
+    const heatmap = buildPresenceHeatmapSvg(tbf.presence_map);
+    const peaksStr = (tbf.arrival_peaks || []).map(p => {
+      const h = Math.floor(p);
+      const m = Math.round((p - h) * 60);
+      return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0');
+    }).join(', ') || '—';
+    const periodStr = tbf.dominant_period_hrs
+      ? (tbf.dominant_period_hrs.toFixed(1) + 'h')
+      : 'none';
+    const dwellStr = tbf.dwell_median_secs < 60
+      ? (tbf.dwell_median_secs + 's')
+      : tbf.dwell_median_secs < 3600
+        ? (Math.floor(tbf.dwell_median_secs/60) + 'min')
+        : (Math.floor(tbf.dwell_median_secs/3600) + 'h ' + Math.floor((tbf.dwell_median_secs%3600)/60) + 'min');
+
+    html += '<tr><td colspan="8" style="padding:16px 24px">'+
+      '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap">'+
+      '<div style="min-width:200px">'+
+        '<div style="font-weight:700;margin-bottom:6px;font-size:0.95rem">'+esc(fp.fingerprint_id)+' '+classificationBadge(tbf.classification)+'</div>'+
+        '<div style="font-size:0.82rem;color:var(--text2);margin-bottom:3px"><b>Arrival:</b> '+esc(peaksStr)+'</div>'+
+        '<div style="font-size:0.82rem;color:var(--text2);margin-bottom:3px"><b>Dwell:</b> '+esc(tbf.dwell_class.replace(/_/g, ' '))+' (median '+esc(dwellStr)+')</div>'+
+        '<div style="font-size:0.82rem;color:var(--text2);margin-bottom:3px"><b>Period:</b> '+esc(periodStr)+
+          (tbf.periodicity_strength ? ' (strength '+(tbf.periodicity_strength).toFixed(2)+')' : '')+
+        '</div>'+
+        '<div style="font-size:0.82rem;color:var(--text2)"><b>Sessions:</b> '+tbf.sessions_used+' over '+tbf.observation_days+' day(s)</div>'+
+      '</div>'+
+      '<div>'+heatmap+'</div>'+
+      '</div></td></tr>';
+  }
+  if(!html){
+    $body.innerHTML = "";
+    $empty.style.display = "block";
+    return;
+  }
+  $body.innerHTML = html;
+}
+
 /* ---- Clock ---- */
 function tickClock(){
   const now = new Date();
@@ -517,7 +613,7 @@ $search.addEventListener("input", () => {
 function readURL(){
   const p = new URLSearchParams(window.location.search);
   const f = p.get("filter");
-  if(f && ["active","alarm","grouped","fingerprints"].includes(f)){
+  if(f && ["active","alarm","grouped","fingerprints","behaviour"].includes(f)){
     currentFilter = f;
     document.querySelectorAll(".filter-btn").forEach(b => {
       b.classList.toggle("active", b.dataset.filter === f);

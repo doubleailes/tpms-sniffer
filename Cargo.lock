@@ -1642,6 +1642,7 @@ dependencies = [
  "flate2",
  "log",
  "rusqlite",
+ "rustfft",
  "serde",
  "serde_json",
  "tokio",
