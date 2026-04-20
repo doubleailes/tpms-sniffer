@@ -616,8 +616,11 @@ impl Resolver {
                 // Only use interval filtering if it leaves at least one
                 // candidate — never use it to reject all matches.
                 if !interval_matches.is_empty() && interval_matches.len() < before_count {
-                    interval_filter_log =
-                        Some(format!("narrowed:{}_to_{}", before_count, interval_matches.len()));
+                    interval_filter_log = Some(format!(
+                        "narrowed:{}_to_{}",
+                        before_count,
+                        interval_matches.len()
+                    ));
                     pressure_matches = interval_matches;
                 }
             }
@@ -4291,11 +4294,7 @@ mod tests {
             base - Duration::seconds(30),
         );
 
-        assert_eq!(
-            resolver.vehicles.len(),
-            4,
-            "setup: 4 vehicles must exist"
-        );
+        assert_eq!(resolver.vehicles.len(), 4, "setup: 4 vehicles must exist");
 
         // Feed a new EezTire packet at 51.1 kPa.  The timestamp must be
         // formatted in local time because TpmsPacket::parsed_ts interprets it
