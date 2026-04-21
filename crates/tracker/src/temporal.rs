@@ -10,8 +10,8 @@
 //! 4. **Presence map** — 24×7 matrix of presence probability
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use rustfft::num_complex::Complex;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -351,7 +351,11 @@ pub fn fit_arrival_gmm(sessions: &[Session], max_components: usize) -> Vec<Gauss
 
         let n = assigned.len() as f32;
         let mean = assigned.iter().sum::<f32>() / n;
-        let variance = assigned.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
+        let variance = assigned
+            .iter()
+            .map(|&x| (x - mean) * (x - mean))
+            .sum::<f32>()
+            / n;
         let sigma = variance.sqrt().max(0.5);
 
         components.push(GaussianComponent {
@@ -857,9 +861,7 @@ pub fn format_arrival(gmm: &[GaussianComponent]) -> String {
 }
 
 /// Render an ASCII 24×7 presence heatmap.
-pub fn ascii_presence_map(
-    map: &[[f32; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS],
-) -> String {
+pub fn ascii_presence_map(map: &[[f32; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS]) -> String {
     let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let mut out = String::new();
     out.push_str(&format!(
@@ -909,9 +911,7 @@ mod tests {
                 continue; // skip weekends
             }
             // Morning pass
-            let morning = Utc
-                .with_ymd_and_hms(2026, 4, date, 10, 15, 0)
-                .unwrap();
+            let morning = Utc.with_ymd_and_hms(2026, 4, date, 10, 15, 0).unwrap();
             sessions.push(Session {
                 fingerprint_id: "fp-test".to_string(),
                 start: morning,
@@ -919,9 +919,7 @@ mod tests {
                 sighting_count: 3,
             });
             // Afternoon pass
-            let afternoon = Utc
-                .with_ymd_and_hms(2026, 4, date, 17, 35, 0)
-                .unwrap();
+            let afternoon = Utc.with_ymd_and_hms(2026, 4, date, 17, 35, 0).unwrap();
             sessions.push(Session {
                 fingerprint_id: "fp-test".to_string(),
                 start: afternoon,

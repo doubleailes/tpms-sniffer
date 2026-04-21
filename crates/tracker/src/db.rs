@@ -1038,10 +1038,7 @@ impl Database {
     }
 
     /// Get all sessions for a fingerprint from session_log.
-    pub fn get_sessions(
-        &self,
-        fingerprint_id: &str,
-    ) -> Result<Vec<crate::temporal::Session>> {
+    pub fn get_sessions(&self, fingerprint_id: &str) -> Result<Vec<crate::temporal::Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_start, session_end FROM session_log \
              WHERE fingerprint_id = ?1 ORDER BY session_start",
@@ -1131,7 +1128,11 @@ impl Database {
                 presence_map_json,
                 tbf.computed_at,
                 tbf.observation_days,
-                if tbf.sessions_used >= crate::temporal::MIN_TBF_SESSIONS { 1i64 } else { 0 },
+                if tbf.sessions_used >= crate::temporal::MIN_TBF_SESSIONS {
+                    1i64
+                } else {
+                    0
+                },
                 tbf.classification.as_str(),
             ],
         )?;
@@ -1174,7 +1175,8 @@ impl Database {
                 let arrival_peak_hours: Vec<u32> =
                     serde_json::from_str(&peak_hours_json).unwrap_or_default();
                 let presence_map: [[f32; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS] =
-                    serde_json::from_str(&presence_json).unwrap_or([[0.0; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS]);
+                    serde_json::from_str(&presence_json)
+                        .unwrap_or([[0.0; PRESENCE_MAP_DAYS]; PRESENCE_MAP_HOURS]);
 
                 let dwell_class = match dwell_class_s.as_str() {
                     "drive_by" => DwellClass::DriveBy,
@@ -1312,9 +1314,7 @@ impl Database {
     }
 
     /// Get all temporal fingerprints (for the report).
-    pub fn all_temporal_fingerprints(
-        &self,
-    ) -> Result<Vec<crate::server::TemporalFingerprintRow>> {
+    pub fn all_temporal_fingerprints(&self) -> Result<Vec<crate::server::TemporalFingerprintRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.fingerprint_id, f.vehicle_class, f.pressure_median_kpa, \
                     f.session_count, t.observation_days, \
