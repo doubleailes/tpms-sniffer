@@ -265,11 +265,8 @@ async fn handle_temporal_fingerprint(
     match tbf {
         Some(t) => {
             let arrival_peaks: Vec<f32> = t.arrival_gmm.iter().map(|c| c.mean_hour).collect();
-            let presence_map: Vec<Vec<f32>> = t
-                .presence_map
-                .iter()
-                .map(|row| row.to_vec())
-                .collect();
+            let presence_map: Vec<Vec<f32>> =
+                t.presence_map.iter().map(|row| row.to_vec()).collect();
             let (dominant_period_hrs, periodicity_strength) = match &t.periodicity {
                 Some(p) => (Some(p.dominant_period_hrs as f64), Some(p.strength as f64)),
                 None => (None, None),

@@ -468,8 +468,11 @@ fn run_temporal_report(db_path: &str, json_output: bool) -> Result<()> {
         let arrival_str = temporal::format_arrival(&gmm);
         let dwell_str = temporal::format_dwell(row.dwell_median_secs);
 
-        let period_str = match (&row.periodicity_class, row.dominant_period_hrs, row.acf_peak_value)
-        {
+        let period_str = match (
+            &row.periodicity_class,
+            row.dominant_period_hrs,
+            row.acf_peak_value,
+        ) {
             (Some(cls), Some(period), Some(strength)) => {
                 format!("{cls} (period {period:.1}h, strength {strength:.2})")
             }
