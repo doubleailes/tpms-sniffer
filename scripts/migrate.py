@@ -116,7 +116,7 @@ sessions AS (
         CAST(strftime('%H', MIN(ts)) AS REAL)
             + CAST(strftime('%M', MIN(ts)) AS REAL) / 60.0
                   AS arrival_hour,
-        -- SQLite %w: 0=Sun; remap to 0=Mon..6=Sun
+        -- SQLite strftime %w gives 0=Sun, remap to 0=Mon..6=Sun
         (CAST(strftime('%w', MIN(ts)) AS INTEGER) + 6) % 7
                   AS day_of_week
     FROM session_ids
