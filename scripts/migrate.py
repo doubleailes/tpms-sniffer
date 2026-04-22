@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Database migration script for tpms-sniffer.
-
-Run migrations sequentially against a SQLite database.  Each migration is
-applied at most once (tracked in a ``schema_version`` table).
+"""
+TPMS Tracker database migration script
+Applies migrations 1-4 for temporal behavioural fingerprinting (issue #34)
 
 Usage:
-    python3 scripts/migrate.py tpms.db            # apply all pending
-    python3 scripts/migrate.py tpms.db --dry-run   # preview only
+    python3 migrate.py tpms.db
+    python3 migrate.py tpms.db --dry-run     # show what would happen, no changes
+    python3 migrate.py tpms.db --step 1      # run a single step only
 """
 
 import argparse
+import shutil
 import sqlite3
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
-# Migration registry
+# Migrations
 # ---------------------------------------------------------------------------
 
 MIGRATION_V1_DESCRIPTION = "initial schema baseline"
@@ -141,24 +145,56 @@ WHERE NOT EXISTS (
 );
 """
 
-MIGRATIONS = [
-    {
-        "version": 6,
-        "description": "correct EezTire pressure: multiply by 6.89476 (PSI→kPa)",
-        "sql": """
+MIGRATION_V5_DESCRIPTION = "add rke_events and vehicle_state_transitions tables"
+MIGRATION_V5 = """
+CREATE TABLE IF NOT EXISTS rke_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT    NOT NULL,
+    rtl433_id    INTEGER NOT NULL,
+    event_type   TEXT    NOT NULL,
+    burst_count  INTEGER NOT NULL DEFAULT 1,
+    rssi         REAL,
+    raw_code     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_rke_events_ts ON rke_events(ts);
+CREATE TABLE IF NOT EXISTS vehicle_state_transitions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               TEXT    NOT NULL,
+    transition_type  TEXT    NOT NULL,
+    fingerprint_id   TEXT    REFERENCES fingerprints(fingerprint_id),
+    rke_event_id     INTEGER REFERENCES rke_events(id),
+    candidate_fps    TEXT,
+    confidence       TEXT    NOT NULL,
+    tpms_gap_secs    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_transitions_fp
+    ON vehicle_state_transitions(fingerprint_id);
+CREATE INDEX IF NOT EXISTS idx_transitions_ts
+    ON vehicle_state_transitions(ts);
+"""
+
+MIGRATION_V6_DESCRIPTION = "correct EezTire pressure: raw unit is 0.1 PSI not 0.1 kPa"
+MIGRATION_V6 = """
 UPDATE sightings
 SET pressure_kpa = pressure_kpa * 6.89476
 WHERE vehicle_id IN (
     SELECT vehicle_id FROM vehicles
     WHERE protocol LIKE '%EezTire%'
 );
-
 UPDATE vehicles
 SET avg_pressure_kpa = avg_pressure_kpa * 6.89476
 WHERE protocol LIKE '%EezTire%';
-""",
-    },
+"""
+
+MIGRATIONS = [
+    (1, MIGRATION_V1_DESCRIPTION, None),
+    (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
+    (3, MIGRATION_V3_DESCRIPTION, MIGRATION_V3),
+    (4, MIGRATION_V4_DESCRIPTION, MIGRATION_V4),
+    (5, MIGRATION_V5_DESCRIPTION, MIGRATION_V5),
+    (6, MIGRATION_V6_DESCRIPTION, MIGRATION_V6),
 ]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -169,15 +205,16 @@ def log(msg: str, dry_run: bool = False) -> None:
     prefix = "[DRY RUN] " if dry_run else ""
     print(f"{prefix}{msg}")
 
-def ensure_version_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version   INTEGER PRIMARY KEY,
-            applied   TEXT DEFAULT (datetime('now'))
+
+def ensure_migrations_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     INTEGER PRIMARY KEY,
+            applied_at  TEXT    NOT NULL,
+            description TEXT    NOT NULL
         )
-        """
-    )
+    """)
+    conn.commit()
 
 
 def current_version(conn: sqlite3.Connection) -> int:
@@ -266,37 +303,80 @@ def run_step(
         conn.execute(pragma)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Apply database migrations.")
-    parser.add_argument("database", help="Path to the SQLite database file")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print pending migrations without applying them",
+def migrate(
+    db_path: Path,
+    target_version: int | None,
+    dry_run: bool,
+) -> None:
+    # ---- backup first -------------------------------------------------------
+    backup_path = db_path.with_suffix(
+        f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
     )
-    args = parser.parse_args()
+    if not dry_run:
+        log(f"Creating backup: {backup_path}")
+        shutil.copy2(db_path, backup_path)
+        log(f"Backup created ✓")
+    else:
+        log(f"[DRY RUN] Would create backup: {backup_path}")
 
-    conn = sqlite3.connect(args.database)
-    ensure_version_table(conn)
-    cur = current_version(conn)
-    print(f"Current schema version: {cur}")
+    # ---- open connection ----------------------------------------------------
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
 
-    pending = [m for m in MIGRATIONS if m["version"] > cur]
+    ensure_migrations_table(conn)
+
+    current = current_version(conn)
+    log(f"\nCurrent schema version: v{current}")
+
+    # ---- determine which steps to run ---------------------------------------
+    pending = [
+        (v, desc, sql)
+        for v, desc, sql in MIGRATIONS
+        if v > current and (target_version is None or v <= target_version)
+    ]
+
     if not pending:
-        print("Nothing to do — all migrations already applied.")
-        sys.exit(0)
+        log("Nothing to do — database is already up to date.")
+        conn.close()
+        return
 
-    print(f"{len(pending)} pending migration(s):")
-    for m in pending:
-        apply_migration(conn, m, dry_run=args.dry_run)
+    log(f"Pending migrations: {[v for v, _, _ in pending]}\n")
 
-    if not args.dry_run:
-        print(f"Schema version is now {current_version(conn)}.")
+    # ---- pre-migration counts -----------------------------------------------
+    before = row_counts(conn)
+    print_counts("Row counts BEFORE migration:", before)
+
+    # ---- run each step ------------------------------------------------------
+    print()
+    for version, description, sql in pending:
+        run_step(conn, version, description, sql, dry_run)
+
+    # ---- post-migration counts ----------------------------------------------
+    after = row_counts(conn)
+    print_counts("\nRow counts AFTER migration:", after)
+
+    # ---- diff summary -------------------------------------------------------
+    print("\n  Changes:")
+    for table in before:
+        b = before[table]
+        a = after[table]
+        if b is None and a is not None:
+            print(f"    {table:<30} created  ({a} rows)")
+        elif b is not None and a is None:
+            print(f"    {table:<30} dropped")
+        elif b != a:
+            delta = (a or 0) - (b or 0)
+            sign = "+" if delta >= 0 else ""
+            print(f"    {table:<30} {sign}{delta:>8} rows  ({b} → {a})")
+
+    if not dry_run:
+        final_version = current_version(conn)
+        log(f"\nMigration complete. Schema version: v{final_version}")
+        log(f"Backup retained at: {backup_path}")
+    else:
+        log("\n[DRY RUN] No changes were written.")
 
     conn.close()
 
