@@ -181,9 +181,6 @@ WHERE vehicle_id IN (
     SELECT vehicle_id FROM vehicles
     WHERE protocol LIKE '%EezTire%'
 );
-UPDATE vehicles
-SET avg_pressure_kpa = avg_pressure_kpa * 6.89476
-WHERE protocol LIKE '%EezTire%';
 """
 
 MIGRATIONS = [
