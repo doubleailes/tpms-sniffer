@@ -1562,7 +1562,7 @@ mod tests {
             "fp-test1234",
             241,
             "Unknown",
-            51.1,
+            352.3,
             None,
             "2025-06-01T12:00:00+00:00",
             false,
@@ -1573,13 +1573,13 @@ mod tests {
         assert_eq!(fps.len(), 1);
         assert_eq!(fps[0].fingerprint_id, "fp-test1234");
         assert_eq!(fps[0].rtl433_id, 241);
-        assert!((fps[0].pressure_median_kpa - 51.1).abs() < 0.1);
+        assert!((fps[0].pressure_median_kpa - 352.3).abs() < 0.1);
         assert_eq!(fps[0].total_sighting_count, 1);
         assert_eq!(fps[0].session_count, 1);
 
         db.update_fingerprint(
             "fp-test1234",
-            51.3,
+            353.5,
             None,
             "2025-06-01T12:01:00+00:00",
             false,
