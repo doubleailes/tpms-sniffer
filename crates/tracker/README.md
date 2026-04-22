@@ -251,9 +251,9 @@ When `--verbose` is set, one `SIGHT` line per resolved packet:
 
 ```
 2026-04-17 10:07:30.938 | SIGHT | vehicle=8294c101 | car=3c14b2d0 | fp=fp-8294c101 |
-  sensor=0xFFFBFFFB | zeros=5 | pressure=46.4 | temp=null |
+  sensor=0xFFFBFFFB | zeros=5 | pressure=319.7 | temp=null |
   alarm=true | battery=false | protocol=EezTire/Carchet/TST-507 |
-  rtl433=241 | class=Unknown | receiver=default
+  rtl433=241 | class=PassengerCar | receiver=default
 ```
 
 #### DEBUG — resolver decisions
