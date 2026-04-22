@@ -1545,8 +1545,8 @@ mod tests {
         let mut resolver = in_memory_resolver();
 
         // Send two packets with 0xFFFFFFFF from EezTire (fixed-ID protocol 241).
-        let p1 = make_packet("0xFFFFFFFF", "EezTire", 241, 51.1);
-        let p2 = make_packet("0xFFFFFFFF", "EezTire", 241, 51.2);
+        let p1 = make_packet("0xFFFFFFFF", "EezTire", 241, 352.3);
+        let p2 = make_packet("0xFFFFFFFF", "EezTire", 241, 352.9);
         resolver.process(&p1).unwrap();
         resolver.process(&p2).unwrap();
         resolver.flush().unwrap();
@@ -1594,7 +1594,7 @@ mod tests {
 
         // Two bursts with 0xFFFFFFFF from different protocols, with very
         // different pressures so the fingerprint correlator cannot merge them.
-        let p1a = make_packet("0xFFFFFFFF", "EezTire", 241, 51.0);
+        let p1a = make_packet("0xFFFFFFFF", "EezTire", 241, 351.6);
         let p1b = make_packet("0xFFFFFFFF", "EezTire", 241, 52.0);
         resolver.process(&p1a).unwrap();
         resolver.process(&p1b).unwrap();
@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn eeztire_rolling_id_burst_resolves_to_single_vehicle() {
         // Regression for the 6-packet burst listed in the tracker issue:
-        // EezTire (protocol 241) stable ~51.1 kPa with every packet reporting
+        // EezTire (protocol 241) stable ~352.3 kPa with every packet reporting
         // a different bit-flipped sensor ID.  Prior behaviour was to create
         // one vehicle per packet; all six must now collapse to a single UUID.
         let mut resolver = in_memory_resolver();
@@ -1667,7 +1667,7 @@ mod tests {
 
         let mut vids = Vec::new();
         for (ts, sid) in bursts {
-            let p = make_packet_at(ts, sid, "EezTire", 241, 51.1);
+            let p = make_packet_at(ts, sid, "EezTire", 241, 352.3);
             let vid = resolver.process(&p).unwrap().expect("vid resolved");
             vids.push(vid);
         }
@@ -1710,14 +1710,14 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let p2 = make_packet_at(
             "2025-06-01 12:00:10.000",
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let vid1 = resolver.process(&p1).unwrap().unwrap();
         let vid2 = resolver.process(&p2).unwrap().unwrap();
@@ -1730,7 +1730,7 @@ mod tests {
             "0x7FFFFF7F",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let vid3 = resolver.process(&p3).unwrap().unwrap();
         assert_ne!(
@@ -1741,8 +1741,8 @@ mod tests {
 
     #[test]
     fn eeztire_two_sensors_at_different_pressures_do_not_merge() {
-        // Two EezTire sensors with materially different pressures (51 kPa and
-        // 25 kPa, both present in the real capture) must resolve to distinct
+        // Two EezTire sensors with materially different pressures (352 kPa and
+        // 172 kPa, both present in the real capture) must resolve to distinct
         // vehicles.
         let mut resolver = in_memory_resolver();
 
@@ -1751,28 +1751,28 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let lo1 = make_packet_at(
             "2025-06-01 12:00:01.000",
             "0xBFFFFFFF",
             "EezTire",
             241,
-            25.0,
+            172.4,
         );
         let hi2 = make_packet_at(
             "2025-06-01 12:00:02.000",
             "0x7FFEFFFE",
             "EezTire",
             241,
-            51.2,
+            352.9,
         );
         let lo2 = make_packet_at(
             "2025-06-01 12:00:03.000",
             "0xEFFFF5FF",
             "EezTire",
             241,
-            24.9,
+            171.7,
         );
 
         let vhi1 = resolver.process(&hi1).unwrap().unwrap();
@@ -1780,14 +1780,14 @@ mod tests {
         let vhi2 = resolver.process(&hi2).unwrap().unwrap();
         let vlo2 = resolver.process(&lo2).unwrap().unwrap();
 
-        assert_ne!(vhi1, vlo1, "51 kPa and 25 kPa sensors must not merge");
+        assert_ne!(vhi1, vlo1, "352 kPa and 172 kPa sensors must not merge");
         assert_eq!(
             vhi1, vhi2,
-            "both 51 kPa packets must resolve to same vehicle"
+            "both 352 kPa packets must resolve to same vehicle"
         );
         assert_eq!(
             vlo1, vlo2,
-            "both 25 kPa packets must resolve to same vehicle"
+            "both 172 kPa packets must resolve to same vehicle"
         );
 
         let eez_count = resolver
@@ -2353,7 +2353,7 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
             false, // low battery
         );
         let vid1 = resolver.process(&p1).unwrap().unwrap();
@@ -2364,7 +2364,7 @@ mod tests {
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
             false,
         );
         let vid2 = resolver.process(&p2).unwrap().unwrap();
@@ -2385,7 +2385,7 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
             true, // good battery
         );
         let vid1 = resolver.process(&p1).unwrap().unwrap();
@@ -2396,7 +2396,7 @@ mod tests {
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
             true,
         );
         let vid2 = resolver.process(&p2).unwrap().unwrap();
@@ -2506,7 +2506,7 @@ mod tests {
         ];
 
         for ts in &timestamps {
-            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
 
@@ -2587,7 +2587,7 @@ mod tests {
         ];
 
         for ts in &timestamps {
-            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
 
@@ -2615,14 +2615,14 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let p2 = make_packet_at(
             "2025-06-01 12:00:01.000",
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let vid1 = resolver.process(&p1).unwrap().unwrap();
         let vid2 = resolver.process(&p2).unwrap().unwrap();
@@ -2645,7 +2645,7 @@ mod tests {
         // Send 12 EezTire packets 30 s apart → 11 intervals.
         for i in 0..12 {
             let ts = format!("2025-06-01 12:{:02}:{:02}.000", i / 2, (i % 2) * 30);
-            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
 
@@ -2900,7 +2900,7 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
             "node-01",
         );
         let vid = resolver.process(&p1).unwrap().unwrap();
@@ -2913,7 +2913,7 @@ mod tests {
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
             "node-02",
         );
         let vid2 = resolver.process(&p2).unwrap().unwrap();
@@ -3280,20 +3280,20 @@ mod tests {
         // prevents cross-protocol matches even when pressure overlaps.
         let mut resolver = in_memory_resolver();
 
-        // Create an EezTire vehicle at 51.1 kPa via the fingerprint path.
+        // Create an EezTire vehicle at 352.3 kPa via the fingerprint path.
         let eez1 = make_packet_at(
             "2026-04-15 10:00:00.000",
             "0xF7FFFFFF",
             "EezTire/Carchet/TST-507",
             241,
-            51.1,
+            352.3,
         );
         let eez2 = make_packet_at(
             "2026-04-15 10:00:30.000",
             "0xFFDFFFFF",
             "EezTire/Carchet/TST-507",
             241,
-            51.1,
+            352.3,
         );
         resolver.process(&eez1).unwrap();
         resolver.process(&eez2).unwrap();
@@ -3312,7 +3312,7 @@ mod tests {
             "0xFFBFFFFF",
             "SomeOther",
             999,
-            51.1,
+            352.3,
         );
         // This goes to process_rolling (invalid sensor ID), which won't match
         // the EezTire vehicle because rtl433_id differs.
@@ -3360,7 +3360,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3379,7 +3379,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3465,7 +3465,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3484,7 +3484,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3563,7 +3563,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3582,7 +3582,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3705,7 +3705,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3724,7 +3724,7 @@ mod tests {
             protocol: "EezTire".to_string(),
             rtl433_id: 241,
             fixed_sensor_id: None,
-            pressure_signature: [51.0, 0.0, 0.0, 0.0],
+            pressure_signature: [351.6, 0.0, 0.0, 0.0],
             make_model_hint: None,
             battery_ok: true,
             tx_intervals_ms: VecDeque::new(),
@@ -3813,7 +3813,7 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let vid = resolver.process(&p).unwrap().unwrap();
 
@@ -3884,7 +3884,7 @@ mod tests {
         // Session 1: Create an EezTire vehicle with enough sightings.
         for i in 0..6 {
             let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
-            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
 
@@ -3906,7 +3906,7 @@ mod tests {
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let vid2 = resolver.process(&p_late).unwrap().unwrap();
 
@@ -3937,14 +3937,14 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let lo = make_packet_at(
             "2025-06-01 12:00:01.000",
             "0xBFFFFFFF",
             "EezTire",
             241,
-            25.0,
+            172.4,
         );
         let vhi = resolver.process(&hi).unwrap().unwrap();
         let vlo = resolver.process(&lo).unwrap().unwrap();
@@ -3968,7 +3968,7 @@ mod tests {
             "0xF7FFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         resolver.process(&p).unwrap();
 
@@ -3976,8 +3976,8 @@ mod tests {
         assert_eq!(fps.len(), 1, "one fingerprint must be created");
         assert_eq!(fps[0].rtl433_id, 241);
         assert!(
-            fps[0].pressure_median_kpa > 40.0 && fps[0].pressure_median_kpa < 60.0,
-            "pressure_median_kpa must be near 51.1"
+            fps[0].pressure_median_kpa > 340.0 && fps[0].pressure_median_kpa < 360.0,
+            "pressure_median_kpa must be near 352.3"
         );
     }
 
@@ -3990,7 +3990,7 @@ mod tests {
         // Session 1: 6 sightings to establish the fingerprint.
         for i in 0..6 {
             let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
-            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
         let vids: Vec<Uuid> = resolver
@@ -4005,7 +4005,7 @@ mod tests {
         // Session 2: after VEHICLE_EXPIRY (>480s gap).
         for i in 0..3 {
             let ts = format!("2025-06-01 12:09:{:02}.000", i * 10);
-            let p = make_packet_at(&ts, "0xBFFFFFFF", "EezTire", 241, 51.0);
+            let p = make_packet_at(&ts, "0xBFFFFFFF", "EezTire", 241, 351.6);
             resolver.process(&p).unwrap();
         }
         let vid2_candidates: Vec<Uuid> = resolver
@@ -4020,7 +4020,7 @@ mod tests {
         // Session 3: another >480s gap.
         for i in 0..3 {
             let ts = format!("2025-06-01 12:18:{:02}.000", i * 10);
-            let p = make_packet_at(&ts, "0xDFFFFFFF", "EezTire", 241, 51.2);
+            let p = make_packet_at(&ts, "0xDFFFFFFF", "EezTire", 241, 352.9);
             resolver.process(&p).unwrap();
         }
         let vid3_candidates: Vec<Uuid> = resolver
@@ -4066,17 +4066,17 @@ mod tests {
         // TX intervals produce 2 fingerprints once both have enough samples.
         let mut resolver = in_memory_resolver();
 
-        // Sensor A: ~51 kPa, ~10s intervals.
+        // Sensor A: ~352 kPa, ~10s intervals.
         for i in 0..8 {
             let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
-            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
 
-        // After expiry, sensor B: ~51 kPa but ~50s intervals.
+        // After expiry, sensor B: ~352 kPa but ~50s intervals.
         for i in 0..8 {
             let ts = format!("2025-06-01 12:09:{:02}.000", i * 50);
-            let p = make_packet_at(&ts, "0xBFFFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(&ts, "0xBFFFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
 
@@ -4112,7 +4112,7 @@ mod tests {
         // Create a vehicle with only 2 sightings (below threshold).
         for i in 0..2 {
             let ts = format!("2025-06-01 12:00:{:02}.000", i * 10);
-            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 51.1);
+            let p = make_packet_at(&ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
             resolver.process(&p).unwrap();
         }
         let vid1 = resolver
@@ -4129,7 +4129,7 @@ mod tests {
             "0xBFFFFFFF",
             "EezTire",
             241,
-            51.1,
+            352.3,
         );
         let vid2 = resolver.process(&p_late).unwrap().unwrap();
         assert_ne!(vid1, vid2, "new vehicle UUID after expiry");
@@ -4260,15 +4260,15 @@ mod tests {
 
     #[test]
     fn four_vehicles_same_pressure_no_hint_matches_most_recent() {
-        // AC: 4 active vehicles at 51.1 kPa with established intervals,
-        // incoming packet at 51.1 kPa with no interval hint → matched to
+        // AC: 4 active vehicles at 352.3 kPa with established intervals,
+        // incoming packet at 352.3 kPa with no interval hint → matched to
         // most recently seen, not new vehicle.
         let mut resolver = in_memory_resolver();
         let base = chrono::Utc::now();
 
         // Inject 4 vehicles at the same compensated pressure with different
         // intervals and staggered last_seen times.
-        let compensated = compensate_pressure(51.1, Some(25.0));
+        let compensated = compensate_pressure(352.3, Some(25.0));
         let _v1 = inject_fingerprint_vehicle(
             &mut resolver,
             compensated,
@@ -4296,12 +4296,12 @@ mod tests {
 
         assert_eq!(resolver.vehicles.len(), 4, "setup: 4 vehicles must exist");
 
-        // Feed a new EezTire packet at 51.1 kPa.  The timestamp must be
+        // Feed a new EezTire packet at 352.3 kPa.  The timestamp must be
         // formatted in local time because TpmsPacket::parsed_ts interprets it
         // as local.
         let now_local = base.with_timezone(&chrono::Local);
         let ts_str = now_local.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-        let p = make_packet_at(&ts_str, "0xFDFFFFFF", "EezTire", 241, 51.1);
+        let p = make_packet_at(&ts_str, "0xFDFFFFFF", "EezTire", 241, 352.3);
         let result = resolver.process(&p).unwrap();
 
         assert!(
@@ -4326,13 +4326,13 @@ mod tests {
 
     #[test]
     fn two_vehicles_same_pressure_hint_selects_closer_interval() {
-        // AC: 2 active vehicles at 51.1 kPa with intervals 45s and 71s,
-        // incoming packet at 51.1 kPa with hint 44s → matched to the 45s
+        // AC: 2 active vehicles at 352.3 kPa with intervals 45s and 71s,
+        // incoming packet at 352.3 kPa with hint 44s → matched to the 45s
         // vehicle.
         let mut resolver = in_memory_resolver();
         let base = chrono::Utc::now();
 
-        let compensated = compensate_pressure(51.1, Some(25.0));
+        let compensated = compensate_pressure(352.3, Some(25.0));
         let v_45 = inject_fingerprint_vehicle(
             &mut resolver,
             compensated,
@@ -4357,7 +4357,7 @@ mod tests {
 
         let now_local = sighting_ts.with_timezone(&chrono::Local);
         let ts_str = now_local.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-        let p = make_packet_at(&ts_str, "0xFDFFFFFF", "EezTire", 241, 51.1);
+        let p = make_packet_at(&ts_str, "0xFDFFFFFF", "EezTire", 241, 352.3);
         let result = resolver.process(&p).unwrap();
 
         assert!(result.is_some(), "must match an existing vehicle");

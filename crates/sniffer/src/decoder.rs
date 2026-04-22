@@ -826,7 +826,8 @@ fn decode_tyreguard(bits: &[u8]) -> Option<TpmsPacket> {
 // ═══════════════════════════════════════════════════════════
 //  [241] EezTire E618 / Carchet TPMS / TST-507
 //  OOK, 433.92 MHz, 9 bytes, CRC-8
-//  P: 9-bit word * 0.1 kPa    T: C - 50
+//  P: 9-bit word * 0.1 PSI    T: C - 50
+//  See rtl_433 issues #2657 and #2819 for PSI encoding details.
 // ═══════════════════════════════════════════════════════════
 fn decode_eeztire(bits: &[u8]) -> Option<TpmsPacket> {
     let b = raw_bits_to_bytes(bits);
@@ -835,9 +836,13 @@ fn decode_eeztire(bits: &[u8]) -> Option<TpmsPacket> {
     }
     let crc_ok = crc8(&b[..8], 0x00) == b[8];
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    let kpa = ((b[5] as u16) | ((b[4] as u16 & 0x01) << 8)) as f32 * 0.1;
+    // Raw 9-bit field encodes pressure in units of 0.1 PSI.
+    // Multiply by 0.1 to get PSI, then by 6.89476 to get kPa.
+    // Combined factor: 0.68948 kPa per raw unit.
+    let psi_x10 = ((b[5] as u16) | ((b[4] as u16 & 0x01) << 8)) as f32;
+    let kpa = psi_x10 * 0.68948;
     let temp = b[6] as f32 - 50.0;
-    let sane = (0.0..=400.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
+    let sane = (50.0..=900.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
     Some(pkt(
         "EezTire/Carchet/TST-507",
         241,
@@ -998,4 +1003,105 @@ fn decode_solar_truck(bits: &[u8]) -> Option<TpmsPacket> {
         &b[..9],
         score(crc_ok, sane, kpa, Some(temp)),
     ))
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build 9 × 8 = 72 raw bits from 9 bytes, suitable for decode_eeztire.
+    fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
+            .collect()
+    }
+
+    /// Construct a 9-byte EezTire frame with the given raw pressure (0..511)
+    /// and temperature byte, then compute a valid CRC-8 in byte 8.
+    fn eeztire_frame(id: u32, raw_pressure: u16, temp_byte: u8) -> Vec<u8> {
+        let id_bytes = id.to_be_bytes();
+        let flags_low = (raw_pressure >> 8) as u8 & 0x01; // bit 8 of pressure
+        let p_byte = (raw_pressure & 0xFF) as u8;
+        let mut frame = vec![
+            id_bytes[0],
+            id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
+            flags_low,
+            p_byte,
+            temp_byte,
+            0x00, // padding byte 7
+        ];
+        let crc = crc8(&frame, 0x00);
+        frame.push(crc);
+        frame
+    }
+
+    #[test]
+    fn eeztire_raw_511_gives_352_kpa() {
+        // Raw 511 × 0.68948 ≈ 352.2 kPa
+        let frame = eeztire_frame(0xAABBCCDD, 511, 75); // temp = 75 - 50 = 25 °C
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_eeztire(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 352.2).abs() < 0.5,
+            "expected ~352.2 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn eeztire_raw_255_gives_176_kpa() {
+        // Raw 255 × 0.68948 ≈ 175.8 kPa
+        let frame = eeztire_frame(0x11223344, 255, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_eeztire(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 175.8).abs() < 0.5,
+            "expected ~175.8 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn eeztire_raw_495_gives_341_kpa() {
+        // Raw 495 × 0.68948 ≈ 341.3 kPa (normal car/SUV)
+        let frame = eeztire_frame(0xDEADBEEF, 495, 80); // temp = 30 °C
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_eeztire(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 341.3).abs() < 0.5,
+            "expected ~341.3 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn eeztire_sanity_rejects_below_50_kpa() {
+        // Raw 50 × 0.68948 ≈ 34.5 kPa — below the 50 kPa sanity floor.
+        // The packet should still be returned (decoder always returns Some),
+        // but the confidence should be lower (no 'sane' bonus).
+        let frame = eeztire_frame(0x00112233, 50, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_eeztire(&bits).expect("should decode");
+        assert!(
+            pkt.pressure_kpa < 50.0,
+            "pressure {} should be below sanity floor",
+            pkt.pressure_kpa,
+        );
+        // Score without 'sane' bonus is lower than with it.
+        let sane_frame = eeztire_frame(0x00112233, 400, 75);
+        let sane_bits = bytes_to_bits(&sane_frame);
+        let sane_pkt = decode_eeztire(&sane_bits).expect("should decode");
+        assert!(
+            sane_pkt.confidence > pkt.confidence,
+            "sane packet (conf={}) should score higher than insane (conf={})",
+            sane_pkt.confidence,
+            pkt.confidence,
+        );
+    }
 }
