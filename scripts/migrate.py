@@ -183,6 +183,17 @@ WHERE vehicle_id IN (
 );
 """
 
+MIGRATION_V7_DESCRIPTION = "re-correct EezTire sightings added after v6 with unfixed decoder"
+MIGRATION_V7 = """
+UPDATE sightings
+SET pressure_kpa = pressure_kpa * 6.89476
+WHERE vehicle_id IN (
+    SELECT vehicle_id FROM vehicles
+    WHERE protocol LIKE '%EezTire%'
+)
+AND ts > '2026-04-22T20:09:00';
+"""
+
 MIGRATIONS = [
     (1, MIGRATION_V1_DESCRIPTION, None),
     (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
@@ -190,6 +201,7 @@ MIGRATIONS = [
     (4, MIGRATION_V4_DESCRIPTION, MIGRATION_V4),
     (5, MIGRATION_V5_DESCRIPTION, MIGRATION_V5),
     (6, MIGRATION_V6_DESCRIPTION, MIGRATION_V6),
+    (7, MIGRATION_V7_DESCRIPTION, MIGRATION_V7),
 ]
 
 
