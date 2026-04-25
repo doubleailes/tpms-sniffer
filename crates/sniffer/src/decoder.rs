@@ -1185,7 +1185,11 @@ mod tests {
         let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x60, 0x50, 75, 0x0E);
         let bits = bytes_to_bits(&frame);
         let pkt = decode_trw_ook(&bits).expect("should decode");
-        assert_eq!(pkt.moving, Some(false), "0x0E should mean parked (not moving)");
+        assert_eq!(
+            pkt.moving,
+            Some(false),
+            "0x0E should mean parked (not moving)"
+        );
     }
 
     #[test]
