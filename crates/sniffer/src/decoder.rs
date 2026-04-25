@@ -533,10 +533,13 @@ fn decode_steelmate(bits: &[u8]) -> Option<TpmsPacket> {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  [123] Jansite TY02S  /  [180] Solar variant
+//  [123] Jansite TY02S  /  [180] Jansite Solar
 //  OOK, 433.92 MHz, 19.2 kbps
 //  8 bytes: [ID:4][flags:1][P:1][T:1][CRC-8:1]
-//  P: kPa * 0.1    T: C - 50
+//  P: quarter PSI per unit → kPa = raw × 0.25 PSI × 6.89476 ≈ raw × 1.7
+//  T: C - 50
+//  Monitoring range: 0–350 kPa (datasheet)
+//  Source: rtl_433/src/devices/tpms_jansite.c
 // ═══════════════════════════════════════════════════════════
 fn decode_jansite(bits: &[u8]) -> Option<TpmsPacket> {
     let b = raw_bits_to_bytes(bits);
@@ -545,9 +548,9 @@ fn decode_jansite(bits: &[u8]) -> Option<TpmsPacket> {
     }
     let crc_ok = crc8(&b[..7], 0x00) == b[7];
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    let kpa = b[5] as f32 * 0.1;
+    let kpa = b[5] as f32 * 1.7; // quarter PSI/unit: 0.25 × 6.89476 ≈ 1.7
     let temp = b[6] as f32 - 50.0;
-    let sane = (0.0..=400.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
+    let sane = (50.0..=400.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
     Some(pkt(
         "Jansite-TY02S",
         123,
@@ -1248,5 +1251,74 @@ mod tests {
         let bits = bytes_to_bits(&frame);
         let pkt = decode_trw_ook(&bits).expect("should decode");
         assert_eq!(pkt.sensor_id, "0x8EDC0E7A", "ID should be from b[1..4]");
+    }
+
+    // ── Jansite helpers ──────────────────────────────────────
+
+    /// Build an 8-byte Jansite frame: [ID:4][flags:1][P:1][T:1][CRC-8:1]
+    fn jansite_frame(id: u32, flags: u8, pressure_raw: u8, temp_raw: u8) -> Vec<u8> {
+        let id_bytes = id.to_be_bytes();
+        let mut frame = vec![
+            id_bytes[0],
+            id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
+            flags,
+            pressure_raw,
+            temp_raw,
+        ];
+        let crc = crc8(&frame, 0x00);
+        frame.push(crc);
+        frame
+    }
+
+    #[test]
+    fn jansite_pressure_0x78_gives_204_kpa() {
+        // Raw 0x78 (120) × 1.7 = 204 kPa (~29.6 PSI, normal scooter front tyre)
+        let frame = jansite_frame(0xAABBCCDD, 0x00, 0x78, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_jansite(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 204.0).abs() < 0.5,
+            "expected ~204 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn jansite_pressure_0x96_gives_255_kpa() {
+        // Raw 0x96 (150) × 1.7 = 255 kPa (~37 PSI, normal motorcycle rear tyre)
+        let frame = jansite_frame(0x11223344, 0x00, 0x96, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_jansite(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 255.0).abs() < 0.5,
+            "expected ~255 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn jansite_sanity_rejects_below_50_kpa() {
+        // Raw 0x09 (9) × 1.7 = 15.3 kPa — below the 50 kPa sanity floor.
+        // The packet should still be returned but with lower confidence.
+        let frame = jansite_frame(0x00112233, 0x00, 0x09, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_jansite(&bits).expect("should decode");
+        assert!(
+            pkt.pressure_kpa < 50.0,
+            "pressure {} should be below sanity floor",
+            pkt.pressure_kpa,
+        );
+        // Score without 'sane' bonus is lower than with it.
+        let sane_frame = jansite_frame(0x00112233, 0x00, 0x78, 75);
+        let sane_bits = bytes_to_bits(&sane_frame);
+        let sane_pkt = decode_jansite(&sane_bits).expect("should decode");
+        assert!(
+            sane_pkt.confidence > pkt.confidence,
+            "sane packet (conf={}) should score higher than insane (conf={})",
+            sane_pkt.confidence,
+            pkt.confidence,
+        );
     }
 }
