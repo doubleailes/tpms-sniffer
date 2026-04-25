@@ -202,6 +202,25 @@ MIGRATIONS = [
     (5, MIGRATION_V5_DESCRIPTION, MIGRATION_V5),
     (6, MIGRATION_V6_DESCRIPTION, MIGRATION_V6),
     (7, MIGRATION_V7_DESCRIPTION, MIGRATION_V7),
+UPDATE vehicles
+SET avg_pressure_kpa = avg_pressure_kpa * 6.89476
+WHERE protocol LIKE '%EezTire%';
+""",
+    },
+    {
+        "version": 8,
+        "description": "wipe corrupt TRW data: pressure was read from ID bytes not pressure field",
+        "sql": """
+DELETE FROM sightings WHERE vehicle_id IN (
+    SELECT vehicle_id FROM vehicles
+    WHERE protocol LIKE '%TRW%'
+);
+DELETE FROM vehicles WHERE protocol LIKE '%TRW%';
+DELETE FROM cars WHERE car_id NOT IN (
+    SELECT DISTINCT car_id FROM vehicles WHERE car_id IS NOT NULL
+);
+""",
+    },
 ]
 
 
