@@ -890,55 +890,73 @@ fn decode_gm_aftermarket(bits: &[u8]) -> Option<TpmsPacket> {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  [298] TRW OOK   /  [299] TRW FSK
-//  OOK or FSK (Manchester), 433.92 MHz, 8 bytes, CRC-8
-//  P: kPa * 0.25   T: C - 40
+//  [298] TRW OOK / [299] TRW FSK
+//  OOK or FSK (Manchester), 433.92 MHz, 11 bytes
+//
+//  Data layout (from rtl_433 tpms_trw.c, FCC-ID GQ4-70T):
+//    b[0]    = Mode byte (0x5c OEM clone / 0x5d-5e OEM)
+//    b[1..4] = Sensor ID (32-bit big-endian)
+//    b[5]    = Flags[7:4] + Seq[3:0]
+//    b[6]    = Pressure: raw × 0.4 PSI × 6.89476 = raw × 2.75790 kPa
+//    b[7]    = Temperature: raw - 50 = °C
+//    b[8]    = Motion status: 0x0E = parked, other = moving
+//    b[9]    = CRC-8/SMBUS poly 0x07 init 0x00 over b[0..9]
+//    b[10]   = Trailing nibble (0x4 OEM / 0x0 Clone)
+//
+//  Flags: 0x6 or 0x9 = pressure alert
+//  Used in Chrysler/Dodge/Jeep/Ram 2014–2022 (GQ4-70T)
 // ═══════════════════════════════════════════════════════════
 fn decode_trw_ook(bits: &[u8]) -> Option<TpmsPacket> {
     let b = raw_bits_to_bytes(bits);
-    if b.len() < 8 {
+    if b.len() < 11 {
         return None;
     }
-    let crc_ok = crc8(&b[..7], 0x00) == b[7];
-    let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    let kpa = b[4] as f32 * 0.25;
-    let temp = b[5] as f32 - 40.0;
-    let sane = (0.0..=400.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
+    let crc_ok = crc8(&b[..10], 0x00) == b[9];
+    let id = u32::from_be_bytes([b[1], b[2], b[3], b[4]]);
+    let kpa = b[6] as f32 * 2.75790;
+    let temp = b[7] as f32 - 50.0;
+    let flags = (b[5] & 0xF0) >> 4;
+    let alarm = Some(flags == 0x6 || flags == 0x9);
+    let moving = Some(b[8] != 0x0E);
+    let sane = (50.0..=900.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
     Some(pkt(
         "TRW-OOK",
         298,
         id,
         kpa,
         Some(temp),
-        Some(b[6] & 0x02 == 0),
-        Some(b[6]),
         None,
-        Some(b[6] & 0x04 != 0),
-        &b[..8],
+        Some(b[5]),
+        moving,
+        alarm,
+        &b[..10],
         score(crc_ok, sane, kpa, Some(temp)),
     ))
 }
 fn decode_trw_fsk(bits: &[u8]) -> Option<TpmsPacket> {
     let b = manchester_decode(bits);
-    if b.len() < 8 {
+    if b.len() < 11 {
         return None;
     }
-    let crc_ok = crc8(&b[..7], 0x00) == b[7];
-    let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    let kpa = b[4] as f32 * 0.25;
-    let temp = b[5] as f32 - 40.0;
-    let sane = (0.0..=400.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
+    let crc_ok = crc8(&b[..10], 0x00) == b[9];
+    let id = u32::from_be_bytes([b[1], b[2], b[3], b[4]]);
+    let kpa = b[6] as f32 * 2.75790;
+    let temp = b[7] as f32 - 50.0;
+    let flags = (b[5] & 0xF0) >> 4;
+    let alarm = Some(flags == 0x6 || flags == 0x9);
+    let moving = Some(b[8] != 0x0E);
+    let sane = (50.0..=900.0).contains(&kpa) && (-40.0..=125.0).contains(&temp);
     Some(pkt(
         "TRW-FSK",
         299,
         id,
         kpa,
         Some(temp),
-        Some(b[6] & 0x02 == 0),
-        Some(b[6]),
         None,
-        Some(b[6] & 0x04 != 0),
-        &b[..8],
+        Some(b[5]),
+        moving,
+        alarm,
+        &b[..10],
         score(crc_ok, sane, kpa, Some(temp)),
     ))
 }
@@ -1103,5 +1121,128 @@ mod tests {
             sane_pkt.confidence,
             pkt.confidence,
         );
+    }
+
+    // ── TRW OOK helpers ──────────────────────────────────────
+
+    /// Build an 11-byte TRW OOK frame with the given parameters,
+    /// then compute a valid CRC-8/SMBUS in byte 9.
+    fn trw_ook_frame(
+        mode: u8,
+        id: u32,
+        flags_seq: u8,
+        pressure_raw: u8,
+        temp_raw: u8,
+        motion: u8,
+    ) -> Vec<u8> {
+        let id_bytes = id.to_be_bytes();
+        let mut frame = vec![
+            mode,
+            id_bytes[0],
+            id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
+            flags_seq,
+            pressure_raw,
+            temp_raw,
+            motion,
+        ];
+        let crc = crc8(&frame, 0x00);
+        frame.push(crc);
+        frame.push(0x04); // trailing nibble
+        frame
+    }
+
+    #[test]
+    fn trw_ook_pressure_0x4a_gives_204_kpa() {
+        // Raw 0x4A (74) × 2.75790 ≈ 204.08 kPa (~29.6 PSI)
+        let frame = trw_ook_frame(0x5C, 0xAABBCCDD, 0x60, 0x4A, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 204.08).abs() < 0.5,
+            "expected ~204 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn trw_ook_pressure_0x50_gives_220_kpa() {
+        // Raw 0x50 (80) × 2.75790 ≈ 220.63 kPa (~32 PSI, nominal car)
+        let frame = trw_ook_frame(0x5C, 0x11223344, 0x60, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert!(
+            (pkt.pressure_kpa - 220.63).abs() < 0.5,
+            "expected ~220.6 kPa, got {}",
+            pkt.pressure_kpa,
+        );
+    }
+
+    #[test]
+    fn trw_ook_motion_0x0e_is_parked() {
+        // Motion byte 0x0E means parked → moving = false
+        let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x60, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert_eq!(pkt.moving, Some(false), "0x0E should mean parked (not moving)");
+    }
+
+    #[test]
+    fn trw_ook_motion_other_is_moving() {
+        // Motion byte != 0x0E means moving
+        let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x60, 0x50, 75, 0x01);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert_eq!(pkt.moving, Some(true), "non-0x0E should mean moving");
+    }
+
+    #[test]
+    fn trw_ook_flags_0x6_triggers_alarm() {
+        // Flags nibble 0x6 → alarm = true
+        let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x60, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert_eq!(pkt.alarm, Some(true), "flags 0x6 should trigger alarm");
+    }
+
+    #[test]
+    fn trw_ook_flags_0x9_triggers_alarm() {
+        // Flags nibble 0x9 → alarm = true
+        let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x90, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert_eq!(pkt.alarm, Some(true), "flags 0x9 should trigger alarm");
+    }
+
+    #[test]
+    fn trw_ook_flags_other_no_alarm() {
+        // Flags nibble 0x3 → alarm = false
+        let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x30, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert_eq!(pkt.alarm, Some(false), "flags 0x3 should not trigger alarm");
+    }
+
+    #[test]
+    fn trw_ook_temperature_offset_50() {
+        // Temp raw 75 - 50 = 25 °C
+        let frame = trw_ook_frame(0x5C, 0xDEADBEEF, 0x60, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert!(
+            (pkt.temp_c.unwrap() - 25.0).abs() < 0.1,
+            "expected 25 °C, got {}",
+            pkt.temp_c.unwrap(),
+        );
+    }
+
+    #[test]
+    fn trw_ook_id_from_bytes_1_to_4() {
+        // Verify ID is read from b[1..4], not b[0..3]
+        let frame = trw_ook_frame(0x5C, 0x8EDC0E7A, 0x60, 0x50, 75, 0x0E);
+        let bits = bytes_to_bits(&frame);
+        let pkt = decode_trw_ook(&bits).expect("should decode");
+        assert_eq!(pkt.sensor_id, "0x8EDC0E7A", "ID should be from b[1..4]");
     }
 }
