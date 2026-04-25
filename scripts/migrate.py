@@ -2,27 +2,27 @@
 """
 TPMS Tracker database migration script
 Applies migrations 1-4 for temporal behavioural fingerprinting (issue #34)
-
+ 
 Usage:
     python3 migrate.py tpms.db
     python3 migrate.py tpms.db --dry-run     # show what would happen, no changes
     python3 migrate.py tpms.db --step 1      # run a single step only
 """
-
+ 
 import argparse
 import shutil
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Migrations
 # ---------------------------------------------------------------------------
-
+ 
 MIGRATION_V1_DESCRIPTION = "initial schema baseline"
-
+ 
 MIGRATION_V2_DESCRIPTION = "clean artifact vehicles (pressure < 1.5 kPa)"
 MIGRATION_V2 = """
 PRAGMA foreign_keys=OFF;
@@ -35,7 +35,7 @@ DELETE FROM cars
     );
 PRAGMA foreign_keys=ON;
 """
-
+ 
 MIGRATION_V3_DESCRIPTION = "add session_log and temporal_fingerprints tables"
 MIGRATION_V3 = """
 CREATE TABLE IF NOT EXISTS session_log (
@@ -47,12 +47,12 @@ CREATE TABLE IF NOT EXISTS session_log (
     arrival_hour    REAL    NOT NULL,
     day_of_week     INTEGER NOT NULL
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_session_log_fp
     ON session_log(fingerprint_id);
 CREATE INDEX IF NOT EXISTS idx_session_log_start
     ON session_log(session_start);
-
+ 
 CREATE TABLE IF NOT EXISTS temporal_fingerprints (
     fingerprint_id          TEXT    PRIMARY KEY
                                     REFERENCES fingerprints(fingerprint_id),
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS temporal_fingerprints (
     min_sessions_met        INTEGER NOT NULL DEFAULT 0
 );
 """
-
+ 
 MIGRATION_V4_DESCRIPTION = "backfill session_log from existing sightings"
 # Note: strftime('%w') returns 0=Sunday in SQLite; we remap to 0=Monday
 MIGRATION_V4 = """
@@ -144,7 +144,8 @@ WHERE NOT EXISTS (
       AND sl.session_start   = sessions.session_start
 );
 """
-
+ 
+ 
 MIGRATION_V5_DESCRIPTION = "add rke_events and vehicle_state_transitions tables"
 MIGRATION_V5 = """
 CREATE TABLE IF NOT EXISTS rke_events (
@@ -172,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_transitions_fp
 CREATE INDEX IF NOT EXISTS idx_transitions_ts
     ON vehicle_state_transitions(ts);
 """
-
+ 
 MIGRATION_V6_DESCRIPTION = "correct EezTire pressure: raw unit is 0.1 PSI not 0.1 kPa"
 MIGRATION_V6 = """
 UPDATE sightings
@@ -182,7 +183,7 @@ WHERE vehicle_id IN (
     WHERE protocol LIKE '%EezTire%'
 );
 """
-
+ 
 MIGRATION_V7_DESCRIPTION = "re-correct EezTire sightings added after v6 with unfixed decoder"
 MIGRATION_V7 = """
 UPDATE sightings
@@ -193,24 +194,10 @@ WHERE vehicle_id IN (
 )
 AND ts > '2026-04-22T20:09:00';
 """
-
-MIGRATIONS = [
-    (1, MIGRATION_V1_DESCRIPTION, None),
-    (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
-    (3, MIGRATION_V3_DESCRIPTION, MIGRATION_V3),
-    (4, MIGRATION_V4_DESCRIPTION, MIGRATION_V4),
-    (5, MIGRATION_V5_DESCRIPTION, MIGRATION_V5),
-    (6, MIGRATION_V6_DESCRIPTION, MIGRATION_V6),
-    (7, MIGRATION_V7_DESCRIPTION, MIGRATION_V7),
-UPDATE vehicles
-SET avg_pressure_kpa = avg_pressure_kpa * 6.89476
-WHERE protocol LIKE '%EezTire%';
-""",
-    },
-    {
-        "version": 8,
-        "description": "wipe corrupt TRW data: pressure was read from ID bytes not pressure field",
-        "sql": """
+ 
+MIGRATION_V8_DESCRIPTION = "wipe corrupt TRW data: pressure was read from ID bytes not pressure field"
+MIGRATION_V8 = """
+PRAGMA foreign_keys=OFF;
 DELETE FROM sightings WHERE vehicle_id IN (
     SELECT vehicle_id FROM vehicles
     WHERE protocol LIKE '%TRW%'
@@ -219,21 +206,41 @@ DELETE FROM vehicles WHERE protocol LIKE '%TRW%';
 DELETE FROM cars WHERE car_id NOT IN (
     SELECT DISTINCT car_id FROM vehicles WHERE car_id IS NOT NULL
 );
-""",
-    },
+PRAGMA foreign_keys=ON;
+"""
+ 
+MIGRATION_V9_DESCRIPTION = "correct Jansite pressure: raw unit is 0.25 PSI not 0.1 kPa (factor x17)"
+MIGRATION_V9 = """
+UPDATE sightings
+SET pressure_kpa = pressure_kpa * 17.0
+WHERE vehicle_id IN (
+    SELECT vehicle_id FROM vehicles
+    WHERE protocol LIKE '%Jansite%'
+);
+"""
+ 
+MIGRATIONS = [
+    (1, MIGRATION_V1_DESCRIPTION, None),
+    (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
+    (3, MIGRATION_V3_DESCRIPTION, MIGRATION_V3),
+    (4, MIGRATION_V4_DESCRIPTION, MIGRATION_V4),
+    (5, MIGRATION_V5_DESCRIPTION, MIGRATION_V5),
+    (6, MIGRATION_V6_DESCRIPTION, MIGRATION_V6),
+    (7, MIGRATION_V7_DESCRIPTION, MIGRATION_V7),
+    (8, MIGRATION_V8_DESCRIPTION, MIGRATION_V8),
+    (9, MIGRATION_V9_DESCRIPTION, MIGRATION_V9),
 ]
-
-
+ 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
+ 
+ 
 def log(msg: str, dry_run: bool = False) -> None:
     prefix = "[DRY RUN] " if dry_run else ""
     print(f"{prefix}{msg}")
-
-
+ 
+ 
 def ensure_migrations_table(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -243,20 +250,20 @@ def ensure_migrations_table(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.commit()
-
-
+ 
+ 
 def current_version(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
     return row[0] if row[0] is not None else 0
-
-
+ 
+ 
 def stamp(conn: sqlite3.Connection, version: int, description: str) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO schema_migrations VALUES (?, ?, ?)",
         (version, datetime.now(timezone.utc).isoformat(), description),
     )
-
-
+ 
+ 
 def row_counts(conn: sqlite3.Connection) -> dict:
     tables = [
         "sightings",
@@ -275,8 +282,8 @@ def row_counts(conn: sqlite3.Connection) -> dict:
         except sqlite3.OperationalError:
             counts[t] = None  # table does not exist yet
     return counts
-
-
+ 
+ 
 def print_counts(label: str, counts: dict) -> None:
     print(f"\n  {label}")
     for table, n in counts.items():
@@ -284,13 +291,13 @@ def print_counts(label: str, counts: dict) -> None:
             print(f"    {table:<30} {n:>8} rows")
         else:
             print(f"    {table:<30}  (not present)")
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Migration runners
 # ---------------------------------------------------------------------------
-
-
+ 
+ 
 def run_step(
     conn: sqlite3.Connection,
     version: int,
@@ -299,13 +306,13 @@ def run_step(
     dry_run: bool,
 ) -> None:
     log(f"  Applying migration v{version}: {description}", dry_run)
-
+ 
     if sql is None:
         if not dry_run:
             stamp(conn, version, description)
             conn.commit()
         return
-
+ 
     if dry_run:
         preview = sql.strip().splitlines()
         for line in preview[:20]:
@@ -313,24 +320,24 @@ def run_step(
         if len(preview) > 20:
             print(f"    SQL> ... ({len(preview) - 20} more lines)")
         return
-
+ 
     statements = [s.strip() for s in sql.split(";") if s.strip()]
     # PRAGMAs must run outside the transaction
     pragmas = [s for s in statements if s.upper().startswith("PRAGMA")]
     rest = [s for s in statements if not s.upper().startswith("PRAGMA")]
-
+ 
     for pragma in [p for p in pragmas if "OFF" in p.upper()]:
         conn.execute(pragma)
-
+ 
     with conn:
         for stmt in rest:
             conn.execute(stmt)
         stamp(conn, version, description)
-
+ 
     for pragma in [p for p in pragmas if "ON" in p.upper()]:
         conn.execute(pragma)
-
-
+ 
+ 
 def migrate(
     db_path: Path,
     target_version: int | None,
@@ -346,45 +353,45 @@ def migrate(
         log(f"Backup created ✓")
     else:
         log(f"[DRY RUN] Would create backup: {backup_path}")
-
+ 
     # ---- open connection ----------------------------------------------------
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-
+ 
     ensure_migrations_table(conn)
-
+ 
     current = current_version(conn)
     log(f"\nCurrent schema version: v{current}")
-
+ 
     # ---- determine which steps to run ---------------------------------------
     pending = [
         (v, desc, sql)
         for v, desc, sql in MIGRATIONS
         if v > current and (target_version is None or v <= target_version)
     ]
-
+ 
     if not pending:
         log("Nothing to do — database is already up to date.")
         conn.close()
         return
-
+ 
     log(f"Pending migrations: {[v for v, _, _ in pending]}\n")
-
+ 
     # ---- pre-migration counts -----------------------------------------------
     before = row_counts(conn)
     print_counts("Row counts BEFORE migration:", before)
-
+ 
     # ---- run each step ------------------------------------------------------
     print()
     for version, description, sql in pending:
         run_step(conn, version, description, sql, dry_run)
-
+ 
     # ---- post-migration counts ----------------------------------------------
     after = row_counts(conn)
     print_counts("\nRow counts AFTER migration:", after)
-
+ 
     # ---- diff summary -------------------------------------------------------
     print("\n  Changes:")
     for table in before:
@@ -398,22 +405,22 @@ def migrate(
             delta = (a or 0) - (b or 0)
             sign = "+" if delta >= 0 else ""
             print(f"    {table:<30} {sign}{delta:>8} rows  ({b} → {a})")
-
+ 
     if not dry_run:
         final_version = current_version(conn)
         log(f"\nMigration complete. Schema version: v{final_version}")
         log(f"Backup retained at: {backup_path}")
     else:
         log("\n[DRY RUN] No changes were written.")
-
+ 
     conn.close()
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
-
+ 
+ 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="TPMS tracker database migration tool",
@@ -438,19 +445,19 @@ Examples:
         help="apply only up to migration version N",
     )
     args = parser.parse_args()
-
+ 
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"Error: database not found: {db_path}", file=sys.stderr)
         sys.exit(1)
-
+ 
     print(f"TPMS Tracker — database migration")
     print(f"Database: {db_path.resolve()}")
     print(f"Mode:     {'dry-run' if args.dry_run else 'live'}")
     if args.step:
         print(f"Target:   v{args.step}")
     print()
-
+ 
     try:
         migrate(db_path, target_version=args.step, dry_run=args.dry_run)
     except sqlite3.Error as e:
@@ -460,7 +467,7 @@ Examples:
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(1)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
