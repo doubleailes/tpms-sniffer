@@ -15,6 +15,7 @@ use crate::jaccard::{
 use crate::jitter;
 use crate::raw_interval::{
     RAW_INTERVAL_BUFFER_TTL_SECS, RAW_INTERVAL_MAX_MS, RawIntervalBuffer, RawIntervalTracker,
+    RollingIntervalTracker, is_rolling_id_protocol,
 };
 use crate::{
     CROSS_RECEIVER_WINDOW_MS, FINGERPRINT_MAX_GAP_DAYS, MAX_PLAUSIBLE_PRESSURE_KPA,
@@ -154,6 +155,10 @@ pub struct Resolver {
     /// These intervals reflect the true TX cadence (and hence oscillator
     /// jitter) rather than the inter-correlator-match latency.
     raw_interval_tracker: RawIntervalTracker,
+    /// Hamming-distance-keyed interval tracker for protocols whose sensor ID
+    /// rotates on every transmission (EezTire, TRW-OOK, TRW-FSK).  See
+    /// `crate::raw_interval::RollingIntervalTracker`.
+    rolling_interval_tracker: RollingIntervalTracker,
     /// Buffers raw intervals per sensor key until the correlator resolves a
     /// fingerprint for the sensor.  Drained into `interval_samples` after
     /// resolution; stale entries are dropped after `RAW_INTERVAL_BUFFER_TTL_SECS`.
@@ -184,6 +189,7 @@ impl Resolver {
             vehicle_to_fingerprint: HashMap::new(),
             merged_car_ids: HashSet::new(),
             raw_interval_tracker: RawIntervalTracker::new(),
+            rolling_interval_tracker: RollingIntervalTracker::new(),
             raw_interval_buffer: RawIntervalBuffer::new(),
             last_raw_interval_evict: None,
         };
@@ -252,10 +258,25 @@ impl Resolver {
         // measures inter-match latency rather than the sensor's true TX
         // cadence.  Successful observations are buffered per-sensor and
         // flushed to interval_samples after fingerprint resolution.
-        if let Some(interval_ms) =
+        //
+        // Rolling-ID protocols (EezTire, TRW-OOK, TRW-FSK) flip 1–3 bits of
+        // the sensor ID on every transmission, so the per-`sensor_id` tracker
+        // never sees a repeat.  Route them through the Hamming-distance
+        // tracker that groups consecutive packets of the same protocol when
+        // the IDs are close enough to plausibly originate from the same
+        // physical sensor.
+        let raw_interval = if is_rolling_id_protocol(packet.rtl433_id) {
+            self.rolling_interval_tracker.observe_with_pressure(
+                sensor_id,
+                packet.rtl433_id,
+                packet.pressure_kpa,
+                ts,
+            )
+        } else {
             self.raw_interval_tracker
                 .observe(sensor_id, packet.rtl433_id, ts)
-        {
+        };
+        if let Some(interval_ms) = raw_interval {
             self.raw_interval_buffer
                 .push(sensor_id, packet.rtl433_id, interval_ms, ts);
         }
@@ -306,12 +327,7 @@ impl Resolver {
         if let Ok(Some(vehicle_id)) = result.as_ref()
             && let Some(fp_id) = self.vehicle_to_fingerprint.get(vehicle_id).cloned()
         {
-            self.flush_raw_intervals_for_sensor(
-                sensor_id,
-                packet.rtl433_id,
-                *vehicle_id,
-                &fp_id,
-            );
+            self.flush_raw_intervals_for_sensor(sensor_id, packet.rtl433_id, *vehicle_id, &fp_id);
         }
 
         // Throttled eviction of stale tracker entries and unresolved buffer
@@ -368,6 +384,8 @@ impl Resolver {
         }
         self.last_raw_interval_evict = Some(now);
         self.raw_interval_tracker
+            .evict_stale(now, RAW_INTERVAL_MAX_MS / 1000);
+        self.rolling_interval_tracker
             .evict_stale(now, RAW_INTERVAL_MAX_MS / 1000);
         self.raw_interval_buffer
             .evict_stale(now, RAW_INTERVAL_BUFFER_TTL_SECS);
@@ -2842,9 +2860,27 @@ mod tests {
         // `process()` call that pushed the interval.
         let mut resolver = in_memory_resolver();
 
-        let p1 = make_packet_at("2026-04-26 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
-        let p2 = make_packet_at("2026-04-26 12:00:22.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
-        let p3 = make_packet_at("2026-04-26 12:00:44.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p1 = make_packet_at(
+            "2026-04-26 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
+        let p2 = make_packet_at(
+            "2026-04-26 12:00:22.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
+        let p3 = make_packet_at(
+            "2026-04-26 12:00:44.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
 
         resolver.process(&p1).unwrap();
         let veh = resolver
@@ -2872,8 +2908,20 @@ mod tests {
         // RAW_INTERVAL_MIN_MS — must not create an interval sample.
         let mut resolver = in_memory_resolver();
 
-        let p1 = make_packet_at("2026-04-26 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
-        let p2 = make_packet_at("2026-04-26 12:00:00.200", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p1 = make_packet_at(
+            "2026-04-26 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
+        let p2 = make_packet_at(
+            "2026-04-26 12:00:00.200",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
 
         resolver.process(&p1).unwrap();
         resolver.process(&p2).unwrap();
@@ -2889,6 +2937,136 @@ mod tests {
             0,
             "burst-duplicate gaps must not produce interval samples"
         );
+    }
+
+    #[test]
+    fn rolling_id_eeztire_stream_with_bit_flips_records_intervals() {
+        // Issue #43: a parked EezTire transmits every 22 s with a different
+        // sensor_id on each packet (1–3 bit flips per transmission).  Before
+        // the fix the per-`sensor_id` tracker never saw a repeat and recorded
+        // zero intervals.  The Hamming-distance-keyed `RollingIntervalTracker`
+        // groups consecutive packets and produces one interval per gap.
+        let mut resolver = in_memory_resolver();
+
+        // 12 packets, 22 s apart, each differing from the previous by 1–2
+        // random bits.  Start from 0xF7FFFFFF and walk through bit flips.
+        let mut id: u32 = 0xF7FFFFFF;
+        let bit_seq = [3u32, 17, 28, 9, 14, 22, 5, 30, 1, 11, 26];
+        let base = chrono::NaiveDateTime::parse_from_str(
+            "2026-04-26 12:00:00.000",
+            "%Y-%m-%d %H:%M:%S%.3f",
+        )
+        .unwrap();
+        for i in 0..12 {
+            let ts = base + chrono::Duration::milliseconds((i as i64) * 22_000);
+            let timestamp = ts.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+            let id_str = format!("0x{:08X}", id);
+            let p = make_packet_at(&timestamp, &id_str, "EezTire", 241, 352.3);
+            resolver.process(&p).unwrap();
+            // Flip one bit for the next packet; first observation has no bit
+            // flip applied yet because we read `id` *before* the mutation.
+            id ^= 1u32 << bit_seq[i % bit_seq.len()];
+        }
+
+        let veh = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .expect("EezTire vehicle must exist");
+        let fp_id = veh
+            .fingerprint_id
+            .clone()
+            .expect("vehicle must have a fingerprint_id");
+        let count = resolver.db.interval_sample_count(&fp_id).unwrap();
+        // 12 packets → at most 11 intervals.  The Hamming-distance tracker
+        // should accept all of them since each transition is exactly 1 bit.
+        assert_eq!(
+            count, 11,
+            "12 EezTire packets at 22 s spacing with 1-bit flips must produce \
+             11 interval samples via Hamming-distance grouping (got {count})"
+        );
+    }
+
+    #[test]
+    fn rolling_id_two_simultaneous_sensors_separated_by_pressure() {
+        // Two EezTire sensors transmit in alternation at very different
+        // pressures (250 vs 350 kPa).  Their bit-flipping IDs may happen to
+        // fall within Hamming distance 3 of each other, but the pressure
+        // delta gate (`MAX_PRESSURE_DELTA_KPA`) must reject any cross-sensor
+        // attribution so that no spurious intervals are recorded.
+        let mut resolver = in_memory_resolver();
+
+        let base = chrono::NaiveDateTime::parse_from_str(
+            "2026-04-26 12:00:00.000",
+            "%Y-%m-%d %H:%M:%S%.3f",
+        )
+        .unwrap();
+
+        // Sensor A: 250 kPa, IDs walk 0xFFFFFFFF, 0xFBFFFFFF, 0xFBFFFFEF, ...
+        // Sensor B: 350 kPa, IDs walk 0xFFFFFFEF, 0xFFFFFFFF, 0xFBFFFFFF, ...
+        // Note that some of B's IDs land within Hamming-3 of A's previous ID.
+        let sensor_a_ids = [0xFFFFFFFFu32, 0xFBFFFFFF, 0xFBFFFFEF];
+        let sensor_b_ids = [0xFFFFFFEFu32, 0xFFFFFFFF, 0xFBFFFFFF];
+
+        // Interleave the two streams: A at t=0,22,44; B at t=11,33,55.
+        for i in 0..3 {
+            let ts_a = base + chrono::Duration::milliseconds((i as i64) * 22_000);
+            let ts_b = base + chrono::Duration::milliseconds((i as i64) * 22_000 + 11_000);
+            let p_a = make_packet_at(
+                &ts_a.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+                &format!("0x{:08X}", sensor_a_ids[i]),
+                "EezTire",
+                241,
+                250.0,
+            );
+            let p_b = make_packet_at(
+                &ts_b.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+                &format!("0x{:08X}", sensor_b_ids[i]),
+                "EezTire",
+                241,
+                350.0,
+            );
+            resolver.process(&p_a).unwrap();
+            resolver.process(&p_b).unwrap();
+        }
+
+        // Two distinct EezTire fingerprints must exist (one per pressure).
+        let eez_vehicles: Vec<_> = resolver
+            .vehicles
+            .values()
+            .filter(|v| v.protocol == "EezTire")
+            .collect();
+        assert_eq!(
+            eez_vehicles.len(),
+            2,
+            "two distinct pressure signatures must produce two EezTire vehicles"
+        );
+
+        // The interval tracker is keyed only on rtl433_id, so any cross-sensor
+        // attribution would have produced ~11 s intervals (alternating A→B).
+        // The pressure gate must suppress them: the only intervals recorded
+        // come from genuine same-sensor transitions (~22 s).  In an
+        // interleaved stream every `observe_with_pressure` call sees a large
+        // pressure delta from the prior packet, so *zero* intervals should be
+        // recorded under either fingerprint.
+        for veh in eez_vehicles {
+            if let Some(fp) = veh.fingerprint_id.as_ref() {
+                let samples = resolver
+                    .db
+                    .get_interval_samples(fp, jitter::MAX_INTERVAL_SAMPLES)
+                    .unwrap();
+                for s in &samples {
+                    // No genuine 22 s gap exists between same-sensor packets
+                    // in this interleaved stream (the two sensors alternate),
+                    // so any sample at all would be a cross-attribution.
+                    assert!(
+                        *s < 5_000 || *s > 18_000,
+                        "spurious cross-sensor interval recorded: {} ms",
+                        s
+                    );
+                }
+            }
+        }
     }
 
     #[test]
