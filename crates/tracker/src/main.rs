@@ -5,7 +5,7 @@ use std::process;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
-use tpms_tracker::{TpmsPacket, analytics, db::Database, replay, resolver::Resolver, server};
+use tpms_tracker::{TpmsPacket, analytics, db::Database, jitter, replay, resolver::Resolver, server};
 
 #[derive(Parser)]
 #[command(
@@ -167,6 +167,47 @@ fn main() -> Result<()> {
     }
 }
 
+/// Periodically recompute jitter profiles for all eligible fingerprints.
+///
+/// Runs every `JITTER_RECOMPUTE_INTERVAL_SECS` seconds.  Opens its own
+/// database connection so it does not contend with the HTTP server or stdin
+/// ingestion path.
+async fn jitter_recompute_task(db_path: String) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            jitter::JITTER_RECOMPUTE_INTERVAL_SECS,
+        ))
+        .await;
+
+        let result = tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            move || -> anyhow::Result<usize> {
+                let db = Database::open(&db_path)?;
+                let fp_ids =
+                    db.fingerprints_eligible_for_jitter_recompute(jitter::MIN_JITTER_SAMPLES)?;
+                let mut updated = 0usize;
+                for fp_id in &fp_ids {
+                    let samples =
+                        db.get_interval_samples(fp_id, jitter::MAX_INTERVAL_SAMPLES)?;
+                    if let Some(profile) = jitter::compute_jitter_profile(&samples) {
+                        db.update_fingerprint_jitter(fp_id, &profile)?;
+                        updated += 1;
+                    }
+                }
+                Ok(updated)
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(n)) if n > 0 => eprintln!("jitter: recomputed profiles for {n} fingerprint(s)"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("jitter: recompute error: {e}"),
+            Err(e) => eprintln!("jitter: task panicked: {e}"),
+        }
+    }
+}
+
 /// Run the stdin ingestion loop alongside the HTTP dashboard server.
 async fn run_with_server(db: Database, args: &Args, addr: &str) -> Result<()> {
     let db_path = args.db.clone();
@@ -176,6 +217,8 @@ async fn run_with_server(db: Database, args: &Args, addr: &str) -> Result<()> {
             eprintln!("server error: {e}");
         }
     });
+
+    tokio::spawn(jitter_recompute_task(args.db.clone()));
 
     // Run the blocking stdin loop on a blocking thread so we don't starve
     // the tokio runtime.
