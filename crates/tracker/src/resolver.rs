@@ -2663,6 +2663,68 @@ mod tests {
     }
 
     #[test]
+    fn interval_samples_populated_via_fingerprint_correlator_path() {
+        // Regression test: EezTire packets carry near-sentinel sensor IDs
+        // (zeros < 3, valid=false) and are routed through process_fingerprint,
+        // resolving via the fingerprint_correlator path — never via fixed_id.
+        // Before the integration fix, extract_interval was never called from
+        // this path so interval_samples stayed empty regardless of how many
+        // packets arrived.  This test sends a stream of EezTire packets at
+        // ~22 s intervals and verifies that interval_samples accumulates rows.
+        let mut resolver = in_memory_resolver();
+
+        // 12 packets ~22 s apart.  After TX_INTERVAL_MIN_SAMPLES intervals
+        // the vehicle's tx_interval_median_ms stabilises near 22 s; from
+        // there each subsequent gap (~22 s) falls inside the
+        // [0.5×, 1.5×] gate and produces an interval_samples row.
+        let timestamps = [
+            "2025-06-01 12:00:00.000",
+            "2025-06-01 12:00:22.000",
+            "2025-06-01 12:00:44.000",
+            "2025-06-01 12:01:06.000",
+            "2025-06-01 12:01:28.000",
+            "2025-06-01 12:01:50.000",
+            "2025-06-01 12:02:12.000",
+            "2025-06-01 12:02:34.000",
+            "2025-06-01 12:02:56.000",
+            "2025-06-01 12:03:18.000",
+            "2025-06-01 12:03:40.000",
+            "2025-06-01 12:04:02.000",
+        ];
+
+        for ts in &timestamps {
+            // 0xF7FFFFFF: only 1 zero bit → is_valid_sensor_id() = false
+            // (matches the rolling/bit-flipping behaviour of real EezTire IDs).
+            let p = make_packet_at(ts, "0xF7FFFFFF", "EezTire", 241, 352.3);
+            resolver.process(&p).unwrap();
+        }
+
+        // Sanity: all packets resolved to a single EezTire vehicle that has
+        // been assigned a fingerprint_id by the fingerprint_correlator path.
+        let eez = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .expect("EezTire vehicle must exist");
+        let fp_id = eez
+            .fingerprint_id
+            .clone()
+            .expect("EezTire vehicle must have a fingerprint_id");
+
+        // The actual bug: interval_samples must be populated.  Before the fix
+        // this was always 0; after the fix it should be > 0 (we expect roughly
+        // one row per packet beyond the first ~3 needed to establish the
+        // median, so at least a few rows for 12 packets at 22 s spacing).
+        let count = resolver.db.interval_sample_count(&fp_id).unwrap();
+        assert!(
+            count > 0,
+            "interval_samples must be populated for EezTire fingerprint_correlator \
+             matches (path=fingerprint_correlator, valid=false), but count={count} \
+             for fingerprint_id={fp_id}"
+        );
+    }
+
+    #[test]
     fn interval_check_skipped_when_insufficient_samples() {
         // When a vehicle has fewer than TX_INTERVAL_MIN_SAMPLES intervals, the
         // interval check must be skipped and only pressure matching is used.
