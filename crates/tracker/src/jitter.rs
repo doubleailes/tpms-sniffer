@@ -23,6 +23,22 @@ pub const INTERVAL_GATE_LOW_FACTOR: f64 = 0.50;
 /// Upper bound of the interval gate (fraction of median).
 pub const INTERVAL_GATE_HIGH_FACTOR: f64 = 1.50;
 
+// Normalization denominators for jitter similarity distance.  Each value
+// represents the expected typical range of the corresponding metric across
+// sensors, so that the per-dimension distance is normalised to [0, 1].
+const SIMILARITY_NORM_SIGMA: f32 = 2.0;  // σ range ~0–2 ms for similar sensors
+const SIMILARITY_NORM_SKEW: f32 = 1.0;   // skewness range ~0–1
+const SIMILARITY_NORM_KURT: f32 = 2.0;   // excess kurtosis range ~0–2
+const SIMILARITY_NORM_ACF: f32 = 0.5;    // lag-1 ACF range ~0–0.5
+
+// Weights for the four jitter dimensions in the combined similarity score.
+// sigma has the highest weight because it is the most stable and
+// discriminative oscillator characteristic.
+const W_SIGMA: f32 = 0.40;
+const W_SKEW: f32 = 0.25;
+const W_KURT: f32 = 0.20;
+const W_ACF: f32 = 0.15;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -167,12 +183,12 @@ pub fn compute_jitter_profile(intervals: &[i64]) -> Option<JitterProfile> {
 ///
 /// Higher values indicate more similar profiles.
 pub fn jitter_similarity(a: &JitterProfile, b: &JitterProfile) -> f32 {
-    let d_sigma = ((a.sigma_ms - b.sigma_ms).abs() / 2.0).min(1.0);
-    let d_skew = ((a.skewness - b.skewness).abs() / 1.0).min(1.0);
-    let d_kurt = ((a.kurtosis - b.kurtosis).abs() / 2.0).min(1.0);
-    let d_acf = ((a.acf_lag1 - b.acf_lag1).abs() / 0.5).min(1.0);
+    let d_sigma = ((a.sigma_ms - b.sigma_ms).abs() / SIMILARITY_NORM_SIGMA).min(1.0);
+    let d_skew = ((a.skewness - b.skewness).abs() / SIMILARITY_NORM_SKEW).min(1.0);
+    let d_kurt = ((a.kurtosis - b.kurtosis).abs() / SIMILARITY_NORM_KURT).min(1.0);
+    let d_acf = ((a.acf_lag1 - b.acf_lag1).abs() / SIMILARITY_NORM_ACF).min(1.0);
 
-    let distance = 0.40 * d_sigma + 0.25 * d_skew + 0.20 * d_kurt + 0.15 * d_acf;
+    let distance = W_SIGMA * d_sigma + W_SKEW * d_skew + W_KURT * d_kurt + W_ACF * d_acf;
 
     1.0 - distance
 }
