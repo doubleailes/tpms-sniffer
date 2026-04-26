@@ -241,6 +241,20 @@ CREATE INDEX IF NOT EXISTS idx_interval_ts
     ON interval_samples(ts);
 """
 
+MIGRATION_V11_DESCRIPTION = (
+    "clear interval_samples and jitter columns: methodology fix (issue #43)"
+)
+MIGRATION_V11 = """
+DELETE FROM interval_samples;
+UPDATE fingerprints SET
+    jitter_sigma_ms   = NULL,
+    jitter_skewness   = NULL,
+    jitter_kurtosis   = NULL,
+    jitter_acf_lag1   = NULL,
+    jitter_samples    = NULL,
+    jitter_updated_at = NULL;
+"""
+
 MIGRATIONS = [
     (1, MIGRATION_V1_DESCRIPTION, None),
     (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
@@ -252,6 +266,7 @@ MIGRATIONS = [
     (8, MIGRATION_V8_DESCRIPTION, MIGRATION_V8),
     (9, MIGRATION_V9_DESCRIPTION, MIGRATION_V9),
     (10, MIGRATION_V10_DESCRIPTION, MIGRATION_V10),
+    (11, MIGRATION_V11_DESCRIPTION, MIGRATION_V11),
 ]
  
 # ---------------------------------------------------------------------------
