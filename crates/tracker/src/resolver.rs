@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 use crate::classification::{compensate_pressure, infer_vehicle_class};
 use crate::db::Database;
-use crate::jitter;
 use crate::jaccard::{
     self, CoOccurrenceMatrix, VehicleMeta, WINDOW_SIZE_S, group_vehicles_into_cars_with_meta,
     infer_wheel_positions,
 };
+use crate::jitter;
 use crate::{
     CROSS_RECEIVER_WINDOW_MS, FINGERPRINT_MAX_GAP_DAYS, MAX_PLAUSIBLE_PRESSURE_KPA,
     MIN_PLAUSIBLE_PRESSURE_KPA, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_MIN_SAMPLES,
@@ -847,10 +847,10 @@ impl Resolver {
                             None,
                         ) {
                             eprintln!("warn: interval sample insert failed: {e}");
-                        } else if let Err(e) = self.db.enforce_interval_ring_buffer(
-                            fp_id,
-                            jitter::MAX_INTERVAL_SAMPLES,
-                        ) {
+                        } else if let Err(e) = self
+                            .db
+                            .enforce_interval_ring_buffer(fp_id, jitter::MAX_INTERVAL_SAMPLES)
+                        {
                             eprintln!("warn: ring buffer enforce failed: {e}");
                         }
                     }
@@ -1200,10 +1200,10 @@ impl Resolver {
                         None,
                     ) {
                         eprintln!("warn: interval sample insert failed: {e}");
-                    } else if let Err(e) = self.db.enforce_interval_ring_buffer(
-                        fp_id,
-                        jitter::MAX_INTERVAL_SAMPLES,
-                    ) {
+                    } else if let Err(e) = self
+                        .db
+                        .enforce_interval_ring_buffer(fp_id, jitter::MAX_INTERVAL_SAMPLES)
+                    {
                         eprintln!("warn: ring buffer enforce failed: {e}");
                     }
                 }
