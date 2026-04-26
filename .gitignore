@@ -1,2 +1,5 @@
 /target
 tpms.db*
+logs/
+*.log
+*.log.*

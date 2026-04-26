@@ -1,13 +1,16 @@
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
+use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
 use tpms_tracker::{
     TpmsPacket, analytics, db::Database, jitter, replay, resolver::Resolver, server,
 };
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(
@@ -56,6 +59,20 @@ struct Args {
     #[arg(long, value_name = "ADDR")]
     serve: Option<String>,
 
+    /// Path to log file. When set, logs are written to this file (with
+    /// rotation) in addition to stderr. The directory is created if it
+    /// does not exist.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    /// Maximum log file size in MB before rotation.
+    #[arg(long, default_value_t = 10, value_name = "MB")]
+    log_max_size: u64,
+
+    /// Number of rotated log files to retain.
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    log_max_files: usize,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -100,21 +117,66 @@ enum Command {
     },
 }
 
-fn init_logging(level: &str) {
-    let env = env_logger::Env::default().filter_or("RUST_LOG", format!("tpms_tracker={level}"));
-    env_logger::Builder::from_env(env)
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(buf, "{}", record.args())
-        })
-        .target(env_logger::Target::Stderr)
-        .init();
+fn init_logging(
+    level: &str,
+    log_file: Option<&Path>,
+    max_size_mb: u64,
+    max_files: usize,
+) -> Result<()> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("tpms_tracker={level}")));
+
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(true)
+        .with_target(false)
+        .with_level(false);
+
+    match log_file {
+        None => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(stderr_layer)
+                .init();
+        }
+        Some(path) => {
+            // Ensure log directory exists
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+
+            let condition = RollingConditionBasic::new().max_size(max_size_mb * 1024 * 1024);
+
+            let file_appender = BasicRollingFileAppender::new(path, condition, max_files)?;
+
+            let file_layer = fmt::layer()
+                .with_writer(Mutex::new(file_appender))
+                .with_ansi(false) // no ANSI colour codes in log files
+                .with_target(false)
+                .with_level(false);
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(stderr_layer)
+                .with(file_layer)
+                .init();
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    init_logging(&args.log_level);
+    init_logging(
+        &args.log_level,
+        args.log_file.as_deref(),
+        args.log_max_size,
+        args.log_max_files,
+    )?;
 
     match &args.command {
         Some(Command::Report {

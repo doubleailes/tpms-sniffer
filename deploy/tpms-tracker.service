@@ -1,0 +1,19 @@
+[Unit]
+Description=TPMS Tracker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/tpms-sniffer
+ExecStart=/root/tpms-sniffer/target/release/tpms-tracker \
+    --db /root/tpms-sniffer/tpms.db \
+    --serve 0.0.0.0:8080 \
+    --log-level info \
+    --log-file /root/tpms-sniffer/logs/tpms-tracker.log \
+    --log-max-size 10 \
+    --log-max-files 5
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
