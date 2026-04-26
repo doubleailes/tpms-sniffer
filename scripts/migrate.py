@@ -218,7 +218,29 @@ WHERE vehicle_id IN (
     WHERE protocol LIKE '%Jansite%'
 );
 """
- 
+
+MIGRATION_V10_DESCRIPTION = "add interval_samples table and jitter columns to fingerprints"
+MIGRATION_V10 = """
+ALTER TABLE fingerprints ADD COLUMN jitter_sigma_ms   REAL;
+ALTER TABLE fingerprints ADD COLUMN jitter_skewness   REAL;
+ALTER TABLE fingerprints ADD COLUMN jitter_kurtosis   REAL;
+ALTER TABLE fingerprints ADD COLUMN jitter_acf_lag1   REAL;
+ALTER TABLE fingerprints ADD COLUMN jitter_samples    INTEGER;
+ALTER TABLE fingerprints ADD COLUMN jitter_updated_at TEXT;
+CREATE TABLE IF NOT EXISTS interval_samples (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_id TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
+    vehicle_id     TEXT    NOT NULL REFERENCES vehicles(vehicle_id),
+    ts             TEXT    NOT NULL,
+    interval_ms    INTEGER NOT NULL,
+    session_id     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_interval_fp
+    ON interval_samples(fingerprint_id);
+CREATE INDEX IF NOT EXISTS idx_interval_ts
+    ON interval_samples(ts);
+"""
+
 MIGRATIONS = [
     (1, MIGRATION_V1_DESCRIPTION, None),
     (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
@@ -229,6 +251,7 @@ MIGRATIONS = [
     (7, MIGRATION_V7_DESCRIPTION, MIGRATION_V7),
     (8, MIGRATION_V8_DESCRIPTION, MIGRATION_V8),
     (9, MIGRATION_V9_DESCRIPTION, MIGRATION_V9),
+    (10, MIGRATION_V10_DESCRIPTION, MIGRATION_V10),
 ]
  
 # ---------------------------------------------------------------------------
@@ -272,6 +295,7 @@ def row_counts(conn: sqlite3.Connection) -> dict:
         "fingerprints",
         "session_log",
         "temporal_fingerprints",
+        "interval_samples",
         "schema_migrations",
     ]
     counts = {}

@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod classification;
 pub mod db;
 pub mod jaccard;
+pub mod jitter;
 pub mod replay;
 pub mod resolver;
 pub mod server;
