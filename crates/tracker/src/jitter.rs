@@ -334,10 +334,7 @@ mod tests {
     fn just_below_max_accepted() {
         let last = Utc::now();
         let now = last + Duration::milliseconds(MAX_PLAUSIBLE_GAP_MS - 1);
-        assert_eq!(
-            extract_interval(last, now),
-            Some(MAX_PLAUSIBLE_GAP_MS - 1)
-        );
+        assert_eq!(extract_interval(last, now), Some(MAX_PLAUSIBLE_GAP_MS - 1));
     }
 
     #[test]
