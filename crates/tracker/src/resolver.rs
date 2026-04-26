@@ -833,11 +833,8 @@ impl Resolver {
 
         // Record interval sample for jitter analytics (non-duplicate sightings only).
         if !is_dup {
-            if let (Some(prev_ts), Some(median_ms)) = (
-                prev_last_seen,
-                vehicle.tx_interval_median_ms.map(|ms| ms as i64),
-            ) {
-                if let Some(interval) = jitter::extract_interval(prev_ts, now, median_ms) {
+            if let Some(prev_ts) = prev_last_seen {
+                if let Some(interval) = jitter::extract_interval(prev_ts, now) {
                     if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
                         if let Err(e) = self.db.insert_interval_sample(
                             fp_id,
@@ -1186,11 +1183,8 @@ impl Resolver {
         }
 
         // Record interval sample for jitter analytics.
-        if let (Some(prev_ts), Some(median_ms)) = (
-            prev_last_seen,
-            vehicle.tx_interval_median_ms.map(|ms| ms as i64),
-        ) {
-            if let Some(interval) = jitter::extract_interval(prev_ts, now, median_ms) {
+        if let Some(prev_ts) = prev_last_seen {
+            if let Some(interval) = jitter::extract_interval(prev_ts, now) {
                 if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
                     if let Err(e) = self.db.insert_interval_sample(
                         fp_id,
@@ -2673,10 +2667,9 @@ mod tests {
         // ~22 s intervals and verifies that interval_samples accumulates rows.
         let mut resolver = in_memory_resolver();
 
-        // 12 packets ~22 s apart.  After TX_INTERVAL_MIN_SAMPLES intervals
-        // the vehicle's tx_interval_median_ms stabilises near 22 s; from
-        // there each subsequent gap (~22 s) falls inside the
-        // [0.5×, 1.5×] gate and produces an interval_samples row.
+        // 12 packets ~22 s apart.  Each consecutive gap (~22 s) falls
+        // inside [MIN_PLAUSIBLE_GAP_MS, MAX_PLAUSIBLE_GAP_MS) and so
+        // produces an interval_samples row.
         let timestamps = [
             "2025-06-01 12:00:00.000",
             "2025-06-01 12:00:22.000",

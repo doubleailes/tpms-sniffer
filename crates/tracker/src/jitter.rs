@@ -17,11 +17,20 @@ pub const JITTER_RECOMPUTE_INTERVAL_SECS: u64 = 300;
 /// Similarity threshold for jitter-based matching.
 pub const JITTER_SIMILARITY_THRESHOLD: f32 = 0.80;
 
-/// Lower bound of the interval gate (fraction of median).
-pub const INTERVAL_GATE_LOW_FACTOR: f64 = 0.50;
+/// Minimum plausible gap between two transmissions (ms).  Anything below
+/// this is treated as a burst duplicate of the same packet.
+pub const MIN_PLAUSIBLE_GAP_MS: i64 = 500;
 
-/// Upper bound of the interval gate (fraction of median).
-pub const INTERVAL_GATE_HIGH_FACTOR: f64 = 1.50;
+/// Maximum plausible gap between two transmissions (ms).  Anything above
+/// this is treated as a cross-session gap rather than a real interval.
+/// Set generously so that rolling-ID sensors — whose consecutive
+/// fingerprint matches are typically separated by 5–7 missed
+/// transmissions — still contribute samples.
+pub const MAX_PLAUSIBLE_GAP_MS: i64 = 300_000;
+
+/// Tukey fence multiplier used by the IQR outlier filter inside
+/// `compute_jitter_profile`.
+const IQR_FENCE_MULT: f64 = 1.5;
 
 // Normalization denominators for jitter similarity distance.  Each value
 // represents the expected typical range of the corresponding metric across
@@ -82,18 +91,18 @@ impl JitterClass {
 
 /// Extract a new interval sample when a packet arrives for a known fingerprint.
 ///
+/// Uses absolute plausibility bounds so that rolling-ID sensors — whose
+/// consecutive successful fingerprint matches may be separated by several
+/// missed transmissions — still produce samples.  Distribution-shape
+/// outlier rejection is performed later inside `compute_jitter_profile`
+/// via an IQR filter.
+///
 /// Returns `None` if:
-///   - the gap exceeds the upper gate (inter-session gap, not jitter)
-///   - the gap is below the lower gate (duplicate/burst packet)
-pub fn extract_interval(
-    last_seen: DateTime<Utc>,
-    now: DateTime<Utc>,
-    median_ms: i64,
-) -> Option<i64> {
+///   - the gap is below `MIN_PLAUSIBLE_GAP_MS` (burst duplicate)
+///   - the gap is at or above `MAX_PLAUSIBLE_GAP_MS` (cross-session gap)
+pub fn extract_interval(last_seen: DateTime<Utc>, now: DateTime<Utc>) -> Option<i64> {
     let gap = (now - last_seen).num_milliseconds();
-    let lo = (median_ms as f64 * INTERVAL_GATE_LOW_FACTOR) as i64;
-    let hi = (median_ms as f64 * INTERVAL_GATE_HIGH_FACTOR) as i64;
-    if (lo..=hi).contains(&gap) {
+    if (MIN_PLAUSIBLE_GAP_MS..MAX_PLAUSIBLE_GAP_MS).contains(&gap) {
         Some(gap)
     } else {
         None
@@ -106,16 +115,26 @@ pub fn extract_interval(
 
 /// Compute a jitter profile from a slice of interval samples (ms).
 ///
-/// Returns `None` if fewer than `MIN_JITTER_SAMPLES` are provided.
+/// Outliers — including the long inter-match gaps that rolling-ID sensors
+/// produce when packets fall between successful fingerprint matches — are
+/// removed via an IQR (Tukey) filter before statistics are computed.
+///
+/// Returns `None` if fewer than `MIN_JITTER_SAMPLES` are provided, or if
+/// fewer than `MIN_JITTER_SAMPLES` samples remain after filtering.
 pub fn compute_jitter_profile(intervals: &[i64]) -> Option<JitterProfile> {
     if intervals.len() < MIN_JITTER_SAMPLES {
         return None;
     }
 
-    let n = intervals.len() as f64;
-    let mean = intervals.iter().map(|&x| x as f64).sum::<f64>() / n;
+    let filtered = iqr_filter(intervals);
+    if filtered.len() < MIN_JITTER_SAMPLES {
+        return None;
+    }
 
-    let variance = intervals
+    let n = filtered.len() as f64;
+    let mean = filtered.iter().map(|&x| x as f64).sum::<f64>() / n;
+
+    let variance = filtered
         .iter()
         .map(|&x| (x as f64 - mean).powi(2))
         .sum::<f64>()
@@ -129,20 +148,20 @@ pub fn compute_jitter_profile(intervals: &[i64]) -> Option<JitterProfile> {
             skewness: 0.0,
             kurtosis: 0.0,
             acf_lag1: 0.0,
-            samples: intervals.len(),
+            samples: filtered.len(),
             updated_at: Utc::now(),
         });
     }
 
     // Skewness: E[(X-μ)³] / σ³
-    let skewness = intervals
+    let skewness = filtered
         .iter()
         .map(|&x| ((x as f64 - mean) / sigma).powi(3))
         .sum::<f64>()
         / n;
 
     // Excess kurtosis: E[(X-μ)⁴] / σ⁴ - 3
-    let kurtosis = intervals
+    let kurtosis = filtered
         .iter()
         .map(|&x| ((x as f64 - mean) / sigma).powi(4))
         .sum::<f64>()
@@ -150,7 +169,7 @@ pub fn compute_jitter_profile(intervals: &[i64]) -> Option<JitterProfile> {
         - 3.0;
 
     // Lag-1 autocorrelation: Cov(x[i], x[i+1]) / Var(x)
-    let pairs: Vec<(f64, f64)> = intervals
+    let pairs: Vec<(f64, f64)> = filtered
         .windows(2)
         .map(|w| (w[0] as f64, w[1] as f64))
         .collect();
@@ -170,9 +189,47 @@ pub fn compute_jitter_profile(intervals: &[i64]) -> Option<JitterProfile> {
         skewness: skewness as f32,
         kurtosis: kurtosis as f32,
         acf_lag1,
-        samples: intervals.len(),
+        samples: filtered.len(),
         updated_at: Utc::now(),
     })
+}
+
+/// Drop samples outside the Tukey fence `[Q1 - 1.5*IQR, Q3 + 1.5*IQR]`,
+/// preserving the original order of the remaining samples (so that the
+/// lag-1 autocorrelation computed downstream stays meaningful).
+fn iqr_filter(intervals: &[i64]) -> Vec<i64> {
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<i64> = intervals.to_vec();
+    sorted.sort_unstable();
+    let q1 = percentile_sorted(&sorted, 0.25);
+    let q3 = percentile_sorted(&sorted, 0.75);
+    let iqr = q3 - q1;
+    let lo = q1 - IQR_FENCE_MULT * iqr;
+    let hi = q3 + IQR_FENCE_MULT * iqr;
+    intervals
+        .iter()
+        .copied()
+        .filter(|&x| {
+            let v = x as f64;
+            v >= lo && v <= hi
+        })
+        .collect()
+}
+
+/// Linear-interpolated percentile of an already-sorted slice.
+fn percentile_sorted(sorted: &[i64], p: f64) -> f64 {
+    debug_assert!(!sorted.is_empty());
+    let rank = p * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo] as f64
+    } else {
+        let w = rank - lo as f64;
+        sorted[lo] as f64 * (1.0 - w) + sorted[hi] as f64 * w
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,60 +280,71 @@ mod tests {
     use chrono::Duration;
 
     // -----------------------------------------------------------------------
-    // Interval gate tests
+    // Interval bound tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn cross_session_gap_excluded_by_interval_gate() {
-        // 3600 s gap with 60 s median — well outside 0.5×–1.5× range.
+    fn cross_session_gap_excluded() {
+        // 1 hour gap is well above MAX_PLAUSIBLE_GAP_MS.
         let last = Utc::now();
         let now = last + Duration::milliseconds(3_600_000);
-        assert!(extract_interval(last, now, 60_000).is_none());
+        assert!(extract_interval(last, now).is_none());
     }
 
     #[test]
-    fn burst_duplicate_excluded_by_interval_gate() {
-        // 50 ms gap with 60 s median — below 0.5× range.
+    fn burst_duplicate_excluded() {
+        // 50 ms gap is below MIN_PLAUSIBLE_GAP_MS.
         let last = Utc::now();
         let now = last + Duration::milliseconds(50);
-        assert!(extract_interval(last, now, 60_000).is_none());
+        assert!(extract_interval(last, now).is_none());
     }
 
     #[test]
-    fn normal_interval_accepted_by_gate() {
+    fn rolling_id_inter_match_gap_accepted() {
+        // A rolling-ID sensor with ~22 s TX interval typically yields
+        // 60–150 s gaps between consecutive successful fingerprint
+        // matches.  These must be accepted now that the median-based
+        // gate is gone.
         let last = Utc::now();
-        let now = last + Duration::milliseconds(60_000);
-        assert_eq!(extract_interval(last, now, 60_000), Some(60_000));
+        for &gap_ms in &[60_000i64, 90_000, 132_000, 150_000] {
+            let now = last + Duration::milliseconds(gap_ms);
+            assert_eq!(
+                extract_interval(last, now),
+                Some(gap_ms),
+                "gap {gap_ms} ms must be accepted"
+            );
+        }
     }
 
     #[test]
-    fn boundary_low_accepted() {
-        // Exactly 0.5× median = 30000 ms
+    fn min_boundary_accepted() {
         let last = Utc::now();
-        let now = last + Duration::milliseconds(30_000);
-        assert_eq!(extract_interval(last, now, 60_000), Some(30_000));
+        let now = last + Duration::milliseconds(MIN_PLAUSIBLE_GAP_MS);
+        assert_eq!(extract_interval(last, now), Some(MIN_PLAUSIBLE_GAP_MS));
     }
 
     #[test]
-    fn boundary_high_accepted() {
-        // Exactly 1.5× median = 90000 ms
+    fn just_below_min_rejected() {
         let last = Utc::now();
-        let now = last + Duration::milliseconds(90_000);
-        assert_eq!(extract_interval(last, now, 60_000), Some(90_000));
+        let now = last + Duration::milliseconds(MIN_PLAUSIBLE_GAP_MS - 1);
+        assert!(extract_interval(last, now).is_none());
     }
 
     #[test]
-    fn just_below_low_rejected() {
+    fn just_below_max_accepted() {
         let last = Utc::now();
-        let now = last + Duration::milliseconds(29_999);
-        assert!(extract_interval(last, now, 60_000).is_none());
+        let now = last + Duration::milliseconds(MAX_PLAUSIBLE_GAP_MS - 1);
+        assert_eq!(
+            extract_interval(last, now),
+            Some(MAX_PLAUSIBLE_GAP_MS - 1)
+        );
     }
 
     #[test]
-    fn just_above_high_rejected() {
+    fn at_max_rejected() {
         let last = Utc::now();
-        let now = last + Duration::milliseconds(90_001);
-        assert!(extract_interval(last, now, 60_000).is_none());
+        let now = last + Duration::milliseconds(MAX_PLAUSIBLE_GAP_MS);
+        assert!(extract_interval(last, now).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -347,6 +415,60 @@ mod tests {
             profile.kurtosis.abs() > 0.5,
             "kurtosis={} should be non-trivial for bimodal",
             profile.kurtosis
+        );
+    }
+
+    #[test]
+    fn iqr_filter_removes_extreme_outliers() {
+        // 100 tightly-clustered samples plus 4 huge outliers.  The IQR
+        // filter should drop the outliers, leaving sigma reflecting only
+        // the inlier spread.
+        let mut intervals: Vec<i64> = Vec::with_capacity(104);
+        for i in 0..100 {
+            intervals.push(22_000 + (i as i64 % 11) - 5);
+        }
+        intervals.push(150_000);
+        intervals.push(180_000);
+        intervals.push(200_000);
+        intervals.push(250_000);
+
+        let profile =
+            compute_jitter_profile(&intervals).expect("should produce a profile after IQR filter");
+
+        // After filtering, remaining samples should be ~100 (the inliers),
+        // not 104, and sigma should reflect the inlier spread (single
+        // digits ms), not the multi-thousand spread the outliers would
+        // introduce.
+        assert!(
+            profile.samples >= MIN_JITTER_SAMPLES && profile.samples <= 100,
+            "filtered sample count = {} out of expected range",
+            profile.samples
+        );
+        assert!(
+            profile.sigma_ms < 100.0,
+            "sigma_ms={} should reflect inliers only after IQR filtering",
+            profile.sigma_ms
+        );
+    }
+
+    #[test]
+    fn iqr_filter_preserves_clean_distribution() {
+        // 200 well-behaved samples with no outliers — filtering should
+        // remove very few samples and produce a usable profile.
+        let mut intervals = Vec::with_capacity(200);
+        let mut state: u64 = 7;
+        for _ in 0..200 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let offset = ((state >> 33) as i64 % 11) - 5;
+            intervals.push(22_000 + offset);
+        }
+        let profile = compute_jitter_profile(&intervals).unwrap();
+        // Most samples must survive; the Tukey fence should drop only a
+        // small fraction of a near-uniform distribution.
+        assert!(
+            profile.samples >= 150,
+            "filtered sample count = {} unexpectedly low",
+            profile.samples
         );
     }
 
