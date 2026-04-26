@@ -1077,11 +1077,7 @@ impl Database {
     }
 
     /// Get the most recent interval samples for a fingerprint, up to `limit`.
-    pub fn get_interval_samples(
-        &self,
-        fingerprint_id: &str,
-        limit: usize,
-    ) -> Result<Vec<i64>> {
+    pub fn get_interval_samples(&self, fingerprint_id: &str, limit: usize) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT interval_ms FROM interval_samples \
              WHERE fingerprint_id = ?1 \

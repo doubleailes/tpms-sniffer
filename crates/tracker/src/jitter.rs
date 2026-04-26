@@ -26,10 +26,10 @@ pub const INTERVAL_GATE_HIGH_FACTOR: f64 = 1.50;
 // Normalization denominators for jitter similarity distance.  Each value
 // represents the expected typical range of the corresponding metric across
 // sensors, so that the per-dimension distance is normalised to [0, 1].
-const SIMILARITY_NORM_SIGMA: f32 = 2.0;  // σ range ~0–2 ms for similar sensors
-const SIMILARITY_NORM_SKEW: f32 = 1.0;   // skewness range ~0–1
-const SIMILARITY_NORM_KURT: f32 = 2.0;   // excess kurtosis range ~0–2
-const SIMILARITY_NORM_ACF: f32 = 0.5;    // lag-1 ACF range ~0–0.5
+const SIMILARITY_NORM_SIGMA: f32 = 2.0; // σ range ~0–2 ms for similar sensors
+const SIMILARITY_NORM_SKEW: f32 = 1.0; // skewness range ~0–1
+const SIMILARITY_NORM_KURT: f32 = 2.0; // excess kurtosis range ~0–2
+const SIMILARITY_NORM_ACF: f32 = 0.5; // lag-1 ACF range ~0–0.5
 
 // Weights for the four jitter dimensions in the combined similarity score.
 // sigma has the highest weight because it is the most stable and
@@ -205,9 +205,7 @@ pub fn classify_jitter(profile: &JitterProfile) -> JitterClass {
         JitterClass::BurstProne
     } else if profile.sigma_ms > 20.0 || profile.acf_lag1.abs() > 0.3 {
         JitterClass::Drifting
-    } else if profile.sigma_ms < 5.0
-        && profile.skewness.abs() < 0.5
-        && profile.acf_lag1.abs() < 0.1
+    } else if profile.sigma_ms < 5.0 && profile.skewness.abs() < 0.5 && profile.acf_lag1.abs() < 0.1
     {
         JitterClass::StableGaussian
     } else {
