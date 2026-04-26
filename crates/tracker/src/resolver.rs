@@ -13,6 +13,9 @@ use crate::jaccard::{
     infer_wheel_positions,
 };
 use crate::jitter;
+use crate::raw_interval::{
+    RAW_INTERVAL_BUFFER_TTL_SECS, RAW_INTERVAL_MAX_MS, RawIntervalBuffer, RawIntervalTracker,
+};
 use crate::{
     CROSS_RECEIVER_WINDOW_MS, FINGERPRINT_MAX_GAP_DAYS, MAX_PLAUSIBLE_PRESSURE_KPA,
     MIN_PLAUSIBLE_PRESSURE_KPA, Sighting, TX_INTERVAL_MAX_MS, TX_INTERVAL_MIN_SAMPLES,
@@ -146,6 +149,18 @@ pub struct Resolver {
     /// Car-IDs that have already been merged (absorbed) into another car.
     /// Prevents duplicate merge log events across grouping passes.
     merged_car_ids: HashSet<(Uuid, Uuid)>,
+    /// Tracks last-seen timestamp per `(sensor_id, rtl433_id)` to compute
+    /// raw inter-packet intervals upstream of the fingerprint correlator.
+    /// These intervals reflect the true TX cadence (and hence oscillator
+    /// jitter) rather than the inter-correlator-match latency.
+    raw_interval_tracker: RawIntervalTracker,
+    /// Buffers raw intervals per sensor key until the correlator resolves a
+    /// fingerprint for the sensor.  Drained into `interval_samples` after
+    /// resolution; stale entries are dropped after `RAW_INTERVAL_BUFFER_TTL_SECS`.
+    raw_interval_buffer: RawIntervalBuffer,
+    /// Last time stale entries were evicted from the raw-interval tracker
+    /// and buffer.  Used to throttle eviction to roughly once per minute.
+    last_raw_interval_evict: Option<DateTime<Utc>>,
 }
 
 impl Resolver {
@@ -168,6 +183,9 @@ impl Resolver {
             vehicle_to_car: HashMap::new(),
             vehicle_to_fingerprint: HashMap::new(),
             merged_car_ids: HashSet::new(),
+            raw_interval_tracker: RawIntervalTracker::new(),
+            raw_interval_buffer: RawIntervalBuffer::new(),
+            last_raw_interval_evict: None,
         };
         r.load_from_db()?;
         Ok(r)
@@ -228,6 +246,20 @@ impl Resolver {
             return Ok(None);
         };
 
+        // Record raw inter-packet interval BEFORE the correlator runs.  The
+        // correlator only matches a fraction of received packets (rolling and
+        // bit-flip IDs miss most matches), so any interval taken downstream
+        // measures inter-match latency rather than the sensor's true TX
+        // cadence.  Successful observations are buffered per-sensor and
+        // flushed to interval_samples after fingerprint resolution.
+        if let Some(interval_ms) =
+            self.raw_interval_tracker
+                .observe(sensor_id, packet.rtl433_id, ts)
+        {
+            self.raw_interval_buffer
+                .push(sensor_id, packet.rtl433_id, interval_ms, ts);
+        }
+
         // Discard temperature sentinel values (≥ 200 °C means "not available").
         let temp_c = packet.temp_c.filter(|&t| t < 200.0);
 
@@ -257,14 +289,88 @@ impl Resolver {
             },
         };
 
-        if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
+        let result = if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
             self.process_fingerprint(sighting)
         } else if ROLLING_ID_PROTOCOLS.contains(&packet.rtl433_id) || !is_valid_sensor_id(sensor_id)
         {
             self.process_rolling(sighting)
         } else {
             self.process_fixed(sighting, packet.rtl433_id)
+        };
+
+        // After the correlator has resolved (or failed to resolve) a vehicle
+        // for this packet, flush any buffered raw intervals for the same
+        // (sensor_id, rtl433_id) into interval_samples.  This deferred-
+        // association strategy lets us record the upstream interval even
+        // though the fingerprint identity is only known post-correlation.
+        if let Ok(Some(vehicle_id)) = result.as_ref()
+            && let Some(fp_id) = self.vehicle_to_fingerprint.get(vehicle_id).cloned()
+        {
+            self.flush_raw_intervals_for_sensor(
+                sensor_id,
+                packet.rtl433_id,
+                *vehicle_id,
+                &fp_id,
+            );
         }
+
+        // Throttled eviction of stale tracker entries and unresolved buffer
+        // entries.  Runs at most once a minute to bound memory.
+        self.maybe_evict_raw_intervals(ts);
+
+        result
+    }
+
+    /// Flush all buffered raw intervals for a given sensor key into
+    /// `interval_samples` under the resolved `fingerprint_id`.
+    fn flush_raw_intervals_for_sensor(
+        &mut self,
+        sensor_id: u32,
+        rtl433_id: u16,
+        vehicle_id: Uuid,
+        fingerprint_id: &str,
+    ) {
+        let intervals = self.raw_interval_buffer.drain(sensor_id, rtl433_id);
+        if intervals.is_empty() {
+            return;
+        }
+        for (interval_ms, ts) in intervals {
+            if let Err(e) = self.db.insert_interval_sample(
+                fingerprint_id,
+                vehicle_id,
+                &ts.to_rfc3339(),
+                interval_ms,
+                None,
+            ) {
+                eprintln!("warn: raw interval sample insert failed: {e}");
+                continue;
+            }
+            if let Err(e) = self
+                .db
+                .enforce_interval_ring_buffer(fingerprint_id, jitter::MAX_INTERVAL_SAMPLES)
+            {
+                eprintln!("warn: ring buffer enforce failed: {e}");
+            }
+        }
+    }
+
+    /// Periodically prune the raw-interval tracker and buffer.  Runs at most
+    /// once per minute; older sensor entries (older than `RAW_INTERVAL_MAX_MS`)
+    /// are dropped from the tracker, and unresolved buffered intervals older
+    /// than `RAW_INTERVAL_BUFFER_TTL_SECS` are discarded.
+    fn maybe_evict_raw_intervals(&mut self, now: DateTime<Utc>) {
+        let due = match self.last_raw_interval_evict {
+            Some(prev) => (now - prev).num_seconds() >= 60,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_raw_interval_evict = Some(now);
+        self.raw_interval_tracker
+            .evict_stale(now, RAW_INTERVAL_MAX_MS / 1000);
+        self.raw_interval_buffer
+            .evict_stale(now, RAW_INTERVAL_BUFFER_TTL_SECS);
     }
 
     /// Flush any pending rolling-ID burst.  Call this when the input stream ends.
@@ -765,11 +871,11 @@ impl Resolver {
             vid
         };
 
-        // Capture the previous last_seen timestamp before the state update overwrites it.
-        // Used below to compute the inter-packet gap for jitter interval recording.
-        let prev_last_seen = self.vehicles.get(&vehicle_id).map(|v| v.last_seen);
-
         // Cross-receiver dedup check + update in-memory state.
+        // Note: jitter interval recording happens upstream in `process()` via
+        // `RawIntervalTracker` / `RawIntervalBuffer`, so we no longer derive
+        // intervals from `last_seen` here — those gaps measure inter-correlator-
+        // match latency, not the sensor's TX cadence.
         let is_dup = {
             let vehicle = self.vehicles.get(&vehicle_id).unwrap();
             Self::is_cross_receiver_duplicate(vehicle, &sighting)
@@ -829,30 +935,6 @@ impl Resolver {
                 &now.to_rfc3339(),
                 sighting.alarm,
             );
-        }
-
-        // Record interval sample for jitter analytics (non-duplicate sightings only).
-        if !is_dup {
-            if let Some(prev_ts) = prev_last_seen {
-                if let Some(interval) = jitter::extract_interval(prev_ts, now) {
-                    if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
-                        if let Err(e) = self.db.insert_interval_sample(
-                            fp_id,
-                            vehicle_id,
-                            &now.to_rfc3339(),
-                            interval,
-                            None,
-                        ) {
-                            eprintln!("warn: interval sample insert failed: {e}");
-                        } else if let Err(e) = self
-                            .db
-                            .enforce_interval_ring_buffer(fp_id, jitter::MAX_INTERVAL_SAMPLES)
-                        {
-                            eprintln!("warn: ring buffer enforce failed: {e}");
-                        }
-                    }
-                }
-            }
         }
 
         // Incrementally update presence slot if car_id is assigned.
@@ -1111,14 +1193,13 @@ impl Resolver {
             vid
         };
 
-        // Capture the previous last_seen timestamp before the state update overwrites it.
-        let prev_last_seen = self.vehicles.get(&vehicle_id).map(|v| v.last_seen);
-
         // Update in-memory state.
         // Note: rolling-ID bursts do not carry per-sighting receiver_id
         // metadata (the burst accumulator merges multiple packets), so
         // cross-receiver dedup is not applied here.  The burst uses the
         // resolver's own receiver_id.
+        // Jitter interval recording happens upstream in `process()` via
+        // `RawIntervalTracker` rather than from the inter-burst gap here.
         {
             let vehicle = self.vehicles.get_mut(&vehicle_id).unwrap();
             Self::record_receiver_sighting(vehicle, &self.receiver_id, now);
@@ -1180,28 +1261,6 @@ impl Resolver {
                 &now.to_rfc3339(),
                 false,
             );
-        }
-
-        // Record interval sample for jitter analytics.
-        if let Some(prev_ts) = prev_last_seen {
-            if let Some(interval) = jitter::extract_interval(prev_ts, now) {
-                if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
-                    if let Err(e) = self.db.insert_interval_sample(
-                        fp_id,
-                        vehicle_id,
-                        &now.to_rfc3339(),
-                        interval,
-                        None,
-                    ) {
-                        eprintln!("warn: interval sample insert failed: {e}");
-                    } else if let Err(e) = self
-                        .db
-                        .enforce_interval_ring_buffer(fp_id, jitter::MAX_INTERVAL_SAMPLES)
-                    {
-                        eprintln!("warn: ring buffer enforce failed: {e}");
-                    }
-                }
-            }
         }
 
         // Incrementally update presence slot if car_id is assigned.
@@ -2714,6 +2773,121 @@ mod tests {
             "interval_samples must be populated for EezTire fingerprint_correlator \
              matches (path=fingerprint_correlator, valid=false), but count={count} \
              for fingerprint_id={fp_id}"
+        );
+    }
+
+    #[test]
+    fn raw_interval_pipeline_yields_per_transmission_samples() {
+        // Issue #42: a sensor that transmits every 22 s should produce one
+        // interval_samples row per inter-packet gap, not one per correlator
+        // match.  100 packets at 22 s spacing must produce 99 samples whose
+        // mean is ≈ 22 000 ms with sub-100 ms sigma (the input is exactly
+        // periodic, so the only spread comes from rounding at the ms level).
+        use crate::jitter::compute_jitter_profile;
+
+        let mut resolver = in_memory_resolver();
+
+        // 100 packets at exactly 22 s spacing, same near-sentinel sensor_id
+        // (matches the production EezTire scenario from issue #42).  Routes
+        // through process_fingerprint, which creates a fingerprint on the
+        // first packet — every subsequent packet reuses it.
+        let base = chrono::NaiveDateTime::parse_from_str(
+            "2026-04-26 12:00:00.000",
+            "%Y-%m-%d %H:%M:%S%.3f",
+        )
+        .unwrap();
+        for i in 0..100 {
+            let ts = base + chrono::Duration::milliseconds(i * 22_000);
+            let timestamp = ts.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+            let p = make_packet_at(&timestamp, "0xF7FFFFFF", "EezTire", 241, 352.3);
+            resolver.process(&p).unwrap();
+        }
+
+        let veh = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .expect("EezTire vehicle must exist");
+        let fp_id = veh
+            .fingerprint_id
+            .clone()
+            .expect("vehicle must have a fingerprint_id");
+
+        let count = resolver.db.interval_sample_count(&fp_id).unwrap();
+        assert_eq!(
+            count, 99,
+            "100 packets at 22 s spacing must produce 99 interval samples"
+        );
+
+        let samples = resolver
+            .db
+            .get_interval_samples(&fp_id, jitter::MAX_INTERVAL_SAMPLES)
+            .unwrap();
+        // Every sample is exactly 22_000 ms (timestamps are millisecond-
+        // accurate and evenly spaced), so the profile must be tightly
+        // clustered around the mean with σ well under 100 ms.
+        let profile =
+            compute_jitter_profile(&samples).expect("profile should compute from 99 samples");
+        assert!(
+            profile.sigma_ms < 100.0,
+            "sigma_ms = {} must be < 100 ms for an evenly-spaced stream",
+            profile.sigma_ms
+        );
+    }
+
+    #[test]
+    fn raw_interval_buffer_flushes_after_first_resolution() {
+        // Each subsequent packet from the same sensor must produce exactly
+        // one interval_samples row — the buffer is flushed in the same
+        // `process()` call that pushed the interval.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at("2026-04-26 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p2 = make_packet_at("2026-04-26 12:00:22.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p3 = make_packet_at("2026-04-26 12:00:44.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
+
+        resolver.process(&p1).unwrap();
+        let veh = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .expect("EezTire vehicle must exist");
+        let fp_id = veh.fingerprint_id.clone().unwrap();
+
+        // After packet 1: no interval recorded (first observation only sets
+        // the tracker baseline).
+        assert_eq!(resolver.db.interval_sample_count(&fp_id).unwrap(), 0);
+
+        resolver.process(&p2).unwrap();
+        // After packet 2: one interval (22_000 ms) flushed under fp_id.
+        assert_eq!(resolver.db.interval_sample_count(&fp_id).unwrap(), 1);
+
+        resolver.process(&p3).unwrap();
+        assert_eq!(resolver.db.interval_sample_count(&fp_id).unwrap(), 2);
+    }
+
+    #[test]
+    fn raw_interval_burst_duplicate_rejected() {
+        // Two packets 200 ms apart from the same sensor — well below
+        // RAW_INTERVAL_MIN_MS — must not create an interval sample.
+        let mut resolver = in_memory_resolver();
+
+        let p1 = make_packet_at("2026-04-26 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p2 = make_packet_at("2026-04-26 12:00:00.200", "0xF7FFFFFF", "EezTire", 241, 352.3);
+
+        resolver.process(&p1).unwrap();
+        resolver.process(&p2).unwrap();
+
+        let veh = resolver
+            .vehicles
+            .values()
+            .find(|v| v.protocol == "EezTire")
+            .expect("EezTire vehicle must exist");
+        let fp_id = veh.fingerprint_id.clone().unwrap();
+        assert_eq!(
+            resolver.db.interval_sample_count(&fp_id).unwrap(),
+            0,
+            "burst-duplicate gaps must not produce interval samples"
         );
     }
 
