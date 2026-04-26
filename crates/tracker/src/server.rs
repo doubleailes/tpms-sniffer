@@ -115,6 +115,27 @@ pub struct TemporalApiResponse {
     pub presence_map: Vec<Vec<f32>>,
 }
 
+/// Jitter profile API response for a single fingerprint.
+#[derive(Serialize)]
+pub struct JitterApiResponse {
+    pub fingerprint_id: String,
+    pub sigma_ms: f64,
+    pub skewness: f64,
+    pub kurtosis: f64,
+    pub acf_lag1: f64,
+    pub samples: usize,
+    pub jitter_class: String,
+    pub updated_at: String,
+    pub histogram: Vec<HistogramBin>,
+}
+
+/// Single bin in a jitter histogram.
+#[derive(Serialize)]
+pub struct HistogramBin {
+    pub bin_ms: i64,
+    pub count: usize,
+}
+
 /// Start the HTTP dashboard server.
 ///
 /// Opens its own read-only database connection so the ingestion loop and the
@@ -136,6 +157,10 @@ pub async fn serve(db_path: &str, addr: &str) -> anyhow::Result<()> {
         .route(
             "/api/fingerprints/{fp_id}/temporal",
             get(handle_temporal_fingerprint),
+        )
+        .route(
+            "/api/fingerprints/{fp_id}/jitter",
+            get(handle_jitter_fingerprint),
         )
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -287,4 +312,63 @@ async fn handle_temporal_fingerprint(
         }
         None => Err(axum::http::StatusCode::NOT_FOUND),
     }
+}
+
+async fn handle_jitter_fingerprint(
+    State(state): State<Arc<AppState>>,
+    Path(fp_id): Path<String>,
+) -> Result<Json<JitterApiResponse>, axum::http::StatusCode> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let profile = db
+        .get_fingerprint_jitter(&fp_id)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match profile {
+        Some(p) => {
+            let intervals = db
+                .get_interval_samples(&fp_id, crate::jitter::MAX_INTERVAL_SAMPLES)
+                .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            // Build a histogram from interval samples.
+            let histogram = build_histogram(&intervals);
+            let jitter_class = crate::jitter::classify_jitter(&p);
+
+            Ok(Json(JitterApiResponse {
+                fingerprint_id: fp_id,
+                sigma_ms: p.sigma_ms as f64,
+                skewness: p.skewness as f64,
+                kurtosis: p.kurtosis as f64,
+                acf_lag1: p.acf_lag1 as f64,
+                samples: p.samples,
+                jitter_class: jitter_class.as_str().to_string(),
+                updated_at: p.updated_at.to_rfc3339(),
+                histogram,
+            }))
+        }
+        None => Err(axum::http::StatusCode::NOT_FOUND),
+    }
+}
+
+/// Build a histogram from interval samples with 20 ms bins.
+fn build_histogram(intervals: &[i64]) -> Vec<HistogramBin> {
+    use std::collections::BTreeMap;
+
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+
+    let bin_width = 20i64; // ms
+    let mut bins: BTreeMap<i64, usize> = BTreeMap::new();
+    for &val in intervals {
+        let bin = (val / bin_width) * bin_width;
+        *bins.entry(bin).or_insert(0) += 1;
+    }
+
+    bins.into_iter()
+        .map(|(bin_ms, count)| HistogramBin { bin_ms, count })
+        .collect()
 }

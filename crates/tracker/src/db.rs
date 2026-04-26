@@ -282,6 +282,44 @@ impl Database {
             "#,
         )?;
 
+        // Migration: add jitter columns to fingerprints table and
+        // interval_samples table for TX interval jitter distribution.
+        let has_jitter_sigma: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('fingerprints') WHERE name='jitter_sigma_ms'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_jitter_sigma == 0 {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE fingerprints ADD COLUMN jitter_sigma_ms   REAL;
+                ALTER TABLE fingerprints ADD COLUMN jitter_skewness   REAL;
+                ALTER TABLE fingerprints ADD COLUMN jitter_kurtosis   REAL;
+                ALTER TABLE fingerprints ADD COLUMN jitter_acf_lag1   REAL;
+                ALTER TABLE fingerprints ADD COLUMN jitter_samples    INTEGER;
+                ALTER TABLE fingerprints ADD COLUMN jitter_updated_at TEXT;
+                "#,
+            )?;
+        }
+
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS interval_samples (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint_id TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
+                vehicle_id     TEXT    NOT NULL REFERENCES vehicles(vehicle_id),
+                ts             TEXT    NOT NULL,
+                interval_ms    INTEGER NOT NULL,
+                session_id     INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_interval_fp
+                ON interval_samples(fingerprint_id);
+            CREATE INDEX IF NOT EXISTS idx_interval_ts
+                ON interval_samples(ts);
+            "#,
+        )?;
+
         Ok(())
     }
 
@@ -1009,6 +1047,146 @@ impl Database {
             params![fingerprint_id, vehicle_id.to_string()],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Interval samples / jitter store
+    // -----------------------------------------------------------------------
+
+    /// Insert an interval sample for a fingerprint.
+    pub fn insert_interval_sample(
+        &self,
+        fingerprint_id: &str,
+        vehicle_id: Uuid,
+        ts: &str,
+        interval_ms: i64,
+        session_id: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO interval_samples (fingerprint_id, vehicle_id, ts, interval_ms, session_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                fingerprint_id,
+                vehicle_id.to_string(),
+                ts,
+                interval_ms,
+                session_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the most recent interval samples for a fingerprint, up to `limit`.
+    pub fn get_interval_samples(
+        &self,
+        fingerprint_id: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT interval_ms FROM interval_samples \
+             WHERE fingerprint_id = ?1 \
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let intervals = stmt
+            .query_map(params![fingerprint_id, limit as i64], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(intervals)
+    }
+
+    /// Enforce the ring buffer limit: delete oldest samples beyond the cap.
+    pub fn enforce_interval_ring_buffer(
+        &self,
+        fingerprint_id: &str,
+        max_samples: usize,
+    ) -> Result<u64> {
+        let affected = self.conn.execute(
+            "DELETE FROM interval_samples WHERE fingerprint_id = ?1 AND id NOT IN \
+             (SELECT id FROM interval_samples WHERE fingerprint_id = ?1 \
+              ORDER BY id DESC LIMIT ?2)",
+            params![fingerprint_id, max_samples as i64],
+        )?;
+        Ok(affected as u64)
+    }
+
+    /// Update jitter statistics on a fingerprint row.
+    pub fn update_fingerprint_jitter(
+        &self,
+        fingerprint_id: &str,
+        profile: &crate::jitter::JitterProfile,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE fingerprints SET \
+                jitter_sigma_ms   = ?1, \
+                jitter_skewness   = ?2, \
+                jitter_kurtosis   = ?3, \
+                jitter_acf_lag1   = ?4, \
+                jitter_samples    = ?5, \
+                jitter_updated_at = ?6 \
+             WHERE fingerprint_id = ?7",
+            params![
+                profile.sigma_ms as f64,
+                profile.skewness as f64,
+                profile.kurtosis as f64,
+                profile.acf_lag1 as f64,
+                profile.samples as i64,
+                profile.updated_at.to_rfc3339(),
+                fingerprint_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get jitter profile for a fingerprint (if computed).
+    pub fn get_fingerprint_jitter(
+        &self,
+        fingerprint_id: &str,
+    ) -> Result<Option<crate::jitter::JitterProfile>> {
+        let result = self.conn.query_row(
+            "SELECT jitter_sigma_ms, jitter_skewness, jitter_kurtosis, \
+                    jitter_acf_lag1, jitter_samples, jitter_updated_at \
+             FROM fingerprints WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+            |row| {
+                let sigma: Option<f64> = row.get(0)?;
+                let skewness: Option<f64> = row.get(1)?;
+                let kurtosis: Option<f64> = row.get(2)?;
+                let acf_lag1: Option<f64> = row.get(3)?;
+                let samples: Option<i64> = row.get(4)?;
+                let updated_at: Option<String> = row.get(5)?;
+
+                match (sigma, skewness, kurtosis, acf_lag1, samples, updated_at) {
+                    (Some(s), Some(sk), Some(k), Some(a), Some(n), Some(u)) => {
+                        let ts = chrono::DateTime::parse_from_rfc3339(&u)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+                        Ok(Some(crate::jitter::JitterProfile {
+                            sigma_ms: s as f32,
+                            skewness: sk as f32,
+                            kurtosis: k as f32,
+                            acf_lag1: a as f32,
+                            samples: n as usize,
+                            updated_at: ts,
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            },
+        );
+        match result {
+            Ok(profile) => Ok(profile),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Count interval samples for a fingerprint.
+    pub fn interval_sample_count(&self, fingerprint_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM interval_samples WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     // -----------------------------------------------------------------------
