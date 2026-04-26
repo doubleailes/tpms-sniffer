@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::classification::{compensate_pressure, infer_vehicle_class};
 use crate::db::Database;
+use crate::jitter;
 use crate::jaccard::{
     self, CoOccurrenceMatrix, VehicleMeta, WINDOW_SIZE_S, group_vehicles_into_cars_with_meta,
     infer_wheel_positions,
@@ -764,6 +765,10 @@ impl Resolver {
             vid
         };
 
+        // Capture the previous last_seen timestamp before the state update overwrites it.
+        // Used below to compute the inter-packet gap for jitter interval recording.
+        let prev_last_seen = self.vehicles.get(&vehicle_id).map(|v| v.last_seen);
+
         // Cross-receiver dedup check + update in-memory state.
         let is_dup = {
             let vehicle = self.vehicles.get(&vehicle_id).unwrap();
@@ -824,6 +829,33 @@ impl Resolver {
                 &now.to_rfc3339(),
                 sighting.alarm,
             );
+        }
+
+        // Record interval sample for jitter analytics (non-duplicate sightings only).
+        if !is_dup {
+            if let (Some(prev_ts), Some(median_ms)) = (
+                prev_last_seen,
+                vehicle.tx_interval_median_ms.map(|ms| ms as i64),
+            ) {
+                if let Some(interval) = jitter::extract_interval(prev_ts, now, median_ms) {
+                    if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
+                        if let Err(e) = self.db.insert_interval_sample(
+                            fp_id,
+                            vehicle_id,
+                            &now.to_rfc3339(),
+                            interval,
+                            None,
+                        ) {
+                            eprintln!("warn: interval sample insert failed: {e}");
+                        } else if let Err(e) = self.db.enforce_interval_ring_buffer(
+                            fp_id,
+                            jitter::MAX_INTERVAL_SAMPLES,
+                        ) {
+                            eprintln!("warn: ring buffer enforce failed: {e}");
+                        }
+                    }
+                }
+            }
         }
 
         // Incrementally update presence slot if car_id is assigned.
@@ -1082,6 +1114,9 @@ impl Resolver {
             vid
         };
 
+        // Capture the previous last_seen timestamp before the state update overwrites it.
+        let prev_last_seen = self.vehicles.get(&vehicle_id).map(|v| v.last_seen);
+
         // Update in-memory state.
         // Note: rolling-ID bursts do not carry per-sighting receiver_id
         // metadata (the burst accumulator merges multiple packets), so
@@ -1148,6 +1183,31 @@ impl Resolver {
                 &now.to_rfc3339(),
                 false,
             );
+        }
+
+        // Record interval sample for jitter analytics.
+        if let (Some(prev_ts), Some(median_ms)) = (
+            prev_last_seen,
+            vehicle.tx_interval_median_ms.map(|ms| ms as i64),
+        ) {
+            if let Some(interval) = jitter::extract_interval(prev_ts, now, median_ms) {
+                if let Some(fp_id) = self.vehicle_to_fingerprint.get(&vehicle_id) {
+                    if let Err(e) = self.db.insert_interval_sample(
+                        fp_id,
+                        vehicle_id,
+                        &now.to_rfc3339(),
+                        interval,
+                        None,
+                    ) {
+                        eprintln!("warn: interval sample insert failed: {e}");
+                    } else if let Err(e) = self.db.enforce_interval_ring_buffer(
+                        fp_id,
+                        jitter::MAX_INTERVAL_SAMPLES,
+                    ) {
+                        eprintln!("warn: ring buffer enforce failed: {e}");
+                    }
+                }
+            }
         }
 
         // Incrementally update presence slot if car_id is assigned.

@@ -1185,6 +1185,24 @@ impl Database {
         Ok(count as usize)
     }
 
+    /// Return the IDs of all fingerprints that have at least `min_samples`
+    /// rows in interval_samples and are therefore eligible for jitter
+    /// profile recomputation.
+    pub fn fingerprints_eligible_for_jitter_recompute(
+        &self,
+        min_samples: usize,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fingerprint_id FROM interval_samples \
+             GROUP BY fingerprint_id \
+             HAVING COUNT(*) >= ?1",
+        )?;
+        let fp_ids = stmt
+            .query_map(params![min_samples as i64], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(fp_ids)
+    }
+
     // -----------------------------------------------------------------------
     // Temporal fingerprint store
     // -----------------------------------------------------------------------
@@ -2170,5 +2188,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_col, 1, "fingerprint_id column must exist on vehicles");
+    }
+
+    // -----------------------------------------------------------------------
+    // Jitter pipeline integration test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jitter_pipeline_insert_samples_and_recompute() {
+        use crate::jitter::{MAX_INTERVAL_SAMPLES, MIN_JITTER_SAMPLES, compute_jitter_profile};
+
+        let db = test_db();
+        let vid = Uuid::new_v4();
+
+        // Insert a minimal vehicle row so interval_samples FK is satisfied.
+        db.conn
+            .execute(
+                "INSERT INTO vehicles \
+                 (vehicle_id, first_seen, last_seen, sighting_count, protocol, \
+                  rtl433_id, pressure_sig, vehicle_class) \
+                 VALUES (?1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', \
+                         0, 'EezTire', 241, '[230.0,0.0,0.0,0.0]', 'PassengerCar')",
+                rusqlite::params![vid.to_string()],
+            )
+            .unwrap();
+
+        // Insert a fingerprint with tx_interval_median_ms=60000.
+        db.create_fingerprint(
+            "fp-jitter-integ",
+            241,
+            "PassengerCar",
+            230.0,
+            Some(60_000),
+            "2026-01-01T00:00:00+00:00",
+            false,
+        )
+        .unwrap();
+
+        // Simulate 100 packet arrivals with intervals in the 55000–65000 ms range.
+        for i in 0u32..100 {
+            let interval = 55_000i64 + (i as i64 * 100 % 10_000);
+            let secs = i * 60;
+            let ts = format!(
+                "2026-01-01T{:02}:{:02}:{:02}+00:00",
+                secs / 3600,
+                (secs / 60) % 60,
+                secs % 60
+            );
+            db.insert_interval_sample("fp-jitter-integ", vid, &ts, interval, None)
+                .unwrap();
+        }
+
+        // Verify interval_samples has 100 rows for this fingerprint.
+        let count = db.interval_sample_count("fp-jitter-integ").unwrap();
+        assert_eq!(count, 100, "interval_samples should have 100 rows");
+
+        // Verify the fingerprint appears in the eligible set.
+        let eligible = db
+            .fingerprints_eligible_for_jitter_recompute(MIN_JITTER_SAMPLES)
+            .unwrap();
+        assert!(
+            eligible.contains(&"fp-jitter-integ".to_string()),
+            "fingerprint should be eligible for recompute"
+        );
+
+        // Trigger jitter recompute and write the profile back.
+        let samples = db
+            .get_interval_samples("fp-jitter-integ", MAX_INTERVAL_SAMPLES)
+            .unwrap();
+        assert_eq!(samples.len(), 100);
+        let profile =
+            compute_jitter_profile(&samples).expect("should compute profile from 100 samples");
+        assert!(profile.sigma_ms > 0.0, "sigma_ms should be > 0 for varied intervals");
+        db.update_fingerprint_jitter("fp-jitter-integ", &profile)
+            .unwrap();
+
+        // Read back and verify jitter_sigma_ms is non-null and > 0.
+        let stored = db
+            .get_fingerprint_jitter("fp-jitter-integ")
+            .unwrap()
+            .expect("jitter profile should be stored");
+        assert!(stored.sigma_ms > 0.0, "stored sigma_ms must be > 0");
+        assert_eq!(stored.samples, 100, "stored sample count must be 100");
+
+        // Verify ring buffer: insert MAX_INTERVAL_SAMPLES + 5 total rows and
+        // enforce the cap, then check the count is capped.
+        for i in 0u32..5 {
+            let ts = format!("2026-01-02T00:{:02}:00+00:00", i);
+            db.insert_interval_sample("fp-jitter-integ", vid, &ts, 60_000, None)
+                .unwrap();
+        }
+        db.enforce_interval_ring_buffer("fp-jitter-integ", MAX_INTERVAL_SAMPLES)
+            .unwrap();
+        let count_after = db.interval_sample_count("fp-jitter-integ").unwrap();
+        assert!(
+            count_after <= MAX_INTERVAL_SAMPLES,
+            "ring buffer should cap rows at MAX_INTERVAL_SAMPLES; got {count_after}"
+        );
     }
 }
