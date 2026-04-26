@@ -1,13 +1,2 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-DB="${1:-tpms.db}"
-LOG_DIR="logs"
-
-exec ./target/release/tpms-tracker \
-  --db "$DB" \
-  --serve 0.0.0.0:8080 \
-  --log-level info \
-  --log-file "$LOG_DIR/tpms-tracker.log" \
-  --log-max-size 10 \
-  --log-max-files 5
+cargo build --release
+./target/release/tpms-sniffer --json | ./target/release/tpms-tracker --db tpms_010.db --log-level debug --log-file ~/logs/tpms-tracker.log
