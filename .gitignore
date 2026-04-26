@@ -3,3 +3,4 @@ tpms.db*
 logs/
 *.log
 *.log.*
+start.sh
