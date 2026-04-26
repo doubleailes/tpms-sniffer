@@ -2259,7 +2259,10 @@ mod tests {
         assert_eq!(samples.len(), 100);
         let profile =
             compute_jitter_profile(&samples).expect("should compute profile from 100 samples");
-        assert!(profile.sigma_ms > 0.0, "sigma_ms should be > 0 for varied intervals");
+        assert!(
+            profile.sigma_ms > 0.0,
+            "sigma_ms should be > 0 for varied intervals"
+        );
         db.update_fingerprint_jitter("fp-jitter-integ", &profile)
             .unwrap();
 

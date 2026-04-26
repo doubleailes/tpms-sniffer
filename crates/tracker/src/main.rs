@@ -5,7 +5,9 @@ use std::process;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
-use tpms_tracker::{TpmsPacket, analytics, db::Database, jitter, replay, resolver::Resolver, server};
+use tpms_tracker::{
+    TpmsPacket, analytics, db::Database, jitter, replay, resolver::Resolver, server,
+};
 
 #[derive(Parser)]
 #[command(
@@ -187,8 +189,7 @@ async fn jitter_recompute_task(db_path: String) {
                     db.fingerprints_eligible_for_jitter_recompute(jitter::MIN_JITTER_SAMPLES)?;
                 let mut updated = 0usize;
                 for fp_id in &fp_ids {
-                    let samples =
-                        db.get_interval_samples(fp_id, jitter::MAX_INTERVAL_SAMPLES)?;
+                    let samples = db.get_interval_samples(fp_id, jitter::MAX_INTERVAL_SAMPLES)?;
                     if let Some(profile) = jitter::compute_jitter_profile(&samples) {
                         db.update_fingerprint_jitter(fp_id, &profile)?;
                         updated += 1;
