@@ -1,7 +1,7 @@
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -10,7 +10,44 @@ use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
 use tpms_tracker::{
     TpmsPacket, analytics, db::Database, jitter, replay, resolver::Resolver, server,
 };
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, fmt::MakeWriter, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// `MakeWriter` wrapper around a `Mutex<W>` that flushes the underlying writer
+/// when each per-event guard is dropped. `BasicRollingFileAppender` wraps the
+/// log file in a `BufWriter`, so without an explicit flush the formatted event
+/// stays buffered until the file is rotated or the process exits — which is
+/// why log files appeared empty even though stderr showed the events.
+struct FlushingWriter<W: Write>(Mutex<W>);
+
+impl<W: Write> FlushingWriter<W> {
+    fn new(writer: W) -> Self {
+        Self(Mutex::new(writer))
+    }
+}
+
+struct FlushOnDrop<'a, W: Write>(MutexGuard<'a, W>);
+
+impl<'a, W: Write> Write for FlushOnDrop<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<'a, W: Write> Drop for FlushOnDrop<'a, W> {
+    fn drop(&mut self) {
+        let _ = self.0.flush();
+    }
+}
+
+impl<'a, W: Write + 'a> MakeWriter<'a> for FlushingWriter<W> {
+    type Writer = FlushOnDrop<'a, W>;
+    fn make_writer(&'a self) -> Self::Writer {
+        FlushOnDrop(self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -152,7 +189,7 @@ fn init_logging(
             let file_appender = BasicRollingFileAppender::new(path, condition, max_files)?;
 
             let file_layer = fmt::layer()
-                .with_writer(Mutex::new(file_appender))
+                .with_writer(FlushingWriter::new(file_appender))
                 .with_ansi(false) // no ANSI colour codes in log files
                 .with_target(false)
                 .with_level(false);
