@@ -812,7 +812,10 @@ mod tests {
             }
         }
         // Histogram: peak should be at the 21–23 s bin.
-        let in_peak = intervals.iter().filter(|&&g| (21_000..=23_000).contains(&g)).count();
+        let in_peak = intervals
+            .iter()
+            .filter(|&&g| (21_000..=23_000).contains(&g))
+            .count();
         let off_peak = intervals.len() - in_peak;
         assert!(
             in_peak >= 80,
