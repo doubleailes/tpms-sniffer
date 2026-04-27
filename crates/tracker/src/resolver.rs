@@ -306,12 +306,7 @@ impl Resolver {
         if let Ok(Some(vehicle_id)) = result.as_ref()
             && let Some(fp_id) = self.vehicle_to_fingerprint.get(vehicle_id).cloned()
         {
-            self.flush_raw_intervals_for_sensor(
-                sensor_id,
-                packet.rtl433_id,
-                *vehicle_id,
-                &fp_id,
-            );
+            self.flush_raw_intervals_for_sensor(sensor_id, packet.rtl433_id, *vehicle_id, &fp_id);
         }
 
         // Throttled eviction of stale tracker entries and unresolved buffer
@@ -2842,9 +2837,27 @@ mod tests {
         // `process()` call that pushed the interval.
         let mut resolver = in_memory_resolver();
 
-        let p1 = make_packet_at("2026-04-26 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
-        let p2 = make_packet_at("2026-04-26 12:00:22.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
-        let p3 = make_packet_at("2026-04-26 12:00:44.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p1 = make_packet_at(
+            "2026-04-26 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
+        let p2 = make_packet_at(
+            "2026-04-26 12:00:22.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
+        let p3 = make_packet_at(
+            "2026-04-26 12:00:44.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
 
         resolver.process(&p1).unwrap();
         let veh = resolver
@@ -2872,8 +2885,20 @@ mod tests {
         // RAW_INTERVAL_MIN_MS — must not create an interval sample.
         let mut resolver = in_memory_resolver();
 
-        let p1 = make_packet_at("2026-04-26 12:00:00.000", "0xF7FFFFFF", "EezTire", 241, 352.3);
-        let p2 = make_packet_at("2026-04-26 12:00:00.200", "0xF7FFFFFF", "EezTire", 241, 352.3);
+        let p1 = make_packet_at(
+            "2026-04-26 12:00:00.000",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
+        let p2 = make_packet_at(
+            "2026-04-26 12:00:00.200",
+            "0xF7FFFFFF",
+            "EezTire",
+            241,
+            352.3,
+        );
 
         resolver.process(&p1).unwrap();
         resolver.process(&p2).unwrap();

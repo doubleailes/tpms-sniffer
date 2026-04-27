@@ -64,12 +64,7 @@ impl RawIntervalTracker {
     ///
     /// Returns `None` for the first observation of a sensor, for burst
     /// duplicates, and for cross-session gaps.
-    pub fn observe(
-        &mut self,
-        sensor_id: u32,
-        rtl433_id: u16,
-        now: DateTime<Utc>,
-    ) -> Option<i64> {
+    pub fn observe(&mut self, sensor_id: u32, rtl433_id: u16, now: DateTime<Utc>) -> Option<i64> {
         let key = (sensor_id, rtl433_id);
         let prev = self.last_seen.insert(key, now);
         prev.and_then(|t| {
@@ -124,13 +119,7 @@ impl RawIntervalBuffer {
     }
 
     /// Append an interval observation for the given sensor.
-    pub fn push(
-        &mut self,
-        sensor_id: u32,
-        rtl433_id: u16,
-        interval_ms: i64,
-        ts: DateTime<Utc>,
-    ) {
+    pub fn push(&mut self, sensor_id: u32, rtl433_id: u16, interval_ms: i64, ts: DateTime<Utc>) {
         self.inner
             .entry((sensor_id, rtl433_id))
             .or_default()
