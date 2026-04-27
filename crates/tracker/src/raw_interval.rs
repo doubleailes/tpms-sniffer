@@ -30,7 +30,7 @@ pub const RAW_INTERVAL_MIN_MS: i64 = 5_000;
 /// Maximum plausible inter-packet gap (ms).  Anything above this is treated
 /// as a cross-session gap (vehicle absent, then returns).  Set to ~3× the
 /// longest known TPMS TX interval (EezTire ~90s when parked).
-pub const RAW_INTERVAL_MAX_MS: i64 = 300_000;
+pub const RAW_INTERVAL_MAX_MS: i64 = 60_000;
 
 /// TTL (seconds) for buffered intervals awaiting fingerprint association.
 /// Buffered entries older than this are dropped — they belong to transient
