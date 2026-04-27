@@ -255,6 +255,26 @@ UPDATE fingerprints SET
     jitter_updated_at = NULL;
 """
 
+MIGRATION_V12_DESCRIPTION = (
+    "clear interval_samples and jitter columns: multi-slot rolling buffer (issue #44)"
+)
+# Issue #44: the single-slot RollingIntervalTracker is replaced by a
+# multi-slot buffered tracker.  Any rolling-ID intervals collected before
+# this fix were dominated by cross-sensor pairs in dense environments
+# (uniform-noise histogram, SNR ≈ 0).  Wipe the contaminated samples and
+# null out the derived jitter columns so they can be recomputed under the
+# new methodology.
+MIGRATION_V12 = """
+DELETE FROM interval_samples;
+UPDATE fingerprints SET
+    jitter_sigma_ms   = NULL,
+    jitter_skewness   = NULL,
+    jitter_kurtosis   = NULL,
+    jitter_acf_lag1   = NULL,
+    jitter_samples    = NULL,
+    jitter_updated_at = NULL;
+"""
+
 MIGRATIONS = [
     (1, MIGRATION_V1_DESCRIPTION, None),
     (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
@@ -267,6 +287,7 @@ MIGRATIONS = [
     (9, MIGRATION_V9_DESCRIPTION, MIGRATION_V9),
     (10, MIGRATION_V10_DESCRIPTION, MIGRATION_V10),
     (11, MIGRATION_V11_DESCRIPTION, MIGRATION_V11),
+    (12, MIGRATION_V12_DESCRIPTION, MIGRATION_V12),
 ]
  
 # ---------------------------------------------------------------------------

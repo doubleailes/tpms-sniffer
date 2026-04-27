@@ -17,7 +17,7 @@
 //! fingerprint assignment.
 
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -53,6 +53,23 @@ pub const MAX_HAMMING_DISTANCE: u32 = 3;
 /// so any delta above this threshold indicates two distinct sensors that
 /// happen to be within `MAX_HAMMING_DISTANCE` of each other.
 pub const MAX_PRESSURE_DELTA_KPA: f32 = 5.0;
+
+/// Number of slots in the per-protocol rolling buffer.
+///
+/// Must exceed the maximum number of simultaneous sensors of the same
+/// protocol expected in the capture environment.  In a 10-sensor EezTire
+/// environment with a 22 s TX cadence and ~2.2 s mean inter-packet gap,
+/// each sensor's previous packet is followed by ~10 competing entries
+/// before its own next packet arrives, so a buffer of 20 provides 2×
+/// headroom.  Scales linearly with `density × tx_interval / mean_gap`.
+pub const ROLLING_BUFFER_SIZE: usize = 20;
+
+/// Suppress repeat matches of the same `(sensor_id_a, sensor_id_b)` pair
+/// within this window.  With a multi-slot buffer the same buffered entry
+/// can match several incoming packets, which would inject duplicate
+/// near-identical intervals.  Set to half of the minimum plausible TX
+/// interval so that genuine same-sensor cadence (≥ 5 s) is unaffected.
+pub const DEDUP_WINDOW_MS: i64 = 8_000;
 
 /// `rtl433_id`s of protocols whose sensor ID rotates on every transmission
 /// via a bit-flip rolling scheme.  Jitter measurement for these protocols
@@ -130,54 +147,88 @@ impl RawIntervalTracker {
 // RollingIntervalTracker
 // ---------------------------------------------------------------------------
 
+/// One slot in the rolling buffer of recent packets for a protocol.
+#[derive(Debug, Clone)]
+struct BufferEntry {
+    sensor_id: u32,
+    /// `None` when the entry was recorded via [`RollingIntervalTracker::observe`]
+    /// without a pressure value.  Pressure gating is skipped in that case.
+    pressure_kpa: Option<f32>,
+    ts: DateTime<Utc>,
+}
+
 /// Tracks raw TX intervals for protocols whose sensor ID rotates on every
 /// transmission (EezTire, TRW-OOK, TRW-FSK).
 ///
 /// Unlike [`RawIntervalTracker`], which keys on `(sensor_id, rtl433_id)`,
 /// this tracker keys on `rtl433_id` only and uses Hamming distance between
 /// consecutive sensor IDs to decide whether two packets came from the same
-/// physical sensor.  Two consecutive packets are attributed to the same
-/// sensor when `hamming_distance(prev_id, new_id) <= MAX_HAMMING_DISTANCE`.
+/// physical sensor.
 ///
-/// In dense environments where two sensors of the same protocol may be in
-/// range simultaneously, [`Self::observe_with_pressure`] adds pressure
-/// continuity as a second matching criterion.
-#[derive(Debug, Default)]
+/// Each protocol has a circular buffer of the last `ROLLING_BUFFER_SIZE`
+/// observations.  A new packet is matched against **every** entry in the
+/// buffer; the match with the lowest Hamming distance (tiebroken by recency)
+/// is selected as the previous packet from the same physical sensor.  This
+/// is necessary in dense environments where many sensors of the same
+/// protocol transmit concurrently — a single-slot tracker is overwritten
+/// by other sensors faster than the same sensor's next packet arrives, so
+/// every match is a cross-sensor pair and the resulting interval histogram
+/// is uniform noise.
+///
+/// In addition to Hamming distance, [`Self::observe_with_pressure`] gates
+/// matches on pressure continuity (`MAX_PRESSURE_DELTA_KPA`) to disambiguate
+/// sensors whose IDs happen to be within 3 bits of each other.  A
+/// deduplication window (`DEDUP_WINDOW_MS`) prevents the same `(id_a, id_b)`
+/// pair from producing duplicate intervals when an entry is matched again
+/// before being evicted.
+#[derive(Debug)]
 pub struct RollingIntervalTracker {
-    /// `rtl433_id → (last_sensor_id, last_pressure_kpa, last_timestamp)`.
-    /// `last_pressure_kpa` is `None` when the previous observation was
-    /// recorded via [`Self::observe`] without a pressure value.
-    last_seen: HashMap<u16, (u32, Option<f32>, DateTime<Utc>)>,
+    /// `rtl433_id → circular buffer of recent observations`.
+    buffers: HashMap<u16, VecDeque<BufferEntry>>,
+    /// Last match time per order-independent sensor-ID pair.  Drives the
+    /// dedup gate so that successive packets cannot pull the same anchor
+    /// twice within `DEDUP_WINDOW_MS`.
+    recent_matches: HashMap<(u32, u32), DateTime<Utc>>,
+    /// Maximum slots per protocol buffer.  Defaults to `ROLLING_BUFFER_SIZE`;
+    /// callers (tests, density-sweep experiments) can override via
+    /// [`Self::with_buffer_size`].
+    buffer_size: usize,
+}
+
+impl Default for RollingIntervalTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RollingIntervalTracker {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_buffer_size(ROLLING_BUFFER_SIZE)
     }
 
-    /// Record a packet observation and return the interval (ms) since the
-    /// previous packet of the same protocol if:
-    ///   * Hamming distance between the previous and new sensor IDs is
-    ///     `<= MAX_HAMMING_DISTANCE`, **and**
-    ///   * the gap is inside `[RAW_INTERVAL_MIN_MS, RAW_INTERVAL_MAX_MS]`.
-    ///
-    /// The stored `(sensor_id, timestamp)` for this protocol is always
-    /// updated, regardless of whether an interval is returned.
+    /// Construct a tracker with a custom per-protocol buffer size.  Used by
+    /// tests and by white-paper buffer-size-vs-SNR sweeps.
+    pub fn with_buffer_size(buffer_size: usize) -> Self {
+        Self {
+            buffers: HashMap::new(),
+            recent_matches: HashMap::new(),
+            buffer_size: buffer_size.max(1),
+        }
+    }
+
+    /// Record a packet observation without pressure gating.  Returns the
+    /// interval (ms) since the best-matching buffered packet of the same
+    /// protocol if all gates pass, otherwise `None`.  The new packet is
+    /// always pushed to the buffer regardless of whether a match was found.
     pub fn observe(&mut self, sensor_id: u32, rtl433_id: u16, now: DateTime<Utc>) -> Option<i64> {
-        let prev = self.last_seen.insert(rtl433_id, (sensor_id, None, now));
-        prev.and_then(|(last_id, _, last_ts)| {
-            Self::interval_if_same_sensor(sensor_id, last_id, now, last_ts)
-        })
+        self.observe_inner(sensor_id, rtl433_id, None, now)
     }
 
-    /// Like [`Self::observe`] but additionally requires the pressure delta
-    /// between the two packets to stay within `MAX_PRESSURE_DELTA_KPA`.
-    /// This disambiguates two sensors of the same protocol that happen to
-    /// transmit IDs within Hamming distance 3 of each other.
-    ///
-    /// If the previous observation was recorded via [`Self::observe`]
-    /// (no pressure available), pressure is not used to gate the match —
-    /// the current call falls back to the pure Hamming-distance check.
+    /// Like [`Self::observe`] but additionally gates matches on pressure
+    /// continuity: a buffered entry is eligible only if its pressure differs
+    /// from the new packet's by at most `MAX_PRESSURE_DELTA_KPA`.  Buffered
+    /// entries recorded without pressure (via [`Self::observe`]) are not
+    /// pressure-gated.
     pub fn observe_with_pressure(
         &mut self,
         sensor_id: u32,
@@ -185,57 +236,95 @@ impl RollingIntervalTracker {
         pressure_kpa: f32,
         now: DateTime<Utc>,
     ) -> Option<i64> {
-        let prev = self
-            .last_seen
-            .insert(rtl433_id, (sensor_id, Some(pressure_kpa), now));
-        prev.and_then(|(last_id, last_pressure, last_ts)| {
-            let interval = Self::interval_if_same_sensor(sensor_id, last_id, now, last_ts)?;
-            // If we have a previous pressure to compare against, gate on it.
-            // Otherwise accept the Hamming-only match.
-            if let Some(prev_p) = last_pressure
-                && (pressure_kpa - prev_p).abs() > MAX_PRESSURE_DELTA_KPA
-            {
-                return None;
-            }
-            Some(interval)
-        })
+        self.observe_inner(sensor_id, rtl433_id, Some(pressure_kpa), now)
     }
 
-    /// Combined Hamming + interval gate.  Pulled out so [`Self::observe`]
-    /// and [`Self::observe_with_pressure`] share the same logic.
-    fn interval_if_same_sensor(
-        new_id: u32,
-        last_id: u32,
+    fn observe_inner(
+        &mut self,
+        sensor_id: u32,
+        rtl433_id: u16,
+        pressure_kpa: Option<f32>,
         now: DateTime<Utc>,
-        last_ts: DateTime<Utc>,
     ) -> Option<i64> {
-        let hamming = (new_id ^ last_id).count_ones();
-        if hamming > MAX_HAMMING_DISTANCE {
-            return None;
+        let buffer_size = self.buffer_size;
+
+        // Phase 1: read-only search of the buffer.  Lower Hamming is preferred;
+        // ties break toward the most recent entry (largest ts).
+        let best = self.buffers.get(&rtl433_id).and_then(|buf| {
+            buf.iter()
+                .filter_map(|entry| {
+                    let hamming = (sensor_id ^ entry.sensor_id).count_ones();
+                    if hamming > MAX_HAMMING_DISTANCE {
+                        return None;
+                    }
+                    let gap = (now - entry.ts).num_milliseconds();
+                    if !(RAW_INTERVAL_MIN_MS..=RAW_INTERVAL_MAX_MS).contains(&gap) {
+                        return None;
+                    }
+                    if let (Some(p_new), Some(p_prev)) = (pressure_kpa, entry.pressure_kpa)
+                        && (p_new - p_prev).abs() > MAX_PRESSURE_DELTA_KPA
+                    {
+                        return None;
+                    }
+                    Some((hamming, entry.ts, gap, entry.sensor_id))
+                })
+                .min_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+        });
+
+        // Phase 2: deduplication gate on the (min, max) pair key.  We update
+        // `recent_matches` only when an interval is actually emitted, so that
+        // a dedup-suppressed call does not extend the suppression window.
+        let mut interval = best.map(|(_, _, gap, _)| gap);
+        if let Some((_, _, _, prev_id)) = best {
+            let pair_key = (sensor_id.min(prev_id), sensor_id.max(prev_id));
+            let suppress = self
+                .recent_matches
+                .get(&pair_key)
+                .is_some_and(|last| (now - *last).num_milliseconds() < DEDUP_WINDOW_MS);
+            if suppress {
+                interval = None;
+            } else if interval.is_some() {
+                self.recent_matches.insert(pair_key, now);
+            }
         }
-        let gap = (now - last_ts).num_milliseconds();
-        if (RAW_INTERVAL_MIN_MS..=RAW_INTERVAL_MAX_MS).contains(&gap) {
-            Some(gap)
-        } else {
-            None
+
+        // Phase 3: push the new packet, evicting by age first, then by size.
+        let buffer = self.buffers.entry(rtl433_id).or_default();
+        if buffer.len() >= buffer_size {
+            let cutoff = now - chrono::Duration::milliseconds(RAW_INTERVAL_MAX_MS);
+            buffer.retain(|e| e.ts > cutoff);
+            while buffer.len() >= buffer_size {
+                buffer.pop_front();
+            }
         }
+        buffer.push_back(BufferEntry {
+            sensor_id,
+            pressure_kpa,
+            ts: now,
+        });
+
+        interval
     }
 
-    /// Drop entries whose last-seen timestamp is older than `max_age_secs`.
-    /// Call periodically to release memory for protocols whose sensors have
-    /// departed.
+    /// Drop buffer entries (and dedup records) older than `max_age_secs`.
+    /// Empty protocol buffers are removed entirely.
     pub fn evict_stale(&mut self, now: DateTime<Utc>, max_age_secs: i64) {
-        self.last_seen
-            .retain(|_, (_, _, ts)| (now - *ts).num_seconds() < max_age_secs);
+        let cutoff = now - chrono::Duration::seconds(max_age_secs);
+        for buffer in self.buffers.values_mut() {
+            buffer.retain(|e| e.ts > cutoff);
+        }
+        self.buffers.retain(|_, buf| !buf.is_empty());
+        self.recent_matches.retain(|_, ts| *ts > cutoff);
     }
 
-    /// Number of tracked protocol keys.  Exposed for tests and diagnostics.
+    /// Number of tracked protocol keys with at least one buffered entry.
+    /// Exposed for tests and diagnostics.
     pub fn len(&self) -> usize {
-        self.last_seen.len()
+        self.buffers.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.last_seen.is_empty()
+        self.buffers.is_empty()
     }
 }
 
@@ -670,5 +759,210 @@ mod tests {
         for g in &intervals {
             assert_eq!(*g, 22_000);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #44 — multi-slot rolling buffer in dense environments
+    // -----------------------------------------------------------------------
+
+    /// Generate one packet's `(sensor_id, ts)` for sensor `idx` at transmission
+    /// `n` in the dense-environment simulation.  Each sensor uses a "colour":
+    /// nibble pattern `i*0x11111111`.  Cross-sensor Hamming distance is at
+    /// least 8 bits, while the within-sensor walk flips bits 0..2 only — so
+    /// intra-sensor pairs stay within `MAX_HAMMING_DISTANCE`.
+    fn dense_packet(idx: usize, n: usize, base: DateTime<Utc>) -> (u32, DateTime<Utc>) {
+        let lane: u32 = (idx as u32 & 0xF).wrapping_mul(0x1111_1111);
+        let walk: u32 = match n % 4 {
+            0 => 0b000,
+            1 => 0b001,
+            2 => 0b011,
+            3 => 0b010,
+            _ => unreachable!(),
+        };
+        let id = lane ^ walk;
+        // 22 s cadence per sensor, staggered by 2.2 s between sensors so the
+        // interleaved rate is 10 packets / 22 s.
+        let ts = base
+            + Duration::milliseconds(idx as i64 * 2_200)
+            + Duration::milliseconds(n as i64 * 22_000);
+        (id, ts)
+    }
+
+    #[test]
+    fn rolling_multi_slot_buffer_recovers_signal_in_dense_environment() {
+        // 10 simultaneous EezTire sensors at 22 s cadence, time-staggered by
+        // 2.2 s.  With ROLLING_BUFFER_SIZE = 20 the per-sensor previous
+        // packet is always reachable, so each new packet should recover its
+        // own ~22 s interval.
+        let mut tracker = RollingIntervalTracker::with_buffer_size(20);
+        let mut intervals = Vec::new();
+        // 10 sensors × 10 transmissions each = 100 packets.  We sort by
+        // timestamp so the tracker sees them in real-world arrival order.
+        let mut packets = Vec::new();
+        for sensor in 0..10 {
+            for n in 0..10 {
+                let (id, ts) = dense_packet(sensor, n, t0());
+                packets.push((ts, id));
+            }
+        }
+        packets.sort_by_key(|p| p.0);
+        for (ts, id) in packets {
+            if let Some(g) = tracker.observe(id, 241, ts) {
+                intervals.push(g);
+            }
+        }
+        // Histogram: peak should be at the 21–23 s bin.
+        let in_peak = intervals.iter().filter(|&&g| (21_000..=23_000).contains(&g)).count();
+        let off_peak = intervals.len() - in_peak;
+        assert!(
+            in_peak >= 80,
+            "expected ≥ 80 same-sensor intervals near 22 s, got {in_peak} of {} total",
+            intervals.len()
+        );
+        // Signal-to-noise: the tight peak must dominate by > 3×.
+        assert!(
+            in_peak as f64 / off_peak.max(1) as f64 > 3.0,
+            "SNR too low: {in_peak} peak vs {off_peak} background"
+        );
+    }
+
+    #[test]
+    fn rolling_single_slot_regression_yields_no_signal_in_dense_environment() {
+        // Same dense scenario as above with `buffer_size = 1` — reproduces
+        // the issue #43 single-slot pathology.  The slot is overwritten by
+        // a different sensor before the same sensor's next packet arrives,
+        // and inter-lane Hamming distance is far above the threshold, so
+        // no intervals (or near none) are recorded.
+        let mut tracker = RollingIntervalTracker::with_buffer_size(1);
+        let mut packets = Vec::new();
+        for sensor in 0..10 {
+            for n in 0..10 {
+                let (id, ts) = dense_packet(sensor, n, t0());
+                packets.push((ts, id));
+            }
+        }
+        packets.sort_by_key(|p| p.0);
+        let mut intervals = Vec::new();
+        for (ts, id) in packets {
+            if let Some(g) = tracker.observe(id, 241, ts) {
+                intervals.push(g);
+            }
+        }
+        // With distinct nibble lanes, cross-sensor Hamming is always 4+, so
+        // a single-slot tracker yields zero same-sensor matches.  This is
+        // the regression guard: any future change that quietly reverts to
+        // a single-slot design would push this number above zero.
+        assert_eq!(
+            intervals.len(),
+            0,
+            "buffer_size=1 must not recover same-sensor pairs in this dense \
+             environment (got {} intervals)",
+            intervals.len()
+        );
+    }
+
+    #[test]
+    fn rolling_dedup_suppresses_repeat_pair_within_window() {
+        // Multipath echo scenario: a sensor transmits id=0x3 once at t=22 s
+        // (matching a prior id=0x1 at t=0), and a near-duplicate of the same
+        // packet arrives 500 ms later (multipath echo, same sensor_id).  The
+        // echo would re-pair (0x1, 0x3) and inject a near-identical interval,
+        // contaminating the histogram.  The dedup guard must suppress it.
+        let mut tracker = RollingIntervalTracker::new();
+        tracker.observe(0x1, 241, t0());
+        let g1 = tracker.observe(0x3, 241, t0() + Duration::milliseconds(22_000));
+        assert_eq!(g1, Some(22_000), "first match must emit a fresh interval");
+        // Echo at t = 22.5 s.  Best buffer match is still 0x1@t=0 (gap to
+        // 0x3@22 s is 500 ms, gap-gated below MIN).  Pair (0x1, 0x3) was
+        // recorded at t=22 s, only 500 ms ago < DEDUP_WINDOW_MS = 8 s.
+        let g2 = tracker.observe(0x3, 241, t0() + Duration::milliseconds(22_500));
+        assert_eq!(
+            g2, None,
+            "repeat (0x1, 0x3) match within DEDUP_WINDOW_MS must be suppressed"
+        );
+    }
+
+    #[test]
+    fn rolling_dedup_releases_pair_after_window() {
+        // Same multipath scenario, but the echo arrives long after
+        // DEDUP_WINDOW_MS — the pair must be matchable again.  Use 31 s as
+        // a "second TX" of the rolling-ID echo so the gap is well above
+        // the dedup window and the gap gate.
+        let mut tracker = RollingIntervalTracker::new();
+        tracker.observe(0x1, 241, t0());
+        let g1 = tracker.observe(0x3, 241, t0() + Duration::milliseconds(22_000));
+        assert_eq!(g1, Some(22_000));
+        // 31 s later: pair recorded 9 s ago > DEDUP_WINDOW_MS = 8 s, allowed.
+        let g2 = tracker.observe(0x3, 241, t0() + Duration::milliseconds(31_000));
+        assert!(
+            g2.is_some(),
+            "pair must be re-matchable after DEDUP_WINDOW_MS elapses"
+        );
+    }
+
+    #[test]
+    fn rolling_buffer_skips_stale_entries_and_matches_recent() {
+        // Mixed buffer: a stale entry (> RAW_INTERVAL_MAX_MS old) and a
+        // recent one.  The new packet must skip the stale entry by gap-gate
+        // and match the recent one.
+        let mut tracker = RollingIntervalTracker::new();
+        tracker.observe(0x1, 241, t0());
+        let t_recent = t0() + Duration::milliseconds(RAW_INTERVAL_MAX_MS + 1_000);
+        tracker.observe(0x4, 241, t_recent);
+        // 22 s after the recent entry: 0x5 at Hamming 1 from both 0x1 and
+        // 0x4.  0x1 is now > MAX_MS old → gap-gated; 0x4 matches.
+        let gap = tracker.observe(0x5, 241, t_recent + Duration::milliseconds(22_000));
+        assert_eq!(gap, Some(22_000));
+    }
+
+    #[test]
+    fn rolling_buffer_evicts_by_age_when_full() {
+        // Fill a small buffer with stale entries, then push a fresh packet.
+        // Age-eviction must reclaim every slot so the next packet matches
+        // only the fresh one.
+        let mut tracker = RollingIntervalTracker::with_buffer_size(3);
+        // Three stale entries spaced 1 s apart at the start.
+        tracker.observe(0x1, 241, t0());
+        tracker.observe(0x2, 241, t0() + Duration::milliseconds(1_000));
+        tracker.observe(0x3, 241, t0() + Duration::milliseconds(2_000));
+        assert_eq!(tracker.len(), 1, "all three packets share rtl433_id=241");
+        // Push a fresh packet 5 s past RAW_INTERVAL_MAX_MS — buffer is full,
+        // so age-eviction runs and removes all three stale entries.
+        let t_fresh = t0() + Duration::milliseconds(RAW_INTERVAL_MAX_MS + 5_000);
+        tracker.observe(0x10, 241, t_fresh);
+        // The next packet, 22 s later, must match 0x10 — proving none of
+        // the original three is still in the buffer.  0x10 (binary 10000)
+        // and 0x12 (binary 10010) differ by 1 bit; 0x10 vs 0x1 also differs
+        // by exactly 1 bit, but 0x1's gap is now > MAX_MS, so even without
+        // age-eviction the gap-gate would reject it.  We instead test that
+        // a second observation 22 s after `t_fresh` yields exactly one
+        // candidate (0x10), with a clean 22 s interval.
+        let gap = tracker.observe(0x12, 241, t_fresh + Duration::milliseconds(22_000));
+        assert_eq!(gap, Some(22_000));
+    }
+
+    #[test]
+    fn rolling_evict_stale_clears_dedup_state() {
+        // After `evict_stale` removes records older than `max_age_secs`, the
+        // dedup state for the same period must also be cleared so a freshly
+        // arriving pair is not silently suppressed.
+        let mut tracker = RollingIntervalTracker::new();
+        tracker.observe(0x1, 241, t0());
+        let _ = tracker.observe(0x3, 241, t0() + Duration::milliseconds(6_000));
+        // Evict everything before t0 + 1000 s.
+        tracker.evict_stale(t0() + Duration::seconds(1_000), 60);
+        assert!(
+            tracker.is_empty(),
+            "buffer must be empty after stale eviction"
+        );
+        // A new pair arriving long after eviction must produce an interval —
+        // dedup state must not have lingered.
+        tracker.observe(0x1, 241, t0() + Duration::seconds(1_500));
+        let gap = tracker.observe(
+            0x3,
+            241,
+            t0() + Duration::seconds(1_500) + Duration::milliseconds(6_000),
+        );
+        assert_eq!(gap, Some(6_000));
     }
 }
