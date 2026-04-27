@@ -3044,11 +3044,12 @@ mod tests {
 
         // The interval tracker is keyed only on rtl433_id, so any cross-sensor
         // attribution would have produced ~11 s intervals (alternating A→B).
-        // The pressure gate must suppress them: the only intervals recorded
-        // come from genuine same-sensor transitions (~22 s).  In an
-        // interleaved stream every `observe_with_pressure` call sees a large
-        // pressure delta from the prior packet, so *zero* intervals should be
-        // recorded under either fingerprint.
+        // Under the multi-slot rolling buffer (issue #44) the tracker now
+        // searches *every* buffered entry, so genuine same-sensor 22 s pairs
+        // are recovered even when the streams interleave; the pressure gate
+        // must still suppress every cross-sensor (~11 s) candidate.  Any
+        // sample falling between MIN and 18 s would therefore prove a
+        // cross-sensor attribution leaked through the pressure gate.
         for veh in eez_vehicles {
             if let Some(fp) = veh.fingerprint_id.as_ref() {
                 let samples = resolver
@@ -3056,9 +3057,6 @@ mod tests {
                     .get_interval_samples(fp, jitter::MAX_INTERVAL_SAMPLES)
                     .unwrap();
                 for s in &samples {
-                    // No genuine 22 s gap exists between same-sensor packets
-                    // in this interleaved stream (the two sensors alternate),
-                    // so any sample at all would be a cross-attribution.
                     assert!(
                         *s < 5_000 || *s > 18_000,
                         "spurious cross-sensor interval recorded: {} ms",
