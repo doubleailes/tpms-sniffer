@@ -276,7 +276,17 @@ impl Resolver {
             self.raw_interval_tracker
                 .observe(sensor_id, packet.rtl433_id, ts)
         };
-        if let Some(interval_ms) = raw_interval {
+        // Buffer the interval only for fixed-ID protocols.  Rolling-ID
+        // packets carry a different `sensor_id` on every transmission, so a
+        // `(sensor_id, rtl433_id)`-keyed buffer entry can never be drained
+        // by a future packet from the same physical sensor and is lost
+        // whenever the current packet does not resolve to a vehicle.  The
+        // rolling-ID interval is instead written directly to
+        // `interval_samples` after resolution below, since the correlator
+        // always returns a fingerprint in the same call for these protocols.
+        if let Some(interval_ms) = raw_interval
+            && !is_rolling_id_protocol(packet.rtl433_id)
+        {
             self.raw_interval_buffer
                 .push(sensor_id, packet.rtl433_id, interval_ms, ts);
         }
@@ -320,14 +330,26 @@ impl Resolver {
         };
 
         // After the correlator has resolved (or failed to resolve) a vehicle
-        // for this packet, flush any buffered raw intervals for the same
-        // (sensor_id, rtl433_id) into interval_samples.  This deferred-
-        // association strategy lets us record the upstream interval even
-        // though the fingerprint identity is only known post-correlation.
+        // for this packet, persist the upstream raw interval.  Fixed-ID
+        // protocols flush from the deferred buffer keyed on
+        // `(sensor_id, rtl433_id)`; rolling-ID protocols write the
+        // just-computed interval directly because their bit-flipping
+        // sensor_id makes the buffer key non-recoverable across packets.
         if let Ok(Some(vehicle_id)) = result.as_ref()
             && let Some(fp_id) = self.vehicle_to_fingerprint.get(vehicle_id).cloned()
         {
-            self.flush_raw_intervals_for_sensor(sensor_id, packet.rtl433_id, *vehicle_id, &fp_id);
+            if is_rolling_id_protocol(packet.rtl433_id) {
+                if let Some(interval_ms) = raw_interval {
+                    self.record_interval_sample(&fp_id, *vehicle_id, interval_ms, ts);
+                }
+            } else {
+                self.flush_raw_intervals_for_sensor(
+                    sensor_id,
+                    packet.rtl433_id,
+                    *vehicle_id,
+                    &fp_id,
+                );
+            }
         }
 
         // Throttled eviction of stale tracker entries and unresolved buffer
@@ -351,22 +373,37 @@ impl Resolver {
             return;
         }
         for (interval_ms, ts) in intervals {
-            if let Err(e) = self.db.insert_interval_sample(
-                fingerprint_id,
-                vehicle_id,
-                &ts.to_rfc3339(),
-                interval_ms,
-                None,
-            ) {
-                eprintln!("warn: raw interval sample insert failed: {e}");
-                continue;
-            }
-            if let Err(e) = self
-                .db
-                .enforce_interval_ring_buffer(fingerprint_id, jitter::MAX_INTERVAL_SAMPLES)
-            {
-                eprintln!("warn: ring buffer enforce failed: {e}");
-            }
+            self.record_interval_sample(fingerprint_id, vehicle_id, interval_ms, ts);
+        }
+    }
+
+    /// Insert a single interval sample under `fingerprint_id` and enforce the
+    /// per-fingerprint ring-buffer cap.  Used both by the deferred-buffer
+    /// flush path (fixed-ID protocols) and by the direct-write path that
+    /// rolling-ID protocols take after the correlator resolves a vehicle in
+    /// the same `process()` call.
+    fn record_interval_sample(
+        &mut self,
+        fingerprint_id: &str,
+        vehicle_id: Uuid,
+        interval_ms: i64,
+        ts: DateTime<Utc>,
+    ) {
+        if let Err(e) = self.db.insert_interval_sample(
+            fingerprint_id,
+            vehicle_id,
+            &ts.to_rfc3339(),
+            interval_ms,
+            None,
+        ) {
+            eprintln!("warn: raw interval sample insert failed: {e}");
+            return;
+        }
+        if let Err(e) = self
+            .db
+            .enforce_interval_ring_buffer(fingerprint_id, jitter::MAX_INTERVAL_SAMPLES)
+        {
+            eprintln!("warn: ring buffer enforce failed: {e}");
         }
     }
 
@@ -2984,6 +3021,17 @@ mod tests {
             count, 11,
             "12 EezTire packets at 22 s spacing with 1-bit flips must produce \
              11 interval samples via Hamming-distance grouping (got {count})"
+        );
+        // Rolling-ID protocols must bypass the deferred buffer entirely:
+        // every interval is written directly under the resolved fingerprint
+        // in the same `process()` call.  Any leftover entries here would
+        // mean a `(sensor_id, rtl433_id)` push that no future packet can
+        // ever drain — i.e. the bug fixed alongside #44.
+        assert!(
+            resolver.raw_interval_buffer.is_empty(),
+            "rolling-ID intervals must not be left in the deferred buffer \
+             (got {} buffered samples)",
+            resolver.raw_interval_buffer.len()
         );
     }
 
