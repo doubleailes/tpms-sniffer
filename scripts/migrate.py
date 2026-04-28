@@ -275,6 +275,29 @@ UPDATE fingerprints SET
     jitter_updated_at = NULL;
 """
 
+MIGRATION_V13_DESCRIPTION = (
+    "add cfo_samples table and CFO columns to fingerprints (issue #45)"
+)
+# Issue #45: oscillator fingerprinting via Carrier Frequency Offset (CFO)
+# measured from raw IQ preambles.  CFO is ID-independent so it works for
+# rolling-ID protocols (EezTire, TRW) where Hamming-distance keying fails
+# in dense urban environments.
+MIGRATION_V13 = """
+CREATE TABLE IF NOT EXISTS cfo_samples (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_id   TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
+    ts               TEXT    NOT NULL,
+    cfo_hz           REAL    NOT NULL,
+    snr_db           REAL,
+    preamble_samples INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cfo_fp ON cfo_samples(fingerprint_id);
+ALTER TABLE fingerprints ADD COLUMN cfo_mean_hz    REAL;
+ALTER TABLE fingerprints ADD COLUMN cfo_sigma_hz   REAL;
+ALTER TABLE fingerprints ADD COLUMN cfo_samples    INTEGER;
+ALTER TABLE fingerprints ADD COLUMN cfo_updated_at TEXT;
+"""
+
 MIGRATIONS = [
     (1, MIGRATION_V1_DESCRIPTION, None),
     (2, MIGRATION_V2_DESCRIPTION, MIGRATION_V2),
@@ -288,6 +311,7 @@ MIGRATIONS = [
     (10, MIGRATION_V10_DESCRIPTION, MIGRATION_V10),
     (11, MIGRATION_V11_DESCRIPTION, MIGRATION_V11),
     (12, MIGRATION_V12_DESCRIPTION, MIGRATION_V12),
+    (13, MIGRATION_V13_DESCRIPTION, MIGRATION_V13),
 ]
  
 # ---------------------------------------------------------------------------
@@ -332,6 +356,7 @@ def row_counts(conn: sqlite3.Connection) -> dict:
         "session_log",
         "temporal_fingerprints",
         "interval_samples",
+        "cfo_samples",
         "schema_migrations",
     ]
     counts = {}

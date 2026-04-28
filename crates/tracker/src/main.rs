@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use log::info;
 use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
 use tpms_tracker::{
-    TpmsPacket, analytics, db::Database, jitter, replay, resolver::Resolver, server,
+    TpmsPacket, analytics, cfo, db::Database, jitter, replay, resolver::Resolver, server,
 };
 use tracing_subscriber::{fmt, fmt::MakeWriter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -308,6 +308,43 @@ async fn jitter_recompute_task(db_path: String) {
     }
 }
 
+/// Periodically recompute CFO statistics for all eligible fingerprints
+/// (issue #45).  Mirrors `jitter_recompute_task` but reads from
+/// `cfo_samples` and updates the CFO columns on `fingerprints`.
+async fn cfo_recompute_task(db_path: String) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            cfo::CFO_RECOMPUTE_INTERVAL_SECS,
+        ))
+        .await;
+
+        let result = tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            move || -> anyhow::Result<usize> {
+                let db = Database::open(&db_path)?;
+                let fp_ids = db.fingerprints_eligible_for_cfo_recompute(cfo::MIN_CFO_SAMPLES)?;
+                let mut updated = 0usize;
+                for fp_id in &fp_ids {
+                    let estimates = db.get_cfo_samples(fp_id, cfo::MAX_CFO_SAMPLES)?;
+                    if let Some(profile) = cfo::compute_cfo_profile(&estimates) {
+                        db.update_fingerprint_cfo(fp_id, &profile)?;
+                        updated += 1;
+                    }
+                }
+                Ok(updated)
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(n)) if n > 0 => eprintln!("cfo: recomputed profiles for {n} fingerprint(s)"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("cfo: recompute error: {e}"),
+            Err(e) => eprintln!("cfo: task panicked: {e}"),
+        }
+    }
+}
+
 /// Run the stdin ingestion loop alongside the HTTP dashboard server.
 async fn run_with_server(db: Database, args: &Args, addr: &str) -> Result<()> {
     let db_path = args.db.clone();
@@ -319,6 +356,7 @@ async fn run_with_server(db: Database, args: &Args, addr: &str) -> Result<()> {
     });
 
     tokio::spawn(jitter_recompute_task(args.db.clone()));
+    tokio::spawn(cfo_recompute_task(args.db.clone()));
 
     // Run the blocking stdin loop on a blocking thread so we don't starve
     // the tokio runtime.

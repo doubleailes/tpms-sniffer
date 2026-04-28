@@ -86,6 +86,12 @@ pub struct TpmsPacket {
     /// see `AVE_MIN_RELIABLE_KPA`). Downstream consumers (the tracker) should not
     /// update pressure fingerprints from packets with this flag unset.
     pub pressure_kpa_reliable: bool,
+    /// Carrier frequency offset (Hz) measured from the packet preamble, when
+    /// raw IQ samples were captured around the packet (issue #45 oscillator
+    /// fingerprinting).  `None` when CFO measurement is not available — older
+    /// JSON streams omit this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfo_hz: Option<f32>,
 }
 
 /// Minimum reliable AVE-TPMS pressure in kPa.
@@ -266,6 +272,7 @@ fn pkt(
         raw_hex: hex_bytes(raw),
         confidence: conf,
         pressure_kpa_reliable: true,
+        cfo_hz: None,
     }
 }
 

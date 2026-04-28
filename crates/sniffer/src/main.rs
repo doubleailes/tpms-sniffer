@@ -1,3 +1,8 @@
+// CFO estimator and IqWindow record (issue #45).  Currently exercised
+// by unit tests only — the IQ-capture path that feeds it into the
+// reporter / tracker JSON is a separate follow-up.
+#[allow(dead_code)]
+mod cfo;
 mod decoder;
 mod demod;
 mod framer;

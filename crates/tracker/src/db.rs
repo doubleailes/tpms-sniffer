@@ -320,6 +320,41 @@ impl Database {
             "#,
         )?;
 
+        // Migration: add cfo_samples table and CFO columns on fingerprints
+        // for issue #45 (oscillator fingerprinting via carrier frequency
+        // offset). Idempotent via pragma_table_info checks.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cfo_samples (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint_id   TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
+                ts               TEXT    NOT NULL,
+                cfo_hz           REAL    NOT NULL,
+                snr_db           REAL,
+                preamble_samples INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cfo_fp
+                ON cfo_samples(fingerprint_id);
+            "#,
+        )?;
+
+        let has_cfo_mean: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('fingerprints') WHERE name='cfo_mean_hz'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_cfo_mean == 0 {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE fingerprints ADD COLUMN cfo_mean_hz    REAL;
+                ALTER TABLE fingerprints ADD COLUMN cfo_sigma_hz   REAL;
+                ALTER TABLE fingerprints ADD COLUMN cfo_samples    INTEGER;
+                ALTER TABLE fingerprints ADD COLUMN cfo_updated_at TEXT;
+                "#,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1204,6 +1239,152 @@ impl Database {
     }
 
     // -----------------------------------------------------------------------
+    // CFO samples / oscillator fingerprint store (issue #45)
+    // -----------------------------------------------------------------------
+
+    /// Insert a CFO sample for a fingerprint.
+    pub fn insert_cfo_sample(
+        &self,
+        fingerprint_id: &str,
+        ts: &str,
+        cfo_hz: f32,
+        snr_db: Option<f32>,
+        preamble_samples: usize,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cfo_samples (fingerprint_id, ts, cfo_hz, snr_db, preamble_samples) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                fingerprint_id,
+                ts,
+                cfo_hz as f64,
+                snr_db.map(|v| v as f64),
+                preamble_samples as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the most recent CFO samples for a fingerprint, up to `limit`.
+    pub fn get_cfo_samples(&self, fingerprint_id: &str, limit: usize) -> Result<Vec<f32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cfo_hz FROM cfo_samples \
+             WHERE fingerprint_id = ?1 \
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let estimates = stmt
+            .query_map(params![fingerprint_id, limit as i64], |row| {
+                let v: f64 = row.get(0)?;
+                Ok(v as f32)
+            })?
+            .collect::<rusqlite::Result<Vec<f32>>>()?;
+        Ok(estimates)
+    }
+
+    /// Enforce the ring buffer limit on cfo_samples per fingerprint.
+    pub fn enforce_cfo_ring_buffer(
+        &self,
+        fingerprint_id: &str,
+        max_samples: usize,
+    ) -> Result<u64> {
+        let affected = self.conn.execute(
+            "DELETE FROM cfo_samples WHERE fingerprint_id = ?1 AND id NOT IN \
+             (SELECT id FROM cfo_samples WHERE fingerprint_id = ?1 \
+              ORDER BY id DESC LIMIT ?2)",
+            params![fingerprint_id, max_samples as i64],
+        )?;
+        Ok(affected as u64)
+    }
+
+    /// Update CFO running statistics on a fingerprint row.
+    pub fn update_fingerprint_cfo(
+        &self,
+        fingerprint_id: &str,
+        profile: &crate::cfo::CfoProfile,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE fingerprints SET \
+                cfo_mean_hz    = ?1, \
+                cfo_sigma_hz   = ?2, \
+                cfo_samples    = ?3, \
+                cfo_updated_at = ?4 \
+             WHERE fingerprint_id = ?5",
+            params![
+                profile.mean_hz as f64,
+                profile.sigma_hz as f64,
+                profile.samples as i64,
+                profile.updated_at.to_rfc3339(),
+                fingerprint_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get CFO profile for a fingerprint (if computed).
+    pub fn get_fingerprint_cfo(
+        &self,
+        fingerprint_id: &str,
+    ) -> Result<Option<crate::cfo::CfoProfile>> {
+        let result = self.conn.query_row(
+            "SELECT cfo_mean_hz, cfo_sigma_hz, cfo_samples, cfo_updated_at \
+             FROM fingerprints WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+            |row| {
+                let mean: Option<f64> = row.get(0)?;
+                let sigma: Option<f64> = row.get(1)?;
+                let samples: Option<i64> = row.get(2)?;
+                let updated: Option<String> = row.get(3)?;
+                match (mean, sigma, samples, updated) {
+                    (Some(m), Some(s), Some(n), Some(u)) => {
+                        let ts = chrono::DateTime::parse_from_rfc3339(&u)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now());
+                        Ok(Some(crate::cfo::CfoProfile {
+                            mean_hz: m as f32,
+                            sigma_hz: s as f32,
+                            samples: n as usize,
+                            updated_at: ts,
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            },
+        );
+        match result {
+            Ok(p) => Ok(p),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Count CFO samples for a fingerprint.
+    pub fn cfo_sample_count(&self, fingerprint_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM cfo_samples WHERE fingerprint_id = ?1",
+            params![fingerprint_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Return the IDs of all fingerprints that have at least `min_samples`
+    /// rows in cfo_samples and are eligible for CFO statistics recomputation.
+    pub fn fingerprints_eligible_for_cfo_recompute(
+        &self,
+        min_samples: usize,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fingerprint_id FROM cfo_samples \
+             GROUP BY fingerprint_id \
+             HAVING COUNT(*) >= ?1",
+        )?;
+        let fp_ids = stmt
+            .query_map(params![min_samples as i64], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(fp_ids)
+    }
+
+    // -----------------------------------------------------------------------
     // Temporal fingerprint store
     // -----------------------------------------------------------------------
 
@@ -1998,6 +2179,7 @@ mod tests {
             pressure_reliable: true,
             tx_interval_hint_ms: None,
             receiver_id: "default".to_string(),
+            cfo_hz: None,
         };
         let sighting2 = Sighting {
             ts: Utc.with_ymd_and_hms(2026, 4, 13, 10, 0, 0).unwrap(),
@@ -2288,5 +2470,112 @@ mod tests {
             count_after <= MAX_INTERVAL_SAMPLES,
             "ring buffer should cap rows at MAX_INTERVAL_SAMPLES; got {count_after}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CFO pipeline integration test (issue #45)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cfo_samples_table_and_index_exist() {
+        let db = test_db();
+        let table_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cfo_samples'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1, "cfo_samples table must exist");
+
+        let index_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cfo_fp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1, "idx_cfo_fp index must exist");
+
+        for col in ["cfo_mean_hz", "cfo_sigma_hz", "cfo_samples", "cfo_updated_at"] {
+            let has_col: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('fingerprints') WHERE name=?1",
+                    rusqlite::params![col],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_col, 1, "fingerprints column {col} must exist");
+        }
+    }
+
+    #[test]
+    fn cfo_pipeline_insert_samples_and_recompute() {
+        use crate::cfo::{MAX_CFO_SAMPLES, MIN_CFO_SAMPLES, compute_cfo_profile};
+
+        let db = test_db();
+
+        // Create a fingerprint to attach CFO samples to.
+        db.create_fingerprint(
+            "fp-cfo-integ",
+            241,
+            "PassengerCar",
+            352.3,
+            Some(22_000),
+            "2026-01-01T00:00:00+00:00",
+            false,
+        )
+        .unwrap();
+
+        // Simulate 30 CFO measurements clustered around +3,000 Hz with a
+        // ±50 Hz jitter — same-sensor behaviour with an RTL-SDR V3 TCXO.
+        for i in 0u32..30 {
+            let cfo_hz = 3_000.0 + ((i % 11) as f32 - 5.0) * 10.0;
+            let secs = i * 22;
+            let ts = format!(
+                "2026-01-01T{:02}:{:02}:{:02}+00:00",
+                secs / 3600,
+                (secs / 60) % 60,
+                secs % 60
+            );
+            db.insert_cfo_sample("fp-cfo-integ", &ts, cfo_hz, None, 64)
+                .unwrap();
+        }
+
+        assert_eq!(db.cfo_sample_count("fp-cfo-integ").unwrap(), 30);
+        let eligible = db
+            .fingerprints_eligible_for_cfo_recompute(MIN_CFO_SAMPLES)
+            .unwrap();
+        assert!(
+            eligible.contains(&"fp-cfo-integ".to_string()),
+            "fingerprint should be eligible for CFO recompute"
+        );
+
+        // Run the recompute step end-to-end and persist.
+        let samples = db.get_cfo_samples("fp-cfo-integ", MAX_CFO_SAMPLES).unwrap();
+        assert_eq!(samples.len(), 30);
+        let profile = compute_cfo_profile(&samples).expect("profile must compute");
+        db.update_fingerprint_cfo("fp-cfo-integ", &profile).unwrap();
+
+        let stored = db
+            .get_fingerprint_cfo("fp-cfo-integ")
+            .unwrap()
+            .expect("CFO profile must persist");
+        assert!(
+            (stored.mean_hz - 3_000.0).abs() < 100.0,
+            "stored mean ≈ 3 kHz, got {}",
+            stored.mean_hz
+        );
+        assert!(stored.sigma_hz < 200.0);
+        assert!(stored.samples >= MIN_CFO_SAMPLES);
+
+        // Ring buffer enforcement: insert past the cap and verify trimming.
+        // Use a tiny cap (5) for the test so we don't have to spam 10k rows.
+        db.enforce_cfo_ring_buffer("fp-cfo-integ", 5).unwrap();
+        let count_after = db.cfo_sample_count("fp-cfo-integ").unwrap();
+        assert_eq!(count_after, 5, "ring buffer cap must trim to 5 rows");
     }
 }

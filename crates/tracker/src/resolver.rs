@@ -318,7 +318,13 @@ impl Resolver {
             } else {
                 packet.receiver_id.clone()
             },
+            cfo_hz: packet.cfo_hz,
         };
+
+        // Capture CFO before `sighting` is consumed by the per-protocol
+        // process_* call so we can record the CFO sample once the
+        // resolver has a fingerprint to attach it to.
+        let cfo_for_sample = sighting.cfo_hz;
 
         let result = if BIT_FLIP_ID_PROTOCOLS.contains(&packet.rtl433_id) {
             self.process_fingerprint(sighting)
@@ -349,6 +355,14 @@ impl Resolver {
                     *vehicle_id,
                     &fp_id,
                 );
+            }
+
+            // Record the CFO sample under the resolved fingerprint, when the
+            // sniffer captured raw IQ for this packet (issue #45).  The
+            // background CFO recompute task aggregates these into running
+            // mean / σ on the fingerprints row.
+            if let Some(cfo_hz) = cfo_for_sample {
+                self.record_cfo_sample(&fp_id, ts, cfo_hz);
             }
         }
 
@@ -404,6 +418,38 @@ impl Resolver {
             .enforce_interval_ring_buffer(fingerprint_id, jitter::MAX_INTERVAL_SAMPLES)
         {
             eprintln!("warn: ring buffer enforce failed: {e}");
+        }
+    }
+
+    /// Insert a single CFO sample under `fingerprint_id` and enforce the
+    /// per-fingerprint ring-buffer cap (issue #45).  CFO samples come from
+    /// the sniffer's preamble IQ capture and are recorded once the resolver
+    /// has matched the packet to a fingerprint.
+    fn record_cfo_sample(
+        &mut self,
+        fingerprint_id: &str,
+        ts: DateTime<Utc>,
+        cfo_hz: f32,
+    ) {
+        // `preamble_samples` records the IQ window length used by the
+        // sniffer to compute this estimate; the sniffer side currently
+        // uses `cfo::PREAMBLE_SAMPLES` (64 samples at 250 kHz = 256 µs).
+        const PREAMBLE_SAMPLES: usize = 64;
+        if let Err(e) = self.db.insert_cfo_sample(
+            fingerprint_id,
+            &ts.to_rfc3339(),
+            cfo_hz,
+            None,
+            PREAMBLE_SAMPLES,
+        ) {
+            eprintln!("warn: cfo sample insert failed: {e}");
+            return;
+        }
+        if let Err(e) = self
+            .db
+            .enforce_cfo_ring_buffer(fingerprint_id, crate::cfo::MAX_CFO_SAMPLES)
+        {
+            eprintln!("warn: cfo ring buffer enforce failed: {e}");
         }
     }
 
@@ -1677,6 +1723,7 @@ mod tests {
             confidence: 90,
             pressure_kpa_reliable,
             receiver_id: "test".to_string(),
+            cfo_hz: None,
         }
     }
 
@@ -1700,6 +1747,7 @@ mod tests {
             confidence: 90,
             pressure_kpa_reliable: true,
             receiver_id: "test".to_string(),
+            cfo_hz: None,
         }
     }
 
