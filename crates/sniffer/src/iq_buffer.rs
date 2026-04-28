@@ -17,11 +17,21 @@
 
 /// Number of IQ samples retained in the ring buffer.
 ///
-/// At 250 kHz a single TPMS burst spans roughly (preamble + frame)
-/// × samples-per-symbol = (16 + 128) × 13 ≈ 1.9k samples.  We keep
-/// 8k samples (≈32 ms) to leave plenty of margin for cross-chunk
-/// bursts and short jitter in when the framer emits a frame.
-pub const IQ_RING_SAMPLES: usize = 8_192;
+/// At 250 kHz a single TPMS burst spans roughly (preamble + frame) ×
+/// samples-per-symbol = (16 + 128) × 13 ≈ 1.9k samples.  We keep
+/// 131,072 samples (≈524 ms, ≈256 KB at u8 IQ) to leave plenty of
+/// headroom over RTL-SDR USB chunk sizes.
+///
+/// Sizing rationale (issue #45 wiring fix): the framer can emit a
+/// frame whose preamble lies anywhere within the chunk that just
+/// completed, so by the time we look up an IQ window the preamble
+/// may be `(chunk_samples - frame_offset + burst_samples)` samples
+/// behind "now".  A typical RTL-SDR USB transfer is 8k–32k samples;
+/// retaining 131k samples (≥4× the largest realistic chunk size)
+/// guarantees the preamble is still in the buffer regardless of
+/// where in the chunk the frame appeared, eliminating the silent
+/// fallback that produced CFO ≡ 0 Hz across all fingerprints.
+pub const IQ_RING_SAMPLES: usize = 131_072;
 
 pub struct IqRingBuffer {
     /// Interleaved I,Q bytes.  Length is fixed at `capacity * 2`.
