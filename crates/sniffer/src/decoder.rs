@@ -32,6 +32,7 @@
 //  [299]  TRW FSK            FSK Manchester, 433 MHz
 // ============================================================
 
+use crate::cfo;
 use crate::manchester::{differential_manchester_decode, manchester_decode};
 use chrono::Local;
 use serde::Serialize;
@@ -86,6 +87,12 @@ pub struct TpmsPacket {
     /// see `AVE_MIN_RELIABLE_KPA`). Downstream consumers (the tracker) should not
     /// update pressure fingerprints from packets with this flag unset.
     pub pressure_kpa_reliable: bool,
+    /// Carrier frequency offset (Hz) measured from the packet preamble, when
+    /// raw IQ samples were captured around the packet (issue #45 oscillator
+    /// fingerprinting).  `None` when CFO measurement is not available — older
+    /// JSON streams omit this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfo_hz: Option<f32>,
 }
 
 /// Minimum reliable AVE-TPMS pressure in kPa.
@@ -111,7 +118,21 @@ pub const AVE_MIN_RELIABLE_KPA: f32 = 200.0;
 
 // ─── Entry point ─────────────────────────────────────────────
 
-pub fn decode(bits: &[u8], protocol: &TpmsProtocol, min_confidence: u8) -> Option<TpmsPacket> {
+/// Decode a frame's bits into a `TpmsPacket`.
+///
+/// `iq_window` and `sample_rate_hz`, when provided, supply the raw IQ
+/// samples spanning a portion of the burst that produced these bits.
+/// On a successful decode the autocorrelation CFO estimator is run
+/// against that window and the result is stamped on `pkt.cfo_hz`
+/// (issue #45).  When `iq_window` is `None` the packet's `cfo_hz`
+/// stays `None`, which is what older callers and tests expect.
+pub fn decode(
+    bits: &[u8],
+    iq_window: Option<&[f32]>,
+    sample_rate_hz: u32,
+    protocol: &TpmsProtocol,
+    min_confidence: u8,
+) -> Option<TpmsPacket> {
     let all: &[fn(&[u8]) -> Option<TpmsPacket>] = &[
         decode_ford,
         decode_citroen,
@@ -169,10 +190,22 @@ pub fn decode(bits: &[u8], protocol: &TpmsProtocol, min_confidence: u8) -> Optio
         TpmsProtocol::SolarTruck => vec![decode_solar_truck],
     };
 
-    fns.iter()
+    let mut pkt = fns
+        .iter()
         .filter_map(|f| f(bits))
         .filter(|p| p.confidence >= min_confidence)
-        .max_by_key(|p| p.confidence)
+        .max_by_key(|p| p.confidence)?;
+
+    // Stamp the carrier frequency offset onto the resulting packet
+    // when raw IQ samples are available.  The estimator is robust to
+    // partial-burst windows: the autocorrelation method tracks the
+    // dominant carrier energy and tolerates a small amount of
+    // silence at the edges of `iq_window`.
+    if let Some(window) = iq_window {
+        pkt.cfo_hz = cfo::estimate_cfo(window, sample_rate_hz);
+    }
+
+    Some(pkt)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -266,6 +299,7 @@ fn pkt(
         raw_hex: hex_bytes(raw),
         confidence: conf,
         pressure_kpa_reliable: true,
+        cfo_hz: None,
     }
 }
 
@@ -1295,6 +1329,76 @@ mod tests {
             (pkt.pressure_kpa - 255.0).abs() < 0.5,
             "expected ~255 kPa, got {}",
             pkt.pressure_kpa,
+        );
+    }
+
+    // ── CFO end-to-end regression (issue #45) ────────────────
+
+    /// Build a valid Hyundai Elantra (rtl433_id=140) 8-byte frame:
+    /// [ID:4][P:1][T:1][F:1][SUM:1].  The Elantra decoder uses a
+    /// byte-sum check; we set byte 7 to the sum of bytes 0..7.
+    fn elantra_frame(id: u32, pressure_kpa: u8, temp_byte: u8) -> Vec<u8> {
+        let id_bytes = id.to_be_bytes();
+        let mut frame = vec![
+            id_bytes[0],
+            id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
+            pressure_kpa,
+            temp_byte,
+            0x00,
+        ];
+        let sum = frame.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        frame.push(sum);
+        frame
+    }
+
+    /// Synthesise a complex tone at the given offset frequency,
+    /// returning interleaved I,Q f32 samples.
+    fn synth_tone(offset_hz: f32, fs: u32, n: usize) -> Vec<f32> {
+        use std::f32::consts::PI;
+        let mut out = Vec::with_capacity(n * 2);
+        let dphi = 2.0 * PI * offset_hz / fs as f32;
+        for k in 0..n {
+            let phi = dphi * k as f32;
+            out.push(phi.cos());
+            out.push(phi.sin());
+        }
+        out
+    }
+
+    #[test]
+    fn decode_stamps_cfo_from_iq_window() {
+        // Build a valid Elantra frame so the decoder produces a
+        // packet, then feed a +3,000 Hz synthetic carrier window
+        // alongside the bits.  The resulting packet must carry a
+        // `cfo_hz` field within ±100 Hz of the synthesised offset.
+        let frame = elantra_frame(0xAABBCCDD, 220, 75);
+        let bits = bytes_to_bits(&frame);
+        let iq = synth_tone(3_000.0, 250_000, super::cfo::PREAMBLE_SAMPLES);
+
+        let pkt = decode(&bits, Some(&iq), 250_000, &TpmsProtocol::Elantra, 50)
+            .expect("decode must succeed for a valid Elantra frame");
+
+        let cfo = pkt
+            .cfo_hz
+            .expect("cfo_hz must be populated when iq_window is provided");
+        assert!(
+            (cfo - 3_000.0).abs() < 100.0,
+            "expected cfo_hz ≈ 3000 Hz, got {cfo}"
+        );
+    }
+
+    #[test]
+    fn decode_leaves_cfo_none_without_iq_window() {
+        // Same valid frame, but no IQ window → cfo_hz must stay None.
+        let frame = elantra_frame(0xAABBCCDD, 220, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt =
+            decode(&bits, None, 250_000, &TpmsProtocol::Elantra, 50).expect("decode must succeed");
+        assert!(
+            pkt.cfo_hz.is_none(),
+            "cfo_hz should remain None when no IQ window is supplied"
         );
     }
 

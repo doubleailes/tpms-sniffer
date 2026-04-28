@@ -219,61 +219,186 @@ WHERE vehicle_id IN (
 );
 """
 
+# ---------------------------------------------------------------------------
+# Idempotent helpers used by callable migrations
+# ---------------------------------------------------------------------------
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def _add_columns_if_missing(
+    conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]
+) -> None:
+    """ALTER TABLE ... ADD COLUMN that skips columns already present.
+
+    SQLite has no `ADD COLUMN IF NOT EXISTS`, so we introspect
+    `pragma_table_info` first.  Mirrors the pattern used by db.rs's
+    in-process auto-migration, which is what makes a fresh
+    `schema_migrations` table possible on a database whose schema is
+    already at the latest level.
+    """
+    for col, col_def in columns:
+        if not _column_exists(conn, table, col):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+
+
+def _interval_samples_appears_post_fix(conn: sqlite3.Connection) -> bool:
+    """Heuristic for whether `interval_samples` data was collected under the
+    post-issue-#44 methodology.  The v11 and v12 wipes were one-shot
+    corrections at the time they were authored; running them on a database
+    that was created fresh under current code would destroy good data.
+
+    We treat data as post-fix when (a) any fingerprint has a populated
+    `jitter_updated_at` (a recompute has run, which only happens with the
+    current methodology), or (b) there are no `interval_samples` rows at all
+    (nothing to wipe).
+    """
+    try:
+        n_samples = conn.execute("SELECT COUNT(*) FROM interval_samples").fetchone()[0]
+    except sqlite3.OperationalError:
+        return True  # table does not exist yet; nothing to wipe
+    if n_samples == 0:
+        return True
+    if _column_exists(conn, "fingerprints", "jitter_updated_at"):
+        n_updated = conn.execute(
+            "SELECT COUNT(*) FROM fingerprints WHERE jitter_updated_at IS NOT NULL"
+        ).fetchone()[0]
+        if n_updated > 0:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Schema migrations v10–v13 (callable form, idempotent)
+# ---------------------------------------------------------------------------
+
 MIGRATION_V10_DESCRIPTION = "add interval_samples table and jitter columns to fingerprints"
-MIGRATION_V10 = """
-ALTER TABLE fingerprints ADD COLUMN jitter_sigma_ms   REAL;
-ALTER TABLE fingerprints ADD COLUMN jitter_skewness   REAL;
-ALTER TABLE fingerprints ADD COLUMN jitter_kurtosis   REAL;
-ALTER TABLE fingerprints ADD COLUMN jitter_acf_lag1   REAL;
-ALTER TABLE fingerprints ADD COLUMN jitter_samples    INTEGER;
-ALTER TABLE fingerprints ADD COLUMN jitter_updated_at TEXT;
-CREATE TABLE IF NOT EXISTS interval_samples (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint_id TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
-    vehicle_id     TEXT    NOT NULL REFERENCES vehicles(vehicle_id),
-    ts             TEXT    NOT NULL,
-    interval_ms    INTEGER NOT NULL,
-    session_id     INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_interval_fp
-    ON interval_samples(fingerprint_id);
-CREATE INDEX IF NOT EXISTS idx_interval_ts
-    ON interval_samples(ts);
-"""
+
+
+def _migration_v10(conn: sqlite3.Connection) -> None:
+    _add_columns_if_missing(
+        conn,
+        "fingerprints",
+        [
+            ("jitter_sigma_ms", "REAL"),
+            ("jitter_skewness", "REAL"),
+            ("jitter_kurtosis", "REAL"),
+            ("jitter_acf_lag1", "REAL"),
+            ("jitter_samples", "INTEGER"),
+            ("jitter_updated_at", "TEXT"),
+        ],
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS interval_samples (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint_id TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
+            vehicle_id     TEXT    NOT NULL REFERENCES vehicles(vehicle_id),
+            ts             TEXT    NOT NULL,
+            interval_ms    INTEGER NOT NULL,
+            session_id     INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_interval_fp ON interval_samples(fingerprint_id);
+        CREATE INDEX IF NOT EXISTS idx_interval_ts ON interval_samples(ts);
+        """
+    )
+
 
 MIGRATION_V11_DESCRIPTION = (
     "clear interval_samples and jitter columns: methodology fix (issue #43)"
 )
-MIGRATION_V11 = """
-DELETE FROM interval_samples;
-UPDATE fingerprints SET
-    jitter_sigma_ms   = NULL,
-    jitter_skewness   = NULL,
-    jitter_kurtosis   = NULL,
-    jitter_acf_lag1   = NULL,
-    jitter_samples    = NULL,
-    jitter_updated_at = NULL;
-"""
+
+
+def _migration_v11(conn: sqlite3.Connection) -> None:
+    # Skip the wipe when the database was created fresh under post-fix code:
+    # destroying good data would be far worse than re-stamping the version.
+    if _interval_samples_appears_post_fix(conn):
+        log(
+            "    skipping wipe — interval_samples already appears post-fix; "
+            "stamping v11 without data changes"
+        )
+        return
+    conn.executescript(
+        """
+        DELETE FROM interval_samples;
+        UPDATE fingerprints SET
+            jitter_sigma_ms   = NULL,
+            jitter_skewness   = NULL,
+            jitter_kurtosis   = NULL,
+            jitter_acf_lag1   = NULL,
+            jitter_samples    = NULL,
+            jitter_updated_at = NULL;
+        """
+    )
+
 
 MIGRATION_V12_DESCRIPTION = (
     "clear interval_samples and jitter columns: multi-slot rolling buffer (issue #44)"
 )
-# Issue #44: the single-slot RollingIntervalTracker is replaced by a
-# multi-slot buffered tracker.  Any rolling-ID intervals collected before
-# this fix were dominated by cross-sensor pairs in dense environments
-# (uniform-noise histogram, SNR ≈ 0).  Wipe the contaminated samples and
-# null out the derived jitter columns so they can be recomputed under the
-# new methodology.
-MIGRATION_V12 = """
-DELETE FROM interval_samples;
-UPDATE fingerprints SET
-    jitter_sigma_ms   = NULL,
-    jitter_skewness   = NULL,
-    jitter_kurtosis   = NULL,
-    jitter_acf_lag1   = NULL,
-    jitter_samples    = NULL,
-    jitter_updated_at = NULL;
-"""
+
+
+def _migration_v12(conn: sqlite3.Connection) -> None:
+    # Issue #44: the single-slot RollingIntervalTracker is replaced by a
+    # multi-slot buffered tracker.  Any rolling-ID intervals collected
+    # before this fix were dominated by cross-sensor pairs in dense
+    # environments (uniform-noise histogram, SNR ≈ 0).  Wipe contaminated
+    # samples and null out derived jitter columns — but only when the data
+    # is actually pre-fix.  See `_interval_samples_appears_post_fix`.
+    if _interval_samples_appears_post_fix(conn):
+        log(
+            "    skipping wipe — interval_samples already appears post-fix; "
+            "stamping v12 without data changes"
+        )
+        return
+    conn.executescript(
+        """
+        DELETE FROM interval_samples;
+        UPDATE fingerprints SET
+            jitter_sigma_ms   = NULL,
+            jitter_skewness   = NULL,
+            jitter_kurtosis   = NULL,
+            jitter_acf_lag1   = NULL,
+            jitter_samples    = NULL,
+            jitter_updated_at = NULL;
+        """
+    )
+
+
+MIGRATION_V13_DESCRIPTION = (
+    "add cfo_samples table and CFO columns to fingerprints (issue #45)"
+)
+
+
+def _migration_v13(conn: sqlite3.Connection) -> None:
+    # Issue #45: oscillator fingerprinting via Carrier Frequency Offset
+    # (CFO) measured from raw IQ preambles.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS cfo_samples (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint_id   TEXT    NOT NULL REFERENCES fingerprints(fingerprint_id),
+            ts               TEXT    NOT NULL,
+            cfo_hz           REAL    NOT NULL,
+            snr_db           REAL,
+            preamble_samples INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cfo_fp ON cfo_samples(fingerprint_id);
+        """
+    )
+    _add_columns_if_missing(
+        conn,
+        "fingerprints",
+        [
+            ("cfo_mean_hz", "REAL"),
+            ("cfo_sigma_hz", "REAL"),
+            ("cfo_samples", "INTEGER"),
+            ("cfo_updated_at", "TEXT"),
+        ],
+    )
+
 
 MIGRATIONS = [
     (1, MIGRATION_V1_DESCRIPTION, None),
@@ -285,9 +410,10 @@ MIGRATIONS = [
     (7, MIGRATION_V7_DESCRIPTION, MIGRATION_V7),
     (8, MIGRATION_V8_DESCRIPTION, MIGRATION_V8),
     (9, MIGRATION_V9_DESCRIPTION, MIGRATION_V9),
-    (10, MIGRATION_V10_DESCRIPTION, MIGRATION_V10),
-    (11, MIGRATION_V11_DESCRIPTION, MIGRATION_V11),
-    (12, MIGRATION_V12_DESCRIPTION, MIGRATION_V12),
+    (10, MIGRATION_V10_DESCRIPTION, _migration_v10),
+    (11, MIGRATION_V11_DESCRIPTION, _migration_v11),
+    (12, MIGRATION_V12_DESCRIPTION, _migration_v12),
+    (13, MIGRATION_V13_DESCRIPTION, _migration_v13),
 ]
  
 # ---------------------------------------------------------------------------
@@ -332,6 +458,7 @@ def row_counts(conn: sqlite3.Connection) -> dict:
         "session_log",
         "temporal_fingerprints",
         "interval_samples",
+        "cfo_samples",
         "schema_migrations",
     ]
     counts = {}
@@ -362,17 +489,36 @@ def run_step(
     conn: sqlite3.Connection,
     version: int,
     description: str,
-    sql: str | None,
+    body,
     dry_run: bool,
 ) -> None:
+    """Apply one migration step.
+
+    `body` may be:
+      • `None`              — version-stamp only (no schema/data change)
+      • `str`               — raw SQL, statements separated by `;`
+      • callable(conn)      — Python function that does the work
+        idempotently, e.g. for ALTER TABLE ADD COLUMN that needs
+        pragma_table_info introspection.
+    """
     log(f"  Applying migration v{version}: {description}", dry_run)
- 
-    if sql is None:
+
+    if body is None:
         if not dry_run:
             stamp(conn, version, description)
             conn.commit()
         return
- 
+
+    if callable(body):
+        if dry_run:
+            print(f"    PY> {body.__name__}(conn)  (idempotent)")
+            return
+        with conn:
+            body(conn)
+            stamp(conn, version, description)
+        return
+
+    sql = body
     if dry_run:
         preview = sql.strip().splitlines()
         for line in preview[:20]:
@@ -380,20 +526,20 @@ def run_step(
         if len(preview) > 20:
             print(f"    SQL> ... ({len(preview) - 20} more lines)")
         return
- 
+
     statements = [s.strip() for s in sql.split(";") if s.strip()]
     # PRAGMAs must run outside the transaction
     pragmas = [s for s in statements if s.upper().startswith("PRAGMA")]
     rest = [s for s in statements if not s.upper().startswith("PRAGMA")]
- 
+
     for pragma in [p for p in pragmas if "OFF" in p.upper()]:
         conn.execute(pragma)
- 
+
     with conn:
         for stmt in rest:
             conn.execute(stmt)
         stamp(conn, version, description)
- 
+
     for pragma in [p for p in pragmas if "ON" in p.upper()]:
         conn.execute(pragma)
  
