@@ -1,11 +1,14 @@
-// CFO estimator and IqWindow record (issue #45).  Currently exercised
-// by unit tests only — the IQ-capture path that feeds it into the
-// reporter / tracker JSON is a separate follow-up.
+// `cfo` exposes more surface (constants, IqWindow, refine_cfo) than the
+// sniffer binary itself consumes — `estimate_cfo` and `PREAMBLE_SAMPLES`
+// are the only items the live pipeline needs.  The rest are public API
+// for the tracker and unit tests, so silence dead-code warnings here.
 #[allow(dead_code)]
 mod cfo;
 mod decoder;
 mod demod;
 mod framer;
+#[allow(dead_code)]
+mod iq_buffer;
 mod manchester;
 mod reporter;
 
@@ -136,6 +139,12 @@ async fn main() -> anyhow::Result<()> {
     let mut ook_demod = demod::OokDemod::new(args.rate);
     let mut fsk_demod = demod::FskDemod::new(args.rate);
     let mut framer = framer::Framer::new();
+    let mut iq_ring = iq_buffer::IqRingBuffer::new(iq_buffer::IQ_RING_SAMPLES);
+
+    // Per-symbol sample count at the configured rate (used to size the
+    // IQ window pulled out of the ring buffer for CFO estimation).
+    // Schrader-family symbol rate is 52 µs.
+    let sps = ((args.rate as f32 * 52e-6) as usize).max(1);
 
     let start = Instant::now();
     while let Some(Ok(chunk)) = stream.next().await {
@@ -145,13 +154,40 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Capture the raw IQ samples *before* demod consumes them.
+        iq_ring.push_chunk(&chunk);
+
         let bits_ook = ook_demod.process(&chunk);
         let bits_fsk = fsk_demod.process(&chunk);
 
         for bits in [bits_ook, bits_fsk] {
             let frames = framer.feed(&bits);
             for frame in frames {
-                if let Some(pkt) = decoder::decode(&frame, &protocol, args.confidence) {
+                // Build the IQ window for CFO measurement.  The frame
+                // body is `frame.len()` bits long, and the alternating
+                // preamble that triggered framing was at least 16 bits
+                // ahead of it.  We pull `PREAMBLE_SAMPLES` samples
+                // starting from the *beginning* of that span so the
+                // window lands inside the carrier rather than in the
+                // post-burst silence.  CFO is constant across the
+                // burst, so any sub-window of the carrier is fine.
+                let burst_samples = (frame.len() + 16) * sps;
+                let iq_window = iq_ring
+                    .extract_window(burst_samples, cfo::PREAMBLE_SAMPLES)
+                    .or_else(|| {
+                        // Fall back to the trailing portion of the
+                        // ring buffer if the burst extends further
+                        // back than the buffer can serve.
+                        iq_ring.extract_window(0, cfo::PREAMBLE_SAMPLES)
+                    });
+
+                if let Some(pkt) = decoder::decode(
+                    &frame,
+                    iq_window.as_deref(),
+                    args.rate,
+                    &protocol,
+                    args.confidence,
+                ) {
                     reporter.report(&pkt);
                 }
             }
