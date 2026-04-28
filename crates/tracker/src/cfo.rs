@@ -113,11 +113,7 @@ pub fn compute_cfo_profile(estimates: &[f32]) -> Option<CfoProfile> {
 
     let nf = filtered.len() as f32;
     let mean_f = filtered.iter().sum::<f32>() / nf;
-    let var_f = filtered
-        .iter()
-        .map(|&x| (x - mean_f).powi(2))
-        .sum::<f32>()
-        / nf;
+    let var_f = filtered.iter().map(|&x| (x - mean_f).powi(2)).sum::<f32>() / nf;
     let sigma_f = var_f.sqrt();
 
     Some(CfoProfile {

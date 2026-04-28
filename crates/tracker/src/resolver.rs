@@ -425,12 +425,7 @@ impl Resolver {
     /// per-fingerprint ring-buffer cap (issue #45).  CFO samples come from
     /// the sniffer's preamble IQ capture and are recorded once the resolver
     /// has matched the packet to a fingerprint.
-    fn record_cfo_sample(
-        &mut self,
-        fingerprint_id: &str,
-        ts: DateTime<Utc>,
-        cfo_hz: f32,
-    ) {
+    fn record_cfo_sample(&mut self, fingerprint_id: &str, ts: DateTime<Utc>, cfo_hz: f32) {
         // `preamble_samples` records the IQ window length used by the
         // sniffer to compute this estimate; the sniffer side currently
         // uses `cfo::PREAMBLE_SAMPLES` (64 samples at 250 kHz = 256 µs).

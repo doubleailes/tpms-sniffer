@@ -1282,11 +1282,7 @@ impl Database {
     }
 
     /// Enforce the ring buffer limit on cfo_samples per fingerprint.
-    pub fn enforce_cfo_ring_buffer(
-        &self,
-        fingerprint_id: &str,
-        max_samples: usize,
-    ) -> Result<u64> {
+    pub fn enforce_cfo_ring_buffer(&self, fingerprint_id: &str, max_samples: usize) -> Result<u64> {
         let affected = self.conn.execute(
             "DELETE FROM cfo_samples WHERE fingerprint_id = ?1 AND id NOT IN \
              (SELECT id FROM cfo_samples WHERE fingerprint_id = ?1 \
@@ -2499,7 +2495,12 @@ mod tests {
             .unwrap();
         assert_eq!(index_count, 1, "idx_cfo_fp index must exist");
 
-        for col in ["cfo_mean_hz", "cfo_sigma_hz", "cfo_samples", "cfo_updated_at"] {
+        for col in [
+            "cfo_mean_hz",
+            "cfo_sigma_hz",
+            "cfo_samples",
+            "cfo_updated_at",
+        ] {
             let has_col: i64 = db
                 .conn
                 .query_row(
