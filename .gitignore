@@ -5,3 +5,4 @@ logs/
 *.log.*
 start.sh
 __pycache__/
+main.pdf
