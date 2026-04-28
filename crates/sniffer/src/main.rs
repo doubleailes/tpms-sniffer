@@ -7,7 +7,12 @@ mod cfo;
 mod decoder;
 mod demod;
 mod framer;
-#[allow(dead_code)]
+// `iq_buffer` is no longer used by the live pipeline (RTL-SDR chunks are
+// large enough — ~131k samples — that any TPMS burst lives entirely
+// within the current chunk, so we slice directly from `chunk` instead
+// of accumulating across chunks).  The module stays compiled under cfg
+// test so its existing unit tests still run.
+#[cfg(test)]
 mod iq_buffer;
 mod manchester;
 mod reporter;
@@ -139,11 +144,9 @@ async fn main() -> anyhow::Result<()> {
     let mut ook_demod = demod::OokDemod::new(args.rate);
     let mut fsk_demod = demod::FskDemod::new(args.rate);
     let mut framer = framer::Framer::new();
-    let mut iq_ring = iq_buffer::IqRingBuffer::new(iq_buffer::IQ_RING_SAMPLES);
 
-    // Per-symbol sample count at the configured rate (used to size the
-    // IQ window pulled out of the ring buffer for CFO estimation).
-    // Schrader-family symbol rate is 52 µs.
+    // Per-symbol sample count at the configured rate.  Schrader-family
+    // symbol rate is 52 µs (≈13 samples at 250 kHz).
     let sps = ((args.rate as f32 * 52e-6) as usize).max(1);
 
     let start = Instant::now();
@@ -154,37 +157,48 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Capture the raw IQ samples *before* demod consumes them.
-        iq_ring.push_chunk(&chunk);
-        let chunk_samples = chunk.len() / 2;
-
         let bits_ook = ook_demod.process(&chunk);
         let bits_fsk = fsk_demod.process(&chunk);
 
         for bits in [bits_ook, bits_fsk] {
             let frames = framer.feed(&bits);
             for frame in frames {
-                // Locate the preamble's IQ samples in the ring buffer.
-                // The framer reports the chunk-relative sample index of
-                // the frame's *last* bit; from there we walk back over
-                // the frame body plus the alternating preamble (≥16
-                // bits) to land on the start of the burst.
+                // Slice the preamble's IQ samples directly out of the
+                // current chunk.  RTL-SDR delivers ~131k-sample chunks
+                // and a TPMS burst is only ~1.1k samples, so the
+                // preamble is almost always in the same chunk as the
+                // frame body.  Walk back from the frame's last bit
+                // over the body to land on the preamble's tail, then
+                // take the trailing PREAMBLE_SAMPLES.
                 //
-                // samples_back is measured from "now" (which is the
-                // end of the chunk we just pushed):
-                //   samples_back =
-                //       (chunk_samples - last_bit_sample_idx)        // post-burst tail in chunk
-                //     + (frame.bits.len() + 16) * sps                // burst length
-                //
-                // The fallback to "last 64 samples" is intentionally
-                // gone — it always landed in post-burst silence and
-                // produced CFO ≡ 0 Hz.  Skipping CFO when the window
-                // can't be extracted is the correct behaviour.
-                let samples_since_end =
-                    chunk_samples.saturating_sub(frame.last_bit_sample_idx as usize);
-                let burst_samples = (frame.bits.len() + 16) * sps;
-                let samples_back = samples_since_end + burst_samples;
-                let iq_window = iq_ring.extract_window(samples_back, cfo::PREAMBLE_SAMPLES);
+                // The previous IQ ring buffer was always 99 % silence
+                // (TPMS bursts are sparse — one every 22–40 s at
+                // 250 kS/s) and the `samples_back` math kept landing
+                // on inter-packet DC, producing CFO ≡ 0 Hz.
+                let last = frame.last_bit_sample_idx as usize;
+                let body_samples = frame.bits.len() * sps;
+                let needed = body_samples + cfo::PREAMBLE_SAMPLES;
+                let iq_window: Option<Vec<f32>> = if last >= needed {
+                    let preamble_end = last - body_samples;
+                    let preamble_start = preamble_end - cfo::PREAMBLE_SAMPLES;
+                    let start_byte = preamble_start * 2;
+                    let end_byte = preamble_end * 2;
+                    if end_byte <= chunk.len() {
+                        Some(
+                            chunk[start_byte..end_byte]
+                                .iter()
+                                .map(|&b| b as f32 - 127.5)
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    // The burst started in the previous chunk; we no
+                    // longer have those IQ samples.  Skip CFO for this
+                    // packet rather than measuring silence.
+                    None
+                };
 
                 if let Some(pkt) = decoder::decode(
                     &frame.bits,
@@ -208,14 +222,24 @@ async fn main() -> anyhow::Result<()> {
 //  Synthesises a u8 IQ chunk containing an alternating-bit
 //  preamble followed by 128 random bits, all riding a known
 //  +3,000 Hz carrier offset.  Runs the chunk through the live
-//  OokDemod → Framer → IqRingBuffer chain exactly as `main`
-//  does, then verifies that the IQ window returned by
-//  `extract_window` produces a CFO estimate within ±200 Hz of
-//  the synthesised offset.
+//  OokDemod → Framer chain exactly as `main` does, then verifies
+//  that the preamble window sliced from the chunk produces a
+//  CFO estimate within ±200 Hz of the synthesised offset.
 //
-//  This test catches the regression where `samples_back` was
-//  computed without `frame.last_bit_sample_idx`, causing the
-//  preamble window to land in post-burst silence and CFO ≡ 0.
+//  These tests catch two regressions in turn:
+//   1. samples_back computed without `frame.last_bit_sample_idx`
+//      → preamble window landed in post-burst silence in this
+//      chunk;
+//   2. samples_back drawn from a cross-chunk ring buffer
+//      → in real captures the IQ ring buffer was 99 % silence
+//      because TPMS bursts arrive once every 22–40 s, so the
+//      window landed on the *previous* chunk's silence regardless
+//      of where in the current chunk the burst appeared.
+//
+//  The fix slices directly from the chunk we just received, which
+//  is always large enough (typical RTL-SDR transfer ≥ 32 ms at
+//  250 kS/s ≈ 8k samples) to contain the entire ~1.1k-sample
+//  burst plus its preamble.
 // ============================================================
 #[cfg(test)]
 mod cfo_pipeline_tests {
@@ -267,24 +291,35 @@ mod cfo_pipeline_tests {
     }
 
     /// Run a single chunk through the live OokDemod → Framer
-    /// → IqRingBuffer chain and return any CFO estimate
-    /// computed from the first frame the framer emits.
+    /// chain, slice the preamble window directly out of the
+    /// chunk (matching the production path in `main`), and
+    /// return the CFO estimate for the first frame emitted.
     fn run_pipeline(chunk: &[u8]) -> Option<f32> {
         let mut ook = demod::OokDemod::new(FS);
         let mut framer = framer::Framer::new();
-        let mut ring = iq_buffer::IqRingBuffer::new(iq_buffer::IQ_RING_SAMPLES);
         let sps = ((FS as f32 * SYMBOL_US / 1e6) as usize).max(1);
 
-        ring.push_chunk(chunk);
-        let chunk_samples = chunk.len() / 2;
         let bits = ook.process(chunk);
         let frames = framer.feed(&bits);
 
         let frame = frames.into_iter().next()?;
-        let samples_since_end = chunk_samples.saturating_sub(frame.last_bit_sample_idx as usize);
-        let burst_samples = (frame.bits.len() + 16) * sps;
-        let samples_back = samples_since_end + burst_samples;
-        let win = ring.extract_window(samples_back, cfo::PREAMBLE_SAMPLES)?;
+        let last = frame.last_bit_sample_idx as usize;
+        let body_samples = frame.bits.len() * sps;
+        let needed = body_samples + cfo::PREAMBLE_SAMPLES;
+        if last < needed {
+            return None;
+        }
+        let preamble_end = last - body_samples;
+        let preamble_start = preamble_end - cfo::PREAMBLE_SAMPLES;
+        let start_byte = preamble_start * 2;
+        let end_byte = preamble_end * 2;
+        if end_byte > chunk.len() {
+            return None;
+        }
+        let win: Vec<f32> = chunk[start_byte..end_byte]
+            .iter()
+            .map(|&b| b as f32 - 127.5)
+            .collect();
         cfo::estimate_cfo(&win, FS)
     }
 
@@ -295,8 +330,7 @@ mod cfo_pipeline_tests {
     #[test]
     fn frame_at_chunk_end_recovers_cfo() {
         // Burst sits at the very end of the chunk: ~no post-burst
-        // silence.  This is the case the old (broken) code already
-        // handled accidentally, included as a baseline.
+        // silence.  Baseline regression check.
         let mut bits = alt_preamble(20);
         bits.extend(std::iter::repeat(1u8).take(128));
         let chunk = synth_chunk(&bits, 1024, 0);
@@ -310,9 +344,8 @@ mod cfo_pipeline_tests {
     #[test]
     fn frame_in_middle_of_chunk_recovers_cfo() {
         // Burst sits in the middle of a long chunk with significant
-        // post-burst silence.  Without the `last_bit_sample_idx`
-        // fix the IQ window lands in this trailing silence and the
-        // estimator returns 0 Hz exactly.
+        // post-burst silence.  Earlier ring-buffer-based code landed
+        // here in trailing silence and reported 0 Hz exactly.
         let mut bits = alt_preamble(20);
         bits.extend(std::iter::repeat(1u8).take(128));
         let chunk = synth_chunk(&bits, 512, 4_096);
@@ -324,6 +357,23 @@ mod cfo_pipeline_tests {
         assert!(
             (cfo - CFO_HZ).abs() < 200.0,
             "frame in middle of chunk: expected ≈{CFO_HZ} Hz, got {cfo}"
+        );
+    }
+
+    #[test]
+    fn realistic_sparse_chunk_recovers_cfo() {
+        // Mimics the field condition that produced CFO ≡ 0 Hz under
+        // the ring-buffer approach: a 131k-sample chunk with a tiny
+        // burst near the start and 100k+ samples of inter-packet
+        // silence afterwards.  Direct chunk slicing must still find
+        // the preamble.
+        let mut bits = alt_preamble(20);
+        bits.extend(std::iter::repeat(1u8).take(128));
+        let chunk = synth_chunk(&bits, 1_024, 128_000);
+        let cfo = run_pipeline(&chunk).expect("pipeline must produce a CFO estimate");
+        assert!(
+            (cfo - CFO_HZ).abs() < 200.0,
+            "realistic sparse chunk: expected ≈{CFO_HZ} Hz, got {cfo}"
         );
     }
 }
