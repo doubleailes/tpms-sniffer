@@ -156,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Capture the raw IQ samples *before* demod consumes them.
         iq_ring.push_chunk(&chunk);
+        let chunk_samples = chunk.len() / 2;
 
         let bits_ook = ook_demod.process(&chunk);
         let bits_fsk = fsk_demod.process(&chunk);
@@ -163,26 +164,30 @@ async fn main() -> anyhow::Result<()> {
         for bits in [bits_ook, bits_fsk] {
             let frames = framer.feed(&bits);
             for frame in frames {
-                // Build the IQ window for CFO measurement.  The frame
-                // body is `frame.len()` bits long, and the alternating
-                // preamble that triggered framing was at least 16 bits
-                // ahead of it.  We pull `PREAMBLE_SAMPLES` samples
-                // starting from the *beginning* of that span so the
-                // window lands inside the carrier rather than in the
-                // post-burst silence.  CFO is constant across the
-                // burst, so any sub-window of the carrier is fine.
-                let burst_samples = (frame.len() + 16) * sps;
-                let iq_window = iq_ring
-                    .extract_window(burst_samples, cfo::PREAMBLE_SAMPLES)
-                    .or_else(|| {
-                        // Fall back to the trailing portion of the
-                        // ring buffer if the burst extends further
-                        // back than the buffer can serve.
-                        iq_ring.extract_window(0, cfo::PREAMBLE_SAMPLES)
-                    });
+                // Locate the preamble's IQ samples in the ring buffer.
+                // The framer reports the chunk-relative sample index of
+                // the frame's *last* bit; from there we walk back over
+                // the frame body plus the alternating preamble (≥16
+                // bits) to land on the start of the burst.
+                //
+                // samples_back is measured from "now" (which is the
+                // end of the chunk we just pushed):
+                //   samples_back =
+                //       (chunk_samples - last_bit_sample_idx)        // post-burst tail in chunk
+                //     + (frame.bits.len() + 16) * sps                // burst length
+                //
+                // The fallback to "last 64 samples" is intentionally
+                // gone — it always landed in post-burst silence and
+                // produced CFO ≡ 0 Hz.  Skipping CFO when the window
+                // can't be extracted is the correct behaviour.
+                let samples_since_end =
+                    chunk_samples.saturating_sub(frame.last_bit_sample_idx as usize);
+                let burst_samples = (frame.bits.len() + 16) * sps;
+                let samples_back = samples_since_end + burst_samples;
+                let iq_window = iq_ring.extract_window(samples_back, cfo::PREAMBLE_SAMPLES);
 
                 if let Some(pkt) = decoder::decode(
-                    &frame,
+                    &frame.bits,
                     iq_window.as_deref(),
                     args.rate,
                     &protocol,
@@ -195,4 +200,130 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================
+//  End-to-end CFO pipeline regression test (issue #45)
+//
+//  Synthesises a u8 IQ chunk containing an alternating-bit
+//  preamble followed by 128 random bits, all riding a known
+//  +3,000 Hz carrier offset.  Runs the chunk through the live
+//  OokDemod → Framer → IqRingBuffer chain exactly as `main`
+//  does, then verifies that the IQ window returned by
+//  `extract_window` produces a CFO estimate within ±200 Hz of
+//  the synthesised offset.
+//
+//  This test catches the regression where `samples_back` was
+//  computed without `frame.last_bit_sample_idx`, causing the
+//  preamble window to land in post-burst silence and CFO ≡ 0.
+// ============================================================
+#[cfg(test)]
+mod cfo_pipeline_tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    const FS: u32 = 250_000;
+    const SYMBOL_US: f32 = 52.0;
+    const CFO_HZ: f32 = 3_000.0;
+
+    /// Synthesise a u8 IQ chunk: `silence_before` samples of DC
+    /// noise, then a burst of `bit_pattern` modulated as OOK at
+    /// 52 µs/bit on a +CFO_HZ carrier, then `silence_after`
+    /// samples of DC.  Returns interleaved u8 IQ bytes.
+    fn synth_chunk(bit_pattern: &[u8], silence_before: usize, silence_after: usize) -> Vec<u8> {
+        let sps = (FS as f32 * SYMBOL_US / 1e6) as usize; // ≈13
+        let burst_samples = bit_pattern.len() * sps;
+        let total = silence_before + burst_samples + silence_after;
+        let mut bytes = Vec::with_capacity(total * 2);
+
+        // Pre-burst silence at DC.
+        for _ in 0..silence_before {
+            bytes.push(127);
+            bytes.push(127);
+        }
+
+        // Modulated burst.  "1" bits transmit the offset carrier
+        // at full amplitude; "0" bits are at the noise floor.
+        let dphi = 2.0 * PI * CFO_HZ / FS as f32;
+        for (b_idx, &b) in bit_pattern.iter().enumerate() {
+            for s in 0..sps {
+                let n = silence_before + b_idx * sps + s;
+                let phi = dphi * n as f32;
+                let amp = if b == 1 { 100.0 } else { 0.0 };
+                let i = (127.5 + amp * phi.cos()).clamp(0.0, 255.0) as u8;
+                let q = (127.5 + amp * phi.sin()).clamp(0.0, 255.0) as u8;
+                bytes.push(i);
+                bytes.push(q);
+            }
+        }
+
+        // Post-burst silence at DC.
+        for _ in 0..silence_after {
+            bytes.push(127);
+            bytes.push(127);
+        }
+
+        bytes
+    }
+
+    /// Run a single chunk through the live OokDemod → Framer
+    /// → IqRingBuffer chain and return any CFO estimate
+    /// computed from the first frame the framer emits.
+    fn run_pipeline(chunk: &[u8]) -> Option<f32> {
+        let mut ook = demod::OokDemod::new(FS);
+        let mut framer = framer::Framer::new();
+        let mut ring = iq_buffer::IqRingBuffer::new(iq_buffer::IQ_RING_SAMPLES);
+        let sps = ((FS as f32 * SYMBOL_US / 1e6) as usize).max(1);
+
+        ring.push_chunk(chunk);
+        let chunk_samples = chunk.len() / 2;
+        let bits = ook.process(chunk);
+        let frames = framer.feed(&bits);
+
+        let frame = frames.into_iter().next()?;
+        let samples_since_end = chunk_samples.saturating_sub(frame.last_bit_sample_idx as usize);
+        let burst_samples = (frame.bits.len() + 16) * sps;
+        let samples_back = samples_since_end + burst_samples;
+        let win = ring.extract_window(samples_back, cfo::PREAMBLE_SAMPLES)?;
+        cfo::estimate_cfo(&win, FS)
+    }
+
+    fn alt_preamble(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i & 1) as u8).collect()
+    }
+
+    #[test]
+    fn frame_at_chunk_end_recovers_cfo() {
+        // Burst sits at the very end of the chunk: ~no post-burst
+        // silence.  This is the case the old (broken) code already
+        // handled accidentally, included as a baseline.
+        let mut bits = alt_preamble(20);
+        bits.extend(std::iter::repeat(1u8).take(128));
+        let chunk = synth_chunk(&bits, 1024, 0);
+        let cfo = run_pipeline(&chunk).expect("pipeline must produce a CFO estimate");
+        assert!(
+            (cfo - CFO_HZ).abs() < 200.0,
+            "frame at chunk end: expected ≈{CFO_HZ} Hz, got {cfo}"
+        );
+    }
+
+    #[test]
+    fn frame_in_middle_of_chunk_recovers_cfo() {
+        // Burst sits in the middle of a long chunk with significant
+        // post-burst silence.  Without the `last_bit_sample_idx`
+        // fix the IQ window lands in this trailing silence and the
+        // estimator returns 0 Hz exactly.
+        let mut bits = alt_preamble(20);
+        bits.extend(std::iter::repeat(1u8).take(128));
+        let chunk = synth_chunk(&bits, 512, 4_096);
+        let cfo = run_pipeline(&chunk).expect("pipeline must produce a CFO estimate");
+        assert!(
+            cfo.abs() > 100.0,
+            "CFO must not be ≈ 0 (would mean we sampled silence): got {cfo}"
+        );
+        assert!(
+            (cfo - CFO_HZ).abs() < 200.0,
+            "frame in middle of chunk: expected ≈{CFO_HZ} Hz, got {cfo}"
+        );
+    }
 }
