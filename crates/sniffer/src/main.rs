@@ -184,12 +184,16 @@ async fn main() -> anyhow::Result<()> {
                     let start_byte = preamble_start * 2;
                     let end_byte = preamble_end * 2;
                     if end_byte <= chunk.len() {
-                        Some(
-                            chunk[start_byte..end_byte]
-                                .iter()
-                                .map(|&b| b as f32 - 127.5)
-                                .collect(),
-                        )
+                        let samples: Vec<f32> = chunk[start_byte..end_byte]
+                            .iter()
+                            .map(|&b| b as f32 - 127.5)
+                            .collect();
+                        // Energy gate: reject windows that land on OOK silence
+                        // (carrier-off preamble bits). Silence energy ~ 0.25;
+                        // carrier energy > 1000. Threshold of 100 cleanly separates.
+                        let energy: f32 = samples.iter().map(|x| x * x).sum::<f32>()
+                            / samples.len() as f32;
+                        if energy > 100.0 { Some(samples) } else { None }
                     } else {
                         None
                     }
