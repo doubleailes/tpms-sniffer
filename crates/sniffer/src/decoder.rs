@@ -581,6 +581,9 @@ fn decode_jansite(bits: &[u8]) -> Option<TpmsPacket> {
         return None;
     }
     let crc_ok = crc8(&b[..7], 0x00) == b[7];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[5] as f32 * 1.7; // quarter PSI/unit: 0.25 × 6.89476 ≈ 1.7
     let temp = b[6] as f32 - 50.0;
@@ -618,6 +621,9 @@ fn decode_elantra(bits: &[u8]) -> Option<TpmsPacket> {
     }
     let sum = (0..7usize).fold(0u8, |a, i| a.wrapping_add(b[i]));
     let crc_ok = sum == b[7];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[4] as f32;
     let temp = b[5] as f32 - 40.0;
@@ -872,6 +878,9 @@ fn decode_eeztire(bits: &[u8]) -> Option<TpmsPacket> {
         return None;
     }
     let crc_ok = crc8(&b[..8], 0x00) == b[8];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     // Raw 9-bit field encodes pressure in units of 0.1 PSI.
     // Multiply by 0.1 to get PSI, then by 6.89476 to get kPa.
@@ -907,6 +916,9 @@ fn decode_gm_aftermarket(bits: &[u8]) -> Option<TpmsPacket> {
     }
     let sum = (0..7usize).fold(0u8, |a, i| a.wrapping_add(b[i]));
     let crc_ok = sum == b[7];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[4] as f32 * 0.25;
     let temp = b[5] as f32 - 40.0;
@@ -1399,6 +1411,43 @@ mod tests {
         assert!(
             pkt.cfo_hz.is_none(),
             "cfo_hz should remain None when no IQ window is supplied"
+        );
+    }
+
+    /// Regression for the noise-flood diagnosis: when the framer locks
+    /// onto random demod output (typical bit pattern: all-`0xFF` with a
+    /// stray flipped bit), the resulting bytes never form a valid CRC.
+    /// Each loose decoder used to still emit a low-confidence packet,
+    /// which polluted the DB with thousands of fake sightings carrying
+    /// sensor IDs near `0xFFFFFFFF`.  All four decoders must now refuse
+    /// such frames outright.
+    #[test]
+    fn noise_frame_rejected_by_crc_gate() {
+        // 12 bytes of 0xFF — covers the longest frame (EezTire = 9, Jansite
+        // = 8, Elantra = 8, GM = 8).  CRC byte is also 0xFF, which never
+        // matches the computed CRC over 0xFF... bytes for any of these
+        // schemes (CRC-8 poly 0x07 or byte-sum).
+        let noise = vec![0xFFu8; 12];
+        let bits = bytes_to_bits(&noise);
+        assert!(
+            decode_eeztire(&bits).is_none(),
+            "EezTire must reject all-0xFF noise"
+        );
+        assert!(
+            decode_jansite(&bits).is_none(),
+            "Jansite must reject all-0xFF noise"
+        );
+        assert!(
+            decode_jansite_solar(&bits).is_none(),
+            "Jansite-Solar must reject all-0xFF noise"
+        );
+        assert!(
+            decode_elantra(&bits).is_none(),
+            "Hyundai-Elantra must reject all-0xFF noise"
+        );
+        assert!(
+            decode_gm_aftermarket(&bits).is_none(),
+            "GM-Aftermarket must reject all-0xFF noise"
         );
     }
 
