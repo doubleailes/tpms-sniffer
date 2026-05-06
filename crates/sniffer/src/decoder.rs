@@ -252,6 +252,27 @@ fn is_noise(b: &[u8]) -> bool {
     b.len() >= 2 && b.iter().all(|&x| x == b[0])
 }
 
+/// Reject frames whose bit population is extreme (≥87.5% ones or zeros).
+///
+/// The framer can lock onto random demod output during silence or noise:
+/// the OOK demod's adaptive threshold drifts, the framer matches a 16-bit
+/// `0x00FF` Huf preamble in noise, and the resulting "frame" bytes are
+/// almost all `0xFF` with a couple of stray bit flips.  A real TPMS frame
+/// has a 32-bit sensor ID, varying pressure/temp bytes, and a random-ish
+/// CRC byte — its bit population sits near 50%, not 90%+.
+///
+/// Threshold: ≥7/8 of the bits in the same direction.  A real frame at
+/// 350 kPa with sensor ID hamming weight 14 lands around 44% ones — well
+/// below the 87.5% cutoff.  This catches the noise patterns that pass
+/// chance CRC matches (e.g. `FF FF FF FF FF FF FF FF D7` for EezTire,
+/// where `crc8(0xFF*8) = 0xD7`).
+fn is_bit_skewed(b: &[u8]) -> bool {
+    let total_bits = (b.len() * 8) as u32;
+    let ones: u32 = b.iter().map(|&x| x.count_ones()).sum();
+    let zeros = total_bits - ones;
+    ones * 8 >= total_bits * 7 || zeros * 8 >= total_bits * 7
+}
+
 fn score(crc_ok: bool, sane: bool, kpa: f32, temp: Option<f32>) -> u8 {
     let mut s = 0u8;
     if crc_ok {
@@ -580,6 +601,9 @@ fn decode_jansite(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 8 {
         return None;
     }
+    if is_bit_skewed(&b[..8]) {
+        return None;
+    }
     let crc_ok = crc8(&b[..7], 0x00) == b[7];
     if !crc_ok {
         return None;
@@ -617,6 +641,9 @@ fn decode_jansite_solar(bits: &[u8]) -> Option<TpmsPacket> {
 fn decode_elantra(bits: &[u8]) -> Option<TpmsPacket> {
     let b = raw_bits_to_bytes(bits);
     if b.len() < 8 {
+        return None;
+    }
+    if is_bit_skewed(&b[..8]) {
         return None;
     }
     let sum = (0..7usize).fold(0u8, |a, i| a.wrapping_add(b[i]));
@@ -806,10 +833,13 @@ fn decode_ave(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 6 {
         return None;
     }
-    if is_noise(&b[..6]) {
+    if is_noise(&b[..6]) || is_bit_skewed(&b[..6]) {
         return None;
     }
     let xor = b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5];
+    if xor != 0 {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[4] as f32 * 1.5;
     let temp = b[5] as f32 - 40.0;
@@ -877,6 +907,9 @@ fn decode_eeztire(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 9 {
         return None;
     }
+    if is_bit_skewed(&b[..9]) {
+        return None;
+    }
     let crc_ok = crc8(&b[..8], 0x00) == b[8];
     if !crc_ok {
         return None;
@@ -912,6 +945,9 @@ fn decode_eeztire(bits: &[u8]) -> Option<TpmsPacket> {
 fn decode_gm_aftermarket(bits: &[u8]) -> Option<TpmsPacket> {
     let b = raw_bits_to_bytes(bits);
     if b.len() < 8 {
+        return None;
+    }
+    if is_bit_skewed(&b[..8]) {
         return None;
     }
     let sum = (0..7usize).fold(0u8, |a, i| a.wrapping_add(b[i]));
@@ -1419,14 +1455,14 @@ mod tests {
     /// stray flipped bit), the resulting bytes never form a valid CRC.
     /// Each loose decoder used to still emit a low-confidence packet,
     /// which polluted the DB with thousands of fake sightings carrying
-    /// sensor IDs near `0xFFFFFFFF`.  All four decoders must now refuse
+    /// sensor IDs near `0xFFFFFFFF`.  All five decoders must now refuse
     /// such frames outright.
     #[test]
     fn noise_frame_rejected_by_crc_gate() {
         // 12 bytes of 0xFF — covers the longest frame (EezTire = 9, Jansite
-        // = 8, Elantra = 8, GM = 8).  CRC byte is also 0xFF, which never
-        // matches the computed CRC over 0xFF... bytes for any of these
-        // schemes (CRC-8 poly 0x07 or byte-sum).
+        // = 8, Elantra = 8, GM = 8, AVE = 6).  CRC byte is also 0xFF,
+        // which never matches the computed CRC over 0xFF... bytes for any
+        // of these schemes (CRC-8 poly 0x07 or byte-sum).
         let noise = vec![0xFFu8; 12];
         let bits = bytes_to_bits(&noise);
         assert!(
@@ -1449,6 +1485,38 @@ mod tests {
             decode_gm_aftermarket(&bits).is_none(),
             "GM-Aftermarket must reject all-0xFF noise"
         );
+        assert!(
+            decode_ave(&bits).is_none(),
+            "AVE-TPMS must reject all-0xFF noise"
+        );
+    }
+
+    /// Some noise patterns happen to satisfy the CRC by coincidence:
+    /// `crc8(0xFF * 8) = 0xD7`, so a frame of `FF FF FF FF FF FF FF FF D7`
+    /// passes EezTire's CRC check.  Single-bit-flip patterns can also
+    /// preserve the byte-sum identity that Elantra and GM use.  And AVE's
+    /// XOR=0 trivially holds for any noise frame whose bit flips pair up
+    /// (e.g. `FF 7F FF FF 7F FF`).  These all-or-near-all-`0xFF` frames
+    /// must be rejected by the bit-skew gate, regardless of CRC outcome.
+    #[test]
+    fn lucky_crc_noise_rejected_by_bit_skew_gate() {
+        // Real noise frames captured in the field 300 s test:
+        let cases: &[(&str, &[u8])] = &[
+            ("EezTire crc-by-chance", &[0xFF; 9]),
+            ("EezTire single-flip", &[0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xFF]),
+            ("Elantra byte-sum-by-chance", &[0xFF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7]),
+            ("AVE xor-by-chance", &[0xFF, 0x7F, 0xFF, 0xFF, 0x7F, 0xFF]),
+            ("AVE xor-by-chance 2", &[0xFD, 0xFF, 0xFF, 0xFF, 0xFD, 0xFF]),
+        ];
+        for (label, frame) in cases {
+            let bits = bytes_to_bits(frame);
+            // Run frame through every patched decoder.  Each must reject.
+            assert!(decode_eeztire(&bits).is_none(), "{label}: eeztire leaked");
+            assert!(decode_jansite(&bits).is_none(), "{label}: jansite leaked");
+            assert!(decode_elantra(&bits).is_none(), "{label}: elantra leaked");
+            assert!(decode_gm_aftermarket(&bits).is_none(), "{label}: gm leaked");
+            assert!(decode_ave(&bits).is_none(), "{label}: ave leaked");
+        }
     }
 
     #[test]
