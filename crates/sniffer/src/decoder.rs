@@ -32,6 +32,7 @@
 //  [299]  TRW FSK            FSK Manchester, 433 MHz
 // ============================================================
 
+use crate::cfo;
 use crate::manchester::{differential_manchester_decode, manchester_decode};
 use chrono::Local;
 use serde::Serialize;
@@ -86,6 +87,12 @@ pub struct TpmsPacket {
     /// see `AVE_MIN_RELIABLE_KPA`). Downstream consumers (the tracker) should not
     /// update pressure fingerprints from packets with this flag unset.
     pub pressure_kpa_reliable: bool,
+    /// Carrier frequency offset (Hz) measured from the packet preamble, when
+    /// raw IQ samples were captured around the packet (issue #45 oscillator
+    /// fingerprinting).  `None` when CFO measurement is not available — older
+    /// JSON streams omit this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfo_hz: Option<f32>,
 }
 
 /// Minimum reliable AVE-TPMS pressure in kPa.
@@ -111,7 +118,21 @@ pub const AVE_MIN_RELIABLE_KPA: f32 = 200.0;
 
 // ─── Entry point ─────────────────────────────────────────────
 
-pub fn decode(bits: &[u8], protocol: &TpmsProtocol, min_confidence: u8) -> Option<TpmsPacket> {
+/// Decode a frame's bits into a `TpmsPacket`.
+///
+/// `iq_window` and `sample_rate_hz`, when provided, supply the raw IQ
+/// samples spanning a portion of the burst that produced these bits.
+/// On a successful decode the autocorrelation CFO estimator is run
+/// against that window and the result is stamped on `pkt.cfo_hz`
+/// (issue #45).  When `iq_window` is `None` the packet's `cfo_hz`
+/// stays `None`, which is what older callers and tests expect.
+pub fn decode(
+    bits: &[u8],
+    iq_window: Option<&[f32]>,
+    sample_rate_hz: u32,
+    protocol: &TpmsProtocol,
+    min_confidence: u8,
+) -> Option<TpmsPacket> {
     let all: &[fn(&[u8]) -> Option<TpmsPacket>] = &[
         decode_ford,
         decode_citroen,
@@ -169,10 +190,22 @@ pub fn decode(bits: &[u8], protocol: &TpmsProtocol, min_confidence: u8) -> Optio
         TpmsProtocol::SolarTruck => vec![decode_solar_truck],
     };
 
-    fns.iter()
+    let mut pkt = fns
+        .iter()
         .filter_map(|f| f(bits))
         .filter(|p| p.confidence >= min_confidence)
-        .max_by_key(|p| p.confidence)
+        .max_by_key(|p| p.confidence)?;
+
+    // Stamp the carrier frequency offset onto the resulting packet
+    // when raw IQ samples are available.  The estimator is robust to
+    // partial-burst windows: the autocorrelation method tracks the
+    // dominant carrier energy and tolerates a small amount of
+    // silence at the edges of `iq_window`.
+    if let Some(window) = iq_window {
+        pkt.cfo_hz = cfo::estimate_cfo(window, sample_rate_hz);
+    }
+
+    Some(pkt)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -217,6 +250,27 @@ fn raw_bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 /// Reject frames where every byte is the same value (noise / no signal).
 fn is_noise(b: &[u8]) -> bool {
     b.len() >= 2 && b.iter().all(|&x| x == b[0])
+}
+
+/// Reject frames whose bit population is extreme (≥87.5% ones or zeros).
+///
+/// The framer can lock onto random demod output during silence or noise:
+/// the OOK demod's adaptive threshold drifts, the framer matches a 16-bit
+/// `0x00FF` Huf preamble in noise, and the resulting "frame" bytes are
+/// almost all `0xFF` with a couple of stray bit flips.  A real TPMS frame
+/// has a 32-bit sensor ID, varying pressure/temp bytes, and a random-ish
+/// CRC byte — its bit population sits near 50%, not 90%+.
+///
+/// Threshold: ≥7/8 of the bits in the same direction.  A real frame at
+/// 350 kPa with sensor ID hamming weight 14 lands around 44% ones — well
+/// below the 87.5% cutoff.  This catches the noise patterns that pass
+/// chance CRC matches (e.g. `FF FF FF FF FF FF FF FF D7` for EezTire,
+/// where `crc8(0xFF*8) = 0xD7`).
+fn is_bit_skewed(b: &[u8]) -> bool {
+    let total_bits = (b.len() * 8) as u32;
+    let ones: u32 = b.iter().map(|&x| x.count_ones()).sum();
+    let zeros = total_bits - ones;
+    ones * 8 >= total_bits * 7 || zeros * 8 >= total_bits * 7
 }
 
 fn score(crc_ok: bool, sane: bool, kpa: f32, temp: Option<f32>) -> u8 {
@@ -266,6 +320,7 @@ fn pkt(
         raw_hex: hex_bytes(raw),
         confidence: conf,
         pressure_kpa_reliable: true,
+        cfo_hz: None,
     }
 }
 
@@ -546,7 +601,13 @@ fn decode_jansite(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 8 {
         return None;
     }
+    if is_bit_skewed(&b[..8]) {
+        return None;
+    }
     let crc_ok = crc8(&b[..7], 0x00) == b[7];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[5] as f32 * 1.7; // quarter PSI/unit: 0.25 × 6.89476 ≈ 1.7
     let temp = b[6] as f32 - 50.0;
@@ -582,8 +643,14 @@ fn decode_elantra(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 8 {
         return None;
     }
+    if is_bit_skewed(&b[..8]) {
+        return None;
+    }
     let sum = (0..7usize).fold(0u8, |a, i| a.wrapping_add(b[i]));
     let crc_ok = sum == b[7];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[4] as f32;
     let temp = b[5] as f32 - 40.0;
@@ -766,10 +833,13 @@ fn decode_ave(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 6 {
         return None;
     }
-    if is_noise(&b[..6]) {
+    if is_noise(&b[..6]) || is_bit_skewed(&b[..6]) {
         return None;
     }
     let xor = b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5];
+    if xor != 0 {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[4] as f32 * 1.5;
     let temp = b[5] as f32 - 40.0;
@@ -837,7 +907,13 @@ fn decode_eeztire(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 9 {
         return None;
     }
+    if is_bit_skewed(&b[..9]) {
+        return None;
+    }
     let crc_ok = crc8(&b[..8], 0x00) == b[8];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     // Raw 9-bit field encodes pressure in units of 0.1 PSI.
     // Multiply by 0.1 to get PSI, then by 6.89476 to get kPa.
@@ -871,8 +947,14 @@ fn decode_gm_aftermarket(bits: &[u8]) -> Option<TpmsPacket> {
     if b.len() < 8 {
         return None;
     }
+    if is_bit_skewed(&b[..8]) {
+        return None;
+    }
     let sum = (0..7usize).fold(0u8, |a, i| a.wrapping_add(b[i]));
     let crc_ok = sum == b[7];
+    if !crc_ok {
+        return None;
+    }
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     let kpa = b[4] as f32 * 0.25;
     let temp = b[5] as f32 - 40.0;
@@ -1296,6 +1378,151 @@ mod tests {
             "expected ~255 kPa, got {}",
             pkt.pressure_kpa,
         );
+    }
+
+    // ── CFO end-to-end regression (issue #45) ────────────────
+
+    /// Build a valid Hyundai Elantra (rtl433_id=140) 8-byte frame:
+    /// [ID:4][P:1][T:1][F:1][SUM:1].  The Elantra decoder uses a
+    /// byte-sum check; we set byte 7 to the sum of bytes 0..7.
+    fn elantra_frame(id: u32, pressure_kpa: u8, temp_byte: u8) -> Vec<u8> {
+        let id_bytes = id.to_be_bytes();
+        let mut frame = vec![
+            id_bytes[0],
+            id_bytes[1],
+            id_bytes[2],
+            id_bytes[3],
+            pressure_kpa,
+            temp_byte,
+            0x00,
+        ];
+        let sum = frame.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        frame.push(sum);
+        frame
+    }
+
+    /// Synthesise a complex tone at the given offset frequency,
+    /// returning interleaved I,Q f32 samples.
+    fn synth_tone(offset_hz: f32, fs: u32, n: usize) -> Vec<f32> {
+        use std::f32::consts::PI;
+        let mut out = Vec::with_capacity(n * 2);
+        let dphi = 2.0 * PI * offset_hz / fs as f32;
+        for k in 0..n {
+            let phi = dphi * k as f32;
+            out.push(phi.cos());
+            out.push(phi.sin());
+        }
+        out
+    }
+
+    #[test]
+    fn decode_stamps_cfo_from_iq_window() {
+        // Build a valid Elantra frame so the decoder produces a
+        // packet, then feed a +3,000 Hz synthetic carrier window
+        // alongside the bits.  The resulting packet must carry a
+        // `cfo_hz` field within ±100 Hz of the synthesised offset.
+        let frame = elantra_frame(0xAABBCCDD, 220, 75);
+        let bits = bytes_to_bits(&frame);
+        let iq = synth_tone(3_000.0, 250_000, super::cfo::PREAMBLE_SAMPLES);
+
+        let pkt = decode(&bits, Some(&iq), 250_000, &TpmsProtocol::Elantra, 50)
+            .expect("decode must succeed for a valid Elantra frame");
+
+        let cfo = pkt
+            .cfo_hz
+            .expect("cfo_hz must be populated when iq_window is provided");
+        assert!(
+            (cfo - 3_000.0).abs() < 100.0,
+            "expected cfo_hz ≈ 3000 Hz, got {cfo}"
+        );
+    }
+
+    #[test]
+    fn decode_leaves_cfo_none_without_iq_window() {
+        // Same valid frame, but no IQ window → cfo_hz must stay None.
+        let frame = elantra_frame(0xAABBCCDD, 220, 75);
+        let bits = bytes_to_bits(&frame);
+        let pkt =
+            decode(&bits, None, 250_000, &TpmsProtocol::Elantra, 50).expect("decode must succeed");
+        assert!(
+            pkt.cfo_hz.is_none(),
+            "cfo_hz should remain None when no IQ window is supplied"
+        );
+    }
+
+    /// Regression for the noise-flood diagnosis: when the framer locks
+    /// onto random demod output (typical bit pattern: all-`0xFF` with a
+    /// stray flipped bit), the resulting bytes never form a valid CRC.
+    /// Each loose decoder used to still emit a low-confidence packet,
+    /// which polluted the DB with thousands of fake sightings carrying
+    /// sensor IDs near `0xFFFFFFFF`.  All five decoders must now refuse
+    /// such frames outright.
+    #[test]
+    fn noise_frame_rejected_by_crc_gate() {
+        // 12 bytes of 0xFF — covers the longest frame (EezTire = 9, Jansite
+        // = 8, Elantra = 8, GM = 8, AVE = 6).  CRC byte is also 0xFF,
+        // which never matches the computed CRC over 0xFF... bytes for any
+        // of these schemes (CRC-8 poly 0x07 or byte-sum).
+        let noise = vec![0xFFu8; 12];
+        let bits = bytes_to_bits(&noise);
+        assert!(
+            decode_eeztire(&bits).is_none(),
+            "EezTire must reject all-0xFF noise"
+        );
+        assert!(
+            decode_jansite(&bits).is_none(),
+            "Jansite must reject all-0xFF noise"
+        );
+        assert!(
+            decode_jansite_solar(&bits).is_none(),
+            "Jansite-Solar must reject all-0xFF noise"
+        );
+        assert!(
+            decode_elantra(&bits).is_none(),
+            "Hyundai-Elantra must reject all-0xFF noise"
+        );
+        assert!(
+            decode_gm_aftermarket(&bits).is_none(),
+            "GM-Aftermarket must reject all-0xFF noise"
+        );
+        assert!(
+            decode_ave(&bits).is_none(),
+            "AVE-TPMS must reject all-0xFF noise"
+        );
+    }
+
+    /// Some noise patterns happen to satisfy the CRC by coincidence:
+    /// `crc8(0xFF * 8) = 0xD7`, so a frame of `FF FF FF FF FF FF FF FF D7`
+    /// passes EezTire's CRC check.  Single-bit-flip patterns can also
+    /// preserve the byte-sum identity that Elantra and GM use.  And AVE's
+    /// XOR=0 trivially holds for any noise frame whose bit flips pair up
+    /// (e.g. `FF 7F FF FF 7F FF`).  These all-or-near-all-`0xFF` frames
+    /// must be rejected by the bit-skew gate, regardless of CRC outcome.
+    #[test]
+    fn lucky_crc_noise_rejected_by_bit_skew_gate() {
+        // Real noise frames captured in the field 300 s test:
+        let cases: &[(&str, &[u8])] = &[
+            ("EezTire crc-by-chance", &[0xFF; 9]),
+            (
+                "EezTire single-flip",
+                &[0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0xEF, 0xFF, 0xFF, 0xFF],
+            ),
+            (
+                "Elantra byte-sum-by-chance",
+                &[0xFF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7],
+            ),
+            ("AVE xor-by-chance", &[0xFF, 0x7F, 0xFF, 0xFF, 0x7F, 0xFF]),
+            ("AVE xor-by-chance 2", &[0xFD, 0xFF, 0xFF, 0xFF, 0xFD, 0xFF]),
+        ];
+        for (label, frame) in cases {
+            let bits = bytes_to_bits(frame);
+            // Run frame through every patched decoder.  Each must reject.
+            assert!(decode_eeztire(&bits).is_none(), "{label}: eeztire leaked");
+            assert!(decode_jansite(&bits).is_none(), "{label}: jansite leaked");
+            assert!(decode_elantra(&bits).is_none(), "{label}: elantra leaked");
+            assert!(decode_gm_aftermarket(&bits).is_none(), "{label}: gm leaked");
+            assert!(decode_ave(&bits).is_none(), "{label}: ave leaked");
+        }
     }
 
     #[test]

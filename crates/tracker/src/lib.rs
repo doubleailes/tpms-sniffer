@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod cfo;
 pub mod classification;
 pub mod db;
 pub mod jaccard;
@@ -91,6 +92,11 @@ pub struct TpmsPacket {
     /// absent in the JSON stream.
     #[serde(default = "default_receiver_id")]
     pub receiver_id: String,
+    /// Carrier frequency offset (Hz) extracted from the packet preamble by
+    /// the sniffer.  Present only when the sniffer captured raw IQ samples
+    /// around this packet (issue #45 oscillator fingerprinting).
+    #[serde(default)]
+    pub cfo_hz: Option<f32>,
 }
 
 fn default_receiver_id() -> String {
@@ -142,6 +148,10 @@ pub struct Sighting {
     pub tx_interval_hint_ms: Option<u32>,
     /// Identifier for the receiver node that captured this packet.
     pub receiver_id: String,
+    /// Carrier frequency offset (Hz) measured from this packet's preamble,
+    /// when the sniffer captured raw IQ samples (issue #45).  `None` when
+    /// CFO data was not available for this packet.
+    pub cfo_hz: Option<f32>,
 }
 
 /// Long-lived record for a vehicle inferred from repeated sightings.

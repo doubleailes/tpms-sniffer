@@ -127,6 +127,17 @@ pub struct JitterApiResponse {
     pub jitter_class: String,
     pub updated_at: String,
     pub histogram: Vec<HistogramBin>,
+    /// Mean carrier frequency offset (Hz) for this fingerprint, if a CFO
+    /// profile has been computed (issue #45).  Null when fewer than
+    /// `cfo::MIN_CFO_SAMPLES` IQ-derived estimates are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfo_mean_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfo_sigma_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfo_samples: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfo_updated_at: Option<String>,
 }
 
 /// Single bin in a jitter histogram.
@@ -337,6 +348,19 @@ async fn handle_jitter_fingerprint(
             let histogram = build_histogram(&intervals);
             let jitter_class = crate::jitter::classify_jitter(&p);
 
+            let cfo = db
+                .get_fingerprint_cfo(&fp_id)
+                .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+            let (cfo_mean_hz, cfo_sigma_hz, cfo_samples, cfo_updated_at) = match cfo {
+                Some(c) => (
+                    Some(c.mean_hz as f64),
+                    Some(c.sigma_hz as f64),
+                    Some(c.samples),
+                    Some(c.updated_at.to_rfc3339()),
+                ),
+                None => (None, None, None, None),
+            };
+
             Ok(Json(JitterApiResponse {
                 fingerprint_id: fp_id,
                 sigma_ms: p.sigma_ms as f64,
@@ -347,6 +371,10 @@ async fn handle_jitter_fingerprint(
                 jitter_class: jitter_class.as_str().to_string(),
                 updated_at: p.updated_at.to_rfc3339(),
                 histogram,
+                cfo_mean_hz,
+                cfo_sigma_hz,
+                cfo_samples,
+                cfo_updated_at,
             }))
         }
         None => Err(axum::http::StatusCode::NOT_FOUND),

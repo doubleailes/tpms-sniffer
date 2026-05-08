@@ -10,11 +10,30 @@
 //  After preamble we collect a fixed window of bits and hand
 //  them to the decoder.  We search for ALL of the preambles
 //  simultaneously using a single shift-register.
+//
+//  Each emitted frame carries the IQ sample index within the
+//  current chunk where the frame's last bit was decided
+//  (issue #45 fix — main needs this to locate the preamble
+//  IQ samples for CFO measurement).  `last_bit_sample_idx`
+//  is sourced from `DemodBit::sample_idx`.
 // ============================================================
+
+use crate::demod::DemodBit;
 
 const ALT_PREAMBLE_MIN: usize = 16; // minimum alternating bits
 const HUF_PREAMBLE: u32 = 0x00FF; // 16 bit
 const MAX_FRAME_BITS: usize = 128; // maximum frame to collect
+
+/// A complete frame as emitted by the framer.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Decoded bit values, one per symbol.
+    pub bits: Vec<u8>,
+    /// Sample index within the current chunk at which the last
+    /// bit of this frame was decided.  Used by `main` to compute
+    /// the offset back into the IQ ring buffer.
+    pub last_bit_sample_idx: u32,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -45,12 +64,14 @@ impl Framer {
         }
     }
 
-    /// Feed a slice of bits (0 or 1). Returns any complete frames found.
-    pub fn feed(&mut self, bits: &[u8]) -> Vec<Vec<u8>> {
+    /// Feed a slice of demodulated bits (each carrying its source
+    /// sample index within the current chunk).  Returns any
+    /// complete frames found.
+    pub fn feed(&mut self, bits: &[DemodBit]) -> Vec<Frame> {
         let mut out = Vec::new();
 
-        for &bit in bits {
-            let b = bit & 1;
+        for &db in bits {
+            let b = db.bit & 1;
 
             // ── Update shift register ──────────────────────
             self.sr = (self.sr << 1) | b as u128;
@@ -110,7 +131,10 @@ impl Framer {
                     self.frame_buf.push(b);
                     *bits += 1;
                     if *bits >= total {
-                        out.push(self.frame_buf.clone());
+                        out.push(Frame {
+                            bits: self.frame_buf.clone(),
+                            last_bit_sample_idx: db.sample_idx,
+                        });
                         self.frame_buf.clear();
                         self.state = State::Idle;
                         self.sr = 0;

@@ -8,10 +8,25 @@
 //       at symbol clock recovered by simple edge timing.
 //
 //  FSK: two-point discriminator; sign of d/dt(phase) → bit.
+//
+//  Each emitted bit is paired with the IQ sample index within
+//  the input chunk at which it was decided (issue #45 fix —
+//  the framer needs this to locate the preamble's IQ samples
+//  for CFO measurement).
 // ============================================================
 
 const OOK_SYMBOL_US: f32 = 52.0; // ~19.2 kbps (Schrader / TRW)
 const FSK_SYMBOL_US: f32 = 52.0;
+
+/// Bit emitted by a demodulator together with the input-chunk
+/// sample index at which the symbol clock fired.  `sample_idx`
+/// is in IQ samples (one I,Q pair = one sample), 0-based within
+/// the chunk passed to `process`.
+#[derive(Debug, Clone, Copy)]
+pub struct DemodBit {
+    pub bit: u8,
+    pub sample_idx: u32,
+}
 
 // ─── OOK ────────────────────────────────────────────────────
 
@@ -41,7 +56,7 @@ impl OokDemod {
         }
     }
 
-    pub fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
+    pub fn process(&mut self, chunk: &[u8]) -> Vec<DemodBit> {
         let mut out = Vec::new();
 
         let samples: Vec<(f32, f32)> = chunk
@@ -49,7 +64,7 @@ impl OokDemod {
             .map(|s| (s[0] as f32 - 127.5, s[1] as f32 - 127.5))
             .collect();
 
-        for (i, q) in &samples {
+        for (idx, (i, q)) in samples.iter().enumerate() {
             let mag = (i * i + q * q).sqrt();
 
             // ── Adaptive threshold (slow IIR) ──────────────
@@ -62,7 +77,10 @@ impl OokDemod {
             self.phase_accum += 1.0;
             if self.phase_accum >= self.sps {
                 self.phase_accum -= self.sps;
-                out.push(bit);
+                out.push(DemodBit {
+                    bit,
+                    sample_idx: idx as u32,
+                });
             }
 
             self.last_mag = mag;
@@ -100,12 +118,12 @@ impl FskDemod {
         }
     }
 
-    pub fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
+    pub fn process(&mut self, chunk: &[u8]) -> Vec<DemodBit> {
         let mut out = Vec::new();
         let mut demod_acc: f32 = 0.0;
         let mut demod_count = 0u32;
 
-        for pair in chunk.chunks_exact(2) {
+        for (idx, pair) in chunk.chunks_exact(2).enumerate() {
             let i = pair[0] as f32 - 127.5;
             let q = pair[1] as f32 - 127.5;
 
@@ -128,7 +146,10 @@ impl FskDemod {
             if self.phase_accum >= self.sps {
                 self.phase_accum -= self.sps;
                 let avg = demod_acc / demod_count as f32;
-                out.push(if avg >= 0.0 { 1u8 } else { 0u8 });
+                out.push(DemodBit {
+                    bit: if avg >= 0.0 { 1u8 } else { 0u8 },
+                    sample_idx: idx as u32,
+                });
                 demod_acc = 0.0;
                 demod_count = 0;
             }
