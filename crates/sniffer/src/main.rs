@@ -191,8 +191,8 @@ async fn main() -> anyhow::Result<()> {
                         // Energy gate: reject windows that land on OOK silence
                         // (carrier-off preamble bits). Silence energy ~ 0.25;
                         // carrier energy > 1000. Threshold of 100 cleanly separates.
-                        let energy: f32 = samples.iter().map(|x| x * x).sum::<f32>()
-                            / samples.len() as f32;
+                        let energy: f32 =
+                            samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32;
                         if energy > 100.0 { Some(samples) } else { None }
                     } else {
                         None
