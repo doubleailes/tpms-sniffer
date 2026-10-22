@@ -1,46 +1,77 @@
-# tpms-sniffer
+# 🛞📡 tpms-sniffer
 
-Passive TPMS vehicle tracking and fingerprinting toolkit in Rust.
-Built on [`rtlsdr-next`](https://github.com/mattdelashaw/rtlsdr-next),
-protocol details ported from [`rtl_433`](https://github.com/merbanan/rtl_433).
+> *Your tyres are talking. Have been for years. We just started listening.*
 
-Designed for long-term unattended field deployment on a Raspberry Pi 4
-with an outdoor antenna. Powers ongoing research into passive vehicle
-re-identification and physical-layer fingerprinting.
+Every modern car has four tiny radios bolted inside its wheels. Their whole job is to shout
+**"I'M AT 230 kPa AND 18 °C!"** into the void at 433 MHz, roughly once a minute, forever, to anyone
+who cares to hear. Spoiler: we care.
 
-> **Research context:** This project is the foundation for a white paper on
-> passive vehicle fingerprinting from 433 MHz TPMS transmissions, combining
-> pressure signatures, temporal behavioural patterns, and crystal oscillator
-> jitter for persistent identity tracking across rolling sensor ID rotations.
+**tpms-sniffer** is a passive TPMS (Tyre Pressure Monitoring System) tracking and fingerprinting toolkit
+written in Rust 🦀. It sits quietly on a Raspberry Pi with an antenna, listens to tyres gossip, and slowly
+works out *who's who* — even when the sensors try to be sneaky and change their IDs on every packet.
+
+Built on [`rtlsdr-next`](https://github.com/mattdelashaw/rtlsdr-next), with protocol details lovingly
+ported from the legendary [`rtl_433`](https://github.com/merbanan/rtl_433).
+
+> 🎓 **Serious-business corner:** this project is the foundation for a white paper on passive vehicle
+> fingerprinting from 433 MHz TPMS transmissions — combining pressure signatures, temporal behavioural
+> patterns, and crystal oscillator jitter for persistent identity tracking across rolling sensor ID
+> rotations. Yes, the fun tone stops at the README. The maths does not joke.
 
 ---
 
-## Architecture
+## 🧭 Table of contents
+
+- [How it works (the 10-second version)](#-how-it-works-the-10-second-version)
+- [Supported protocols — the guest list](#-supported-protocols--the-guest-list)
+- [Shopping list](#-shopping-list)
+- [Build & run](#-build--run)
+- [The three-layer identity onion](#-the-three-layer-identity-onion)
+- [Catching the shapeshifters (rolling IDs)](#-catching-the-shapeshifters-rolling-ids)
+- [Is it a scooter or a lorry?](#-is-it-a-scooter-or-a-lorry)
+- [Physical-layer fingerprinting](#-physical-layer-fingerprinting-aka-every-crystal-has-a-heartbeat)
+- [Temporal behavioural fingerprinting](#-temporal-behavioural-fingerprinting-aka-creature-of-habit)
+- [Web dashboard](#-web-dashboard)
+- [Database](#-database)
+- [Testing & fixture replay](#-testing--fixture-replay)
+- [Roadmap](#-roadmap)
+- [References](#-scientific-references-the-giants-whose-shoulders-we-stand-on)
+- [Legal stuff](#-legal-stuff-please-read-it-we-mean-it)
+
+---
+
+## ⚡ How it works (the 10-second version)
 
 ```text
-RTL-SDR (433.92 MHz)
-    │
-    └─ tpms-sniffer   (Rust, 25 protocol decoders)
-           │ JSON lines
-           └─ tpms-tracker  (Rust, SQLite + axum)
-                  ├─ Resolver         rolling-ID correlation + fingerprint store
-                  ├─ Jaccard grouper  multi-sensor vehicle assembly
-                  ├─ Jitter engine    oscillator fingerprinting
-                  ├─ TBF engine       temporal behavioural fingerprinting
-                  ├─ Web dashboard    axum (http://pi:8080)
-                  └─ tpms.db          SQLite (WAL mode)
+   🛞 🛞 🛞 🛞   "psst… 230 kPa… 18°C… battery ok…"
+        │
+        ▼  433.92 MHz
+   📡 RTL-SDR dongle
+        │
+        └─ tpms-sniffer      IQ → demod → framing → 25 protocol decoders
+               │  (JSON lines, one per packet)
+               ▼
+           tpms-tracker      the detective 🕵️
+               ├─ Resolver         rolling-ID correlation + fingerprint store
+               ├─ Jaccard grouper  "these four tyres always show up together… suspicious"
+               ├─ Jitter engine    oscillator fingerprinting
+               ├─ TBF engine       temporal behavioural fingerprinting
+               ├─ Web dashboard    axum, at http://pi:8080
+               └─ tpms.db          SQLite (WAL mode)
 ```
 
-### Crates
+Two crates, one pipe, zero transmissions:
 
-|            Crate |                                                                Role |
-|------------------|---------------------------------------------------------------------|
-| `crates/sniffer` | IQ demodulation, framing, 25 protocol decoders, JSON reporter       |
-| `crates/tracker` | Resolver, SQLite persistence, fingerprinting, analytics, web server |
+|            Crate | What it does                                                         |
+|------------------|----------------------------------------------------------------------|
+| `crates/sniffer` | The ears 👂 — IQ demodulation, framing, 25 decoders, JSON reporter   |
+| `crates/tracker` | The brain 🧠 — resolver, SQLite, fingerprinting, analytics, web UI   |
 
 ---
 
-## Supported protocols (25 total)
+## 🎟️ Supported protocols — the guest list
+
+25 protocols, from posh Porsches to humble clip-on aftermarket gadgets. Everybody's welcome at this party.
 
 | `--protocol` | Protocol / Sensor | rtl\_433 # | Vehicles | Freq | Mod |
 |---|---|---|---|---|---|
@@ -70,34 +101,34 @@ RTL-SDR (433.92 MHz)
 | `trw_ook` | TRW OOK (FCC-ID GQ4-70T) | 298 | Chrysler/Dodge/Jeep 2014–2022 | 433 | OOK |
 | `trw_fsk` | TRW FSK (FCC-ID GQ4-70T) | 299 | Chrysler/Dodge/Jeep 2014–2022 | 433 | FSK-Manch |
 
-Modulation: **OOK** = On-Off Keying, **FSK-Manch** = FSK + Manchester,
-**FSK-DMC** = FSK + Differential Manchester.
+**Modulation decoder ring:** **OOK** = On-Off Keying (the radio equivalent of blinking a torch),
+**FSK-Manch** = FSK + Manchester, **FSK-DMC** = FSK + Differential Manchester.
 
 ---
 
-## Hardware
+## 🛒 Shopping list
 
-| Component | Model | Notes |
+| Component | Model | Why |
 |---|---|---|
-| SBC | Raspberry Pi 4 | 4 GB RAM, DietPi OS |
-| SDR | RTL-SDR V3 | TCXO reference, SMA connector |
-| Antenna | Sirio HGO 433 & 868 | 2 dBi @ 433 MHz, 4 dBi @ 868 MHz, outdoor |
+| SBC | Raspberry Pi 4 | 4 GB RAM, DietPi OS. Small, cheap, runs for months unattended. |
+| SDR | RTL-SDR V3 | TCXO reference, so *our* crystal doesn't wobble while we measure *theirs*. |
+| Antenna | Sirio HGO 433 & 868 | 2 dBi @ 433 MHz, 4 dBi @ 868 MHz, outdoor. Bigger ears, more gossip. |
 
-The antenna covers both 433 MHz (TPMS, RKE) and 868 MHz (newer EU
-vehicles), enabling future dual-band capture with a second RTL-SDR dongle.
+The antenna covers both 433 MHz (TPMS, RKE) and 868 MHz (newer EU vehicles), so a second RTL-SDR dongle
+can join the party later for dual-band capture.
 
 ---
 
-## Build & run
+## 🚀 Build & run
 
 ```bash
-# System dependencies
+# 1. Feed the system some dependencies
 sudo apt install libusb-1.0-0-dev pkg-config
 
-# Build both crates
+# 2. Summon the crab 🦀
 cargo build --release
 
-# Run sniffer piped to tracker
+# 3. Plug the ears into the brain
 ./target/release/tpms-sniffer --json | \
 ./target/release/tpms-tracker \
   --db tpms.db \
@@ -106,162 +137,189 @@ cargo build --release
   --log-file logs/tpms-tracker.log
 ```
 
-Or use the provided `start.sh`.
+Too much typing? `./start.sh` does it for you. Want it to survive reboots like a cockroach? There's a
+systemd unit in [`deploy/tpms-tracker.service`](deploy/tpms-tracker.service).
 
-### Sniffer flags
+### 🎛️ Sniffer knobs
 
+```text
+-d, --device <N>          RTL-SDR device index                 [default: 0]
+-f, --freq <HZ>           Centre frequency (315 MHz US / 433.92 MHz EU) [default: 433920000]
+-r, --rate <HZ>           Sample rate                          [default: 250000]
+-g, --gain <TENTHS_DB>    RF gain in tenths of dB, 0 = auto    [default: 0]
+    --protocol <NAME>     Only decode this protocol            [default: all]
+    --confidence <PCT>    Minimum confidence 0–100             [default: 65]
+    --json                Emit JSON lines (required for the tracker pipe)
+    --duration-secs <S>   Stop after S seconds (great for fixture captures)
 ```
---freq <HZ>           Centre frequency [default: 433920000]
---protocol <NAME>     Decode only this protocol (default: all)
---gain <TENTHS_DB>    RTL-SDR gain in tenths of dB (default: auto)
---confidence <PCT>    Minimum confidence threshold [default: 65]
---json                Emit JSON lines (required for tracker pipe)
+
+### 🎛️ Tracker knobs
+
+```text
+    --db <PATH>              SQLite database (created if missing) [default: tpms.db]
+    --serve <ADDR>           Start the web dashboard (e.g. 0.0.0.0:8080)
+    --log-level <LEVEL>      info | debug | trace (RUST_LOG wins if set) [default: info]
+    --log-file <PATH>        Rotating log file, alongside stderr
+    --log-max-size <MB>      Rotate at this size                  [default: 10]
+    --log-max-files <N>      Rotated files to keep                [default: 5]
+    --confidence <PCT>       Minimum confidence to process        [default: 65]
+    --receiver-id <ID>       Name this node for multi-receiver setups [default: default]
+    --replay <PATH>          Replay a .jsonl / .jsonl.gz fixture instead of stdin
+    --assert-consistency     After replay, fail loudly if anything looks off
+    --export-jaccard <PATH>  Dump the co-occurrence matrix as JSON
+-v, --verbose                Print a line for every resolved packet
 ```
 
-### Tracker flags
+Plus some subcommands for the curious:
 
-```
---db <PATH>            SQLite database path
---serve <ADDR>         Bind web dashboard (e.g. 0.0.0.0:8080)
---log-level <LEVEL>    error | warn | info | debug | trace
---log-file <PATH>      Rotating log file (written alongside stderr)
---log-max-size <MB>    Rotate at this file size [default: 10]
---log-max-files <N>    Rotated files to retain [default: 5]
---replay <PATH>        Replay a JSON fixture file (testing)
+```bash
+tpms-tracker report [--car <ID>] [--from ISO] [--to ISO] [--json] [--temporal]   # 📋 behavioural reports
+tpms-tracker backfill                                                            # 🧹 rebuild presence slots
+tpms-tracker geojson [--car <ID>] [-o out.geojson]                               # 🗺️ export paths
 ```
 
 ---
 
-## Three-layer identity model
+## 🧅 The three-layer identity onion
 
-```
-fingerprint_id   permanent physical sensor identity (cross-session)
+```text
+fingerprint_id   "this is THE sensor"            permanent, cross-session
     │
-    └─ vehicle_id   session-scoped (expires after VEHICLE_EXPIRY seconds)
+    └─ vehicle_id   "this is the sensor… today"  session-scoped, expires after VEHICLE_EXPIRY
            │
-           └─ sightings   individual decoded packets
+           └─ sightings   "it said something!"   individual decoded packets
 ```
 
-### Sentinel detection
+### 🚫 Sentinel detection
 
-Valid sensor IDs require `count_zeros(id) >= 3`. All-ones noise patterns
-(`0xFFFFFFFF`) are discarded before any fingerprint lookup.
+Not everything that decodes is a tyre. Valid sensor IDs must satisfy `count_zeros(id) >= 3`, so all-ones
+noise like `0xFFFFFFFF` is shown the door before it can pollute the fingerprint store.
 
-### Rolling-ID resolution
+### 🧮 Confidence scoring
 
-EezTire, TRW-OOK, and TRW-FSK sensors change their sensor_id on every
-transmission (bit-flip rolling scheme). The fingerprint correlator
-resolves them by matching on protocol + pressure delta. The TX interval
-is used as a tiebreaker only, never as a veto.
+Every packet has to earn its place:
 
-### Jaccard vehicle grouper
+| Condition | Points |
+|---|---|
+| CRC / checksum passes | +60 |
+| Pressure + temp in a sane range | +20 |
+| Pressure in typical tyre range 150–350 kPa | +10 |
+| Temperature in -20–80 °C | +5 |
+| Participation trophy 🏅 | +5 |
 
-Sensors co-occurring within 60-second windows are grouped into car
-entities. Merge threshold: `JACCARD_MERGE_THRESHOLD = 0.60`.
+Default bouncer threshold: **65%**.
 
 ---
 
-## Vehicle classification
+## 🦎 Catching the shapeshifters (rolling IDs)
 
-Inferred from corrected pressure after unit conversion:
+EezTire, TRW-OOK and TRW-FSK sensors are drama queens: they change their `sensor_id` on **every single
+transmission** using a bit-flip rolling scheme. Cute. Doesn't work.
 
-| Class | Pressure range | Typical vehicles |
+The fingerprint correlator resolves them by matching on **protocol + pressure delta**. The TX interval is a
+tiebreaker only — never a veto — so a slightly late packet can't get a sensor disowned.
+
+### 👨‍👩‍👧‍👦 Jaccard vehicle grouper
+
+Four tyres that keep turning up in the same 60-second windows are probably the same car (or a *very*
+coordinated flash mob). Sensors are grouped into car entities when their co-occurrence crosses
+`JACCARD_MERGE_THRESHOLD = 0.60`.
+
+---
+
+## 🛵🚚 Is it a scooter or a lorry?
+
+Tyre pressure gives the game away:
+
+| Class | Pressure range | Typical suspects |
 |---|---|---|
 | Motorcycle | 150–200 kPa | Scooters, motorcycles |
 | PassengerCar | 200–280 kPa | Cars, small SUVs |
 | SuvLightTruck | 260–340 kPa | SUVs, crossovers |
-| LightCommercialVan | 350–480 kPa | Delivery vans |
+| LightCommercialVan | 350–480 kPa | That delivery van that's always double-parked |
 | HeavyTruck | 550–800 kPa | HGVs |
 
-Protocol-level overrides apply where pressure alone is unreliable
-(Jansite-Solar → always Motorcycle).
+Some protocols get overrides where pressure lies (Jansite-Solar → always Motorcycle).
 
----
+### 🔧 Pressure unit corrections
 
-## Pressure unit corrections
-
-Several protocols encode pressure in PSI with the unit incorrectly
-described in earlier decoder implementations:
+Several protocols encode PSI while earlier decoders swore it was something else. We fixed the maths:
 
 | Protocol | Raw unit | Multiplier to kPa |
 |---|---|---|
 | EezTire (241) | 0.1 PSI/unit | × 0.68948 |
 | TRW OOK/FSK (298/299) | 0.4 PSI/unit | × 2.75790 |
 | Jansite (123/180) | 0.25 PSI/unit | × 1.7 |
-| AVE TPMS (208) | 1.5 kPa/unit | correct |
-| Hyundai Elantra (140) | 1 kPa/unit | correct |
+| AVE TPMS (208) | 1.5 kPa/unit | already correct ✅ |
+| Hyundai Elantra (140) | 1 kPa/unit | already correct ✅ |
 
-The database migration script (`scripts/migrate.py`) corrects historical
-data when decoders are fixed.
+`scripts/migrate.py` retro-fixes historical data whenever a decoder gets corrected — no sighting left behind.
 
 ---
 
-## Physical-layer fingerprinting
+## 💓 Physical-layer fingerprinting (a.k.a. every crystal has a heartbeat)
 
-The tracker fingerprints sensors by the timing jitter of their crystal
-oscillator — a hardware characteristic that is stable across the sensor's
-lifetime and survives rolling ID rotation and pressure variation.
+A sensor can change its ID. It can't change its **crystal oscillator**. The tiny timing wobble in when a
+sensor transmits is a hardware quirk that stays stable for its whole life — through ID rotations, pressure
+changes, the lot. We measure that wobble.
 
 ### Interval collection
 
-For **fixed-ID protocols** (Jansite, Hyundai, AVE): consecutive packets
-from the same `sensor_id` are used directly.
+- **Fixed-ID protocols** (Jansite, Hyundai, AVE): consecutive packets from the same `sensor_id`. Easy mode.
+- **Rolling-ID protocols** (EezTire, TRW): consecutive packets are paired using **Hamming distance** between
+  successive IDs. Same-sensor pairs differ by 1–3 bits; strangers differ by ~16 bits on average.
+  Shapeshifters, but bad at it.
 
-For **rolling-ID protocols** (EezTire, TRW): consecutive packets from
-the same physical sensor are identified using Hamming distance between
-successive sensor IDs. Same-sensor pairs differ by 1–3 bits; different
-sensors differ by ~16 bits on average.
-
-```
-MAX_HAMMING_DISTANCE  = 3      consecutive-packet same-sensor threshold
-MAX_PRESSURE_DELTA    = 5 kPa  additional cross-sensor guard
-RAW_INTERVAL_MIN      = 5,000 ms   reject burst duplicates
-RAW_INTERVAL_MAX      = 300,000 ms reject cross-session gaps
+```text
+MAX_HAMMING_DISTANCE  = 3            same-sensor threshold
+MAX_PRESSURE_DELTA    = 5 kPa        extra cross-sensor guard
+RAW_INTERVAL_MIN      = 5,000 ms     reject burst duplicates
+RAW_INTERVAL_MAX      = 300,000 ms   reject cross-session gaps
 ```
 
-### Jitter statistics (computed after 50 samples)
+### Jitter statistics (unlocked after 50 samples)
 
-| Metric | Physical meaning |
+| Metric | What it's telling you |
 |---|---|
-| `sigma_ms` | Oscillator stability — expected 1–30 ms for ±20 ppm crystal |
-| `skewness` | Asymmetry of timing distribution |
-| `kurtosis` | Tail weight — high for sensors with collision-avoidance retransmit |
-| `acf_lag1` | Lag-1 autocorrelation — negative indicates active frequency correction |
+| `sigma_ms` | Oscillator stability — expect 1–30 ms for a ±20 ppm crystal |
+| `skewness` | Is the timing distribution lopsided? |
+| `kurtosis` | Tail weight — high for sensors doing collision-avoidance retransmits |
+| `acf_lag1` | Lag-1 autocorrelation — negative means active frequency correction |
 
 ---
 
-## Temporal behavioural fingerprinting
+## 🕰️ Temporal behavioural fingerprinting (a.k.a. creature of habit)
 
-Each fingerprint accumulates a behavioural profile from `session_log`:
+Cars are like cats: they have routines. Each fingerprint builds a behavioural profile from `session_log`:
 
-- **Arrival distribution** — Gaussian mixture over hour-of-day
-- **Dwell time** — log-normal (drive-by median < 30s vs parked > 1h)
+- **Arrival distribution** — Gaussian mixture over hour-of-day ("always here at 08:47, bless")
+- **Dwell time** — log-normal (drive-by median < 30 s vs. parked > 1 h)
 - **Periodicity** — dominant cycle via autocorrelation (daily / weekly)
-- **Presence map** — 24×7 probability matrix
+- **Presence map** — a 24×7 probability matrix
 
-Minimum 7 sessions required. Distinguishes commuters (bimodal arrival,
-zero dwell, 24h period) from stationary vehicles (flat arrival, hours
-dwell, no period) from transients (single drive-by sessions).
+Needs at least 7 sessions. Tells apart **commuters** (bimodal arrival, zero dwell, 24 h period) from
+**couch potatoes** (flat arrival, hours of dwell, no period) from **tourists** (one drive-by and gone).
 
 ---
 
-## Web dashboard
+## 📊 Web dashboard
 
-At `http://pi:8080` when `--serve` is passed.
+Pass `--serve` and point a browser at `http://pi:8080`.
 
-| Endpoint | Description |
+| Endpoint | What you get |
 |---|---|
-| `GET /` | Embedded dashboard |
+| `GET /` | The embedded dashboard |
 | `GET /api/stats` | Summary statistics |
-| `GET /api/cars` | All tracked vehicles |
-| `GET /api/cars/:id` | Single vehicle detail |
+| `GET /api/cars` | Every tracked vehicle |
+| `GET /api/cars/:id` | One vehicle, in detail |
+| `GET /api/fingerprints` | All persistent fingerprints |
 | `GET /api/fingerprints/:id/jitter` | Jitter profile + histogram |
 
 ---
 
-## Database schema
+## 🗄️ Database
 
-SQLite WAL mode. Current schema version: **v9**.
+SQLite in WAL mode. Current schema version: **v9**.
 
 | Table | Contents |
 |---|---|
@@ -272,66 +330,51 @@ SQLite WAL mode. Current schema version: **v9**.
 | `session_log` | Per-session start/end/dwell for TBF |
 | `temporal_fingerprints` | Computed TBF profiles |
 | `interval_samples` | Raw TX intervals, ring buffer (10k rows per fingerprint) |
-| `rke_events` | Remote Keyless Entry events (planned, issue #35) |
+| `rke_events` | Remote Keyless Entry events (coming soon™, issue #35) |
 | `vehicle_state_transitions` | Arrival/departure from RKE fusion (planned) |
 | `schema_migrations` | Applied migration history |
 
 ### Migrations
 
 ```bash
-python3 scripts/migrate.py tpms.db            # apply all pending
-python3 scripts/migrate.py tpms.db --dry-run  # preview
-python3 scripts/migrate.py tpms.db --step 6   # up to v6 only
+python3 scripts/migrate.py tpms.db            # apply everything pending
+python3 scripts/migrate.py tpms.db --dry-run  # look before you leap
+python3 scripts/migrate.py tpms.db --step 6   # stop at v6
 ```
 
-Automatic timestamped backup before any write.
+A timestamped backup is taken before any write, because we've all been there.
 
----
+### 📝 Structured logging
 
-## Structured logging
-
-```
+```text
 2026-04-26 18:41:39 | RESOLVE | sensor=0xFFFFFFFF | zeros=0 | valid=false
   | path=fingerprint_correlator | candidates=2 | matched=c7e69c9d
   | match_reason=pressure_delta:0.0_kpa | protocol_filter=pass
   | pressure_before=352.3 | pressure_after=352.3
 ```
 
-With `--log-file`, logs rotate by size and are retained for configurable
-history. Useful for post-hoc jitter and interval analysis without touching
-the SQLite database.
+With `--log-file`, logs rotate by size with configurable history — perfect for post-hoc jitter and interval
+archaeology without poking the database.
 
 ---
 
-## Confidence scoring
-
-| Condition | Points |
-|---|---|
-| CRC / checksum passes | +60 |
-| Pressure + temp in sane range | +20 |
-| Pressure in typical tyre range 150–350 kPa | +10 |
-| Temperature in -20–80 °C range | +5 |
-| Base bonus | +5 |
-
-Default threshold: **65%**.
-
----
-
-## Fixture replay & testing
+## 🧪 Testing & fixture replay
 
 ```bash
 cargo test
 
-# Replay a specific fixture against in-memory database
+# Replay a real-world capture against an in-memory DB and make sure nothing's wonky
 ./target/release/tpms-tracker \
-  --replay tests/fixtures/parking_lot.json \
+  --replay tests/fixtures/wild/session_20260415_1000.jsonl.gz \
   --db :memory: \
   --assert-consistency
 ```
 
----
+Want to contribute a capture? See [`tests/fixtures/README.md`](tests/fixtures/README.md) for the recipe.
+Tracker internals (per-protocol expiry, TX-interval matching, class tolerances) are documented in
+[`crates/tracker/README.md`](crates/tracker/README.md).
 
-## Key constants
+### 🔩 Key constants
 
 ```rust
 VEHICLE_EXPIRY              = 300s     (EezTire/TRW: 480s, AVE: 600s)
@@ -348,131 +391,98 @@ SESSION_GAP_THRESHOLD       = 600s
 
 ---
 
-## Research roadmap
+## 🗺️ Roadmap
 
 | Issue | Feature | Status |
 |---|---|---|
-| #61 | Temporal behavioural fingerprinting | In progress |
-| #63 | RKE + TPMS multi-modal fusion | Designed |
-| #36 | Meshtastic C2 integration | Designed |
-| #64 | EezTire pressure unit fix | Merged |
-| #66 | TRW-OOK/FSK decoder fix | Merged |
-| #68 | Jansite pressure unit fix | Merged |
-| #70 | TX interval jitter infrastructure | Merged |
-| #74 | Rotating log file system | Merged |
-| #77 | Raw interval collection upstream of correlator | Merged |
-| #79 | Hamming-distance grouping for rolling-ID protocols | In test |
+| #61 | Temporal behavioural fingerprinting | 🚧 In progress |
+| #63 | RKE + TPMS multi-modal fusion | 📐 Designed |
+| #36 | Meshtastic C2 integration | 📐 Designed |
+| #64 | EezTire pressure unit fix | ✅ Merged |
+| #66 | TRW-OOK/FSK decoder fix | ✅ Merged |
+| #68 | Jansite pressure unit fix | ✅ Merged |
+| #70 | TX interval jitter infrastructure | ✅ Merged |
+| #74 | Rotating log file system | ✅ Merged |
+| #77 | Raw interval collection upstream of correlator | ✅ Merged |
+| #79 | Hamming-distance grouping for rolling-ID protocols | 🧪 In test |
 
-Target white paper: *Passive Vehicle Re-identification from 433 MHz TPMS:
-Temporal Behavioural Fingerprinting, Physical-Layer Oscillator Signatures,
-and Cross-Band Identity Fusion.*
+Target white paper: *Passive Vehicle Re-identification from 433 MHz TPMS: Temporal Behavioural
+Fingerprinting, Physical-Layer Oscillator Signatures, and Cross-Band Identity Fusion.*
 
 ---
 
-## Scientific references
+## 📚 Scientific references (the giants whose shoulders we stand on)
 
 ### Primary inspiration — TPMS passive tracking
 
-**[1] Lizarribar, Y., Scalingi, A., Giustiniano, D., Sánchez Sánchez, P. M.,
-Calvo-Palomino, R., Bovet, G., & Lenders, V. (2026).**
-*Can't Hide Your Stride: Inferring Car Movement Patterns from Passive TPMS
-Measurements.*
-IEEE Wireless On-demand Network Systems and Services (WONS 2026).
-IMDEA Networks Institute.
-→ The baseline paper that established Jaccard co-occurrence grouping for
-passive TPMS vehicle tracking. This project extends their approach with
-rolling-ID resolution, physical-layer fingerprinting, and temporal
+**[1] Lizarribar, Y., Scalingi, A., Giustiniano, D., Sánchez Sánchez, P. M., Calvo-Palomino, R., Bovet, G.,
+& Lenders, V. (2026).** *Can't Hide Your Stride: Inferring Car Movement Patterns from Passive TPMS
+Measurements.* IEEE Wireless On-demand Network Systems and Services (WONS 2026). IMDEA Networks Institute.
+→ The baseline paper that established Jaccard co-occurrence grouping for passive TPMS vehicle tracking. This
+project extends their approach with rolling-ID resolution, physical-layer fingerprinting, and temporal
 behavioural analysis.
 
 ### RF device fingerprinting (physical-layer jitter, issues #40–#43)
 
-**[2] Danev, B., Luecke, T. S., & Capkun, S. (2009).**
-*Transient-based identification of wireless sensor nodes.*
-Proceedings of the 8th ACM/IEEE International Conference on Information
-Processing in Sensor Networks (IPSN '09), pp. 25–36.
-→ Foundational paper on physical-layer fingerprinting of wireless sensor
-nodes using RF transient characteristics. Establishes the theoretical basis
-for oscillator-based device identification.
+**[2] Danev, B., Luecke, T. S., & Capkun, S. (2009).** *Transient-based identification of wireless sensor
+nodes.* IPSN '09, pp. 25–36.
+→ Foundational work on physical-layer fingerprinting of wireless sensor nodes via RF transients.
 
-**[3] Brik, V., Banerjee, S., Gruteser, M., & Oh, S. (2008).**
-*Wireless device identification with radiometric signatures.*
-Proceedings of the 14th ACM International Conference on Mobile Computing and
-Networking (MobiCom '08), pp. 116–127.
-→ First large-scale demonstration of 802.11 device fingerprinting using
-clock offset, frequency error, and timing jitter. Motivates the
-`acf_lag1` feature in the jitter profile.
+**[3] Brik, V., Banerjee, S., Gruteser, M., & Oh, S. (2008).** *Wireless device identification with
+radiometric signatures.* MobiCom '08, pp. 116–127.
+→ First large-scale 802.11 fingerprinting using clock offset, frequency error, and timing jitter. Motivates
+the `acf_lag1` feature.
 
-**[4] Rasmussen, K. B., & Capkun, S. (2007).**
-*Implications of radio fingerprinting on the security of sensor networks.*
-Proceedings of the 3rd International Conference on Security and Privacy in
-Communications Networks (SecureComm '07), pp. 331–340.
-→ Analysis of radio fingerprinting applicability to sensor network security.
-Establishes the discriminative power of crystal oscillator frequency offset
-as a device identifier.
+**[4] Rasmussen, K. B., & Capkun, S. (2007).** *Implications of radio fingerprinting on the security of
+sensor networks.* SecureComm '07, pp. 331–340.
+→ Establishes crystal oscillator frequency offset as a discriminative device identifier.
 
-**[5] Xu, Q., Zheng, R., Saad, W., & Han, Z. (2016).**
-*Device fingerprinting in wireless networks: Challenges and opportunities.*
-IEEE Communications Surveys & Tutorials, 18(1), pp. 94–119.
-→ Survey of RF device fingerprinting techniques including clock skew, carrier
-frequency offset, and modulation imperfections. Used to calibrate expected
-sigma ranges for TPMS crystal oscillators.
+**[5] Xu, Q., Zheng, R., Saad, W., & Han, Z. (2016).** *Device fingerprinting in wireless networks:
+Challenges and opportunities.* IEEE Communications Surveys & Tutorials, 18(1), pp. 94–119.
+→ Survey used to calibrate expected sigma ranges for TPMS crystal oscillators.
 
 ### TPMS security background
 
-**[6] Rouf, I., Miller, R., Mustafa, H., Taylor, T., Oh, S., Xu, W.,
-Gruteser, M., Trappe, W., & Seskar, I. (2010).**
-*Security and privacy vulnerabilities of in-car wireless networks: A tire
-pressure monitoring system case study.*
-Proceedings of the 19th USENIX Security Symposium, pp. 323–338.
-→ The first systematic security analysis of TPMS, demonstrating passive
-tracking and active injection attacks. Establishes the threat model this
-project operates within.
+**[6] Rouf, I., Miller, R., Mustafa, H., Taylor, T., Oh, S., Xu, W., Gruteser, M., Trappe, W., & Seskar, I.
+(2010).** *Security and privacy vulnerabilities of in-car wireless networks: A tire pressure monitoring
+system case study.* 19th USENIX Security Symposium, pp. 323–338.
+→ The OG TPMS security analysis — passive tracking and active injection. Defines the threat model we live in.
 
-**[7] Sterne, K. T., Ernst, J. M., Kilcoyne, D. K., Michaels, A. J.,
-& Moy, G. (2017).**
-*Tire pressure monitoring system sensor radio frequency measurements for
-privacy concerns.*
-Transportation Research Record, 2643(1), pp. 10–17.
-→ Empirical RF measurements of TPMS transmission characteristics including
-frequency stability and timing — directly relevant to jitter fingerprinting.
+**[7] Sterne, K. T., Ernst, J. M., Kilcoyne, D. K., Michaels, A. J., & Moy, G. (2017).** *Tire pressure
+monitoring system sensor radio frequency measurements for privacy concerns.* Transportation Research
+Record, 2643(1), pp. 10–17.
+→ Empirical RF measurements of TPMS frequency stability and timing — directly relevant to jitter work.
 
-### MAC randomisation and rolling ID evasion (related context)
+### MAC randomisation and rolling-ID evasion
 
-**[8] Martin, J., Mayberry, T., Donahue, C., Foppe, L., Brown, L.,
-Riggins, C., Rye, E. C., & Brown, D. (2017).**
-*A study of MAC address randomization in mobile devices and when it fails.*
-Proceedings on Privacy Enhancing Technologies (PETS 2017), pp. 365–383.
-→ Motivates the analogy between WiFi MAC randomisation evasion and TPMS
-rolling-ID resolution. The Hamming-distance approach in issue #43 draws on
-the same category of techniques used to defeat MAC randomisation.
+**[8] Martin, J., Mayberry, T., Donahue, C., Foppe, L., Brown, L., Riggins, C., Rye, E. C., & Brown, D.
+(2017).** *A study of MAC address randomization in mobile devices and when it fails.* PETS 2017,
+pp. 365–383.
+→ The WiFi cousin of our rolling-ID problem. The Hamming-distance approach in issue #43 borrows from the same
+toolbox.
 
 ### Software references
 
-**[9] Lukeswitz. (2024).**
-*AntiHunter — ESP32-S3 WiFi/BLE perimeter defense with Meshtastic mesh.*
-GitHub. https://github.com/lukeswitz/AntiHunter
-→ Complementary project covering 2.4 GHz (WiFi/BLE) device detection.
-Inspiration for cross-band fusion (issue #35) and Meshtastic C2
-integration (issue #36).
+**[9] Lukeswitz. (2024).** *AntiHunter — ESP32-S3 WiFi/BLE perimeter defense with Meshtastic mesh.*
+<https://github.com/lukeswitz/AntiHunter>
+→ The 2.4 GHz sibling. Inspiration for cross-band fusion (#35) and Meshtastic C2 (#36).
 
-**[10] merbanan. (2024).**
-*rtl\_433 — Decode radio transmissions from devices operating on 433.9 MHz,
-868 MHz, 315 MHz, 345 MHz, and 915 MHz ISM bands.*
-GitHub. https://github.com/merbanan/rtl_433
-→ Reference implementation for all 25 TPMS protocol decoders. Protocol
-byte layouts, pressure unit encodings, and CRC polynomials are ported
-directly from this codebase.
+**[10] merbanan. (2024).** *rtl\_433 — Decode radio transmissions from devices on the 433.9 / 868 / 315 /
+345 / 915 MHz ISM bands.* <https://github.com/merbanan/rtl_433>
+→ Reference implementation for all 25 decoders. Byte layouts, pressure encodings and CRC polynomials are
+ported straight from here. Eternal gratitude. 🙏
 
 ---
 
-## Legal notice
+## ⚖️ Legal stuff (please read it, we mean it)
 
-Passive reception only. No transmission. The project does not interact
-with any vehicle system. Verify local regulations regarding passive
-reception of ISM-band RF signals before deployment.
+**Passive reception only.** This project never transmits a single bit and never interacts with any vehicle
+system — it just listens. Check your local regulations on passive reception of ISM-band RF signals before
+deploying, and be a decent human about what you do with the data. Tyres deserve privacy too. Well. Their
+owners do.
 
 ---
 
-## License
+## 📜 License
 
-MIT.
+MIT. Go forth and listen responsibly. 🎧
